@@ -33,6 +33,13 @@ class ClassifyRequest(BaseModel):
     smoothing: Literal["none", "median_1", "median_2", "median_3", "median_5"]
     featureFlags: FeatureFlags
     outputPath: str | None = None
+    tileMode: bool = False
+    tileMaxPixels: int | None = None
+    tileOverlap: int = 0
+    tileOutputDir: str | None = None
+    tileWorkers: int | None = None
+    detectShadows: bool = False
+    maxThreads: int | None = None
 
 
 class ClassifyStep1Request(BaseModel):
@@ -42,6 +49,13 @@ class ClassifyStep1Request(BaseModel):
     smoothing: Literal["none", "median_1", "median_2", "median_3", "median_5"]
     featureFlags: FeatureFlags
     outputPath: str | None = None
+    tileMode: bool = False
+    tileMaxPixels: int | None = None
+    tileOverlap: int = 0
+    tileOutputDir: str | None = None
+    tileWorkers: int | None = None
+    detectShadows: bool = False
+    maxThreads: int | None = None
 
 
 class ClassifyStep2Request(BaseModel):
@@ -50,6 +64,12 @@ class ClassifyStep2Request(BaseModel):
     vectorLayers: List[VectorLayer]
     classes: List[ClassItem]
     outputPath: str | None = None
+    tileMode: bool = False
+    tileMaxPixels: int | None = None
+    tileOverlap: int = 0
+    tileOutputDir: str | None = None
+    tileWorkers: int | None = None
+    maxThreads: int | None = None
 
 
 app = FastAPI(title="Material Classification API")
@@ -77,7 +97,14 @@ def classify(request: ClassifyRequest) -> dict:
         [layer.model_dump() for layer in request.vectorLayers],
         request.smoothing,
         request.featureFlags.model_dump(),
-        request.outputPath
+        request.outputPath,
+        request.tileMode,
+        request.tileMaxPixels or 512 * 512,
+        request.tileOverlap,
+        request.tileOutputDir,
+        request.tileWorkers,
+        request.detectShadows,
+        request.maxThreads
     )
 
 
@@ -89,7 +116,14 @@ def classify_step1(request: ClassifyStep1Request) -> dict:
         [item.model_dump() for item in request.classes],
         request.smoothing,
         request.featureFlags.model_dump(),
-        request.outputPath
+        request.outputPath,
+        request.tileMode,
+        request.tileMaxPixels or 512 * 512,
+        request.tileOverlap,
+        request.tileOutputDir,
+        request.tileWorkers,
+        request.detectShadows,
+        request.maxThreads
     )
 
 
@@ -100,6 +134,12 @@ def classify_step2(request: ClassifyStep2Request) -> dict:
         request.classificationPath,
         [layer.model_dump() for layer in request.vectorLayers],
         [item.model_dump() for item in request.classes],
-        request.outputPath
+        request.outputPath,
+        request.tileMode,
+        request.tileMaxPixels or 512 * 512,
+        request.tileOverlap,
+        request.tileOutputDir,
+        request.tileWorkers,
+        request.maxThreads
     )
 

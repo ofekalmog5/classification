@@ -2,6 +2,10 @@
 from typing import Dict, List, Tuple, Optional
 import tempfile
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from rasterio.windows import Window
+from rasterio.windows import transform as window_transform
+from rasterio.transform import array_bounds
 
 # Configure PROJ library for geopandas/rasterio BEFORE importing geopandas
 # This fixes "PROJ: proj_identify: Cannot find proj.db" errors
@@ -10,7 +14,6 @@ def _setup_proj_lib():
     def _layout_minor(proj_dir: Path) -> Optional[int]:
         try:
             import sqlite3
-
             db_path = proj_dir / 'proj.db'
             if not db_path.exists():
                 return None
@@ -80,6 +83,8 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 import math
 
+VECTOR_OVERLAY_COLOR = (255, 255, 0)
+
 
 def _normalize_pseudo_mercator_crs(crs: CRS) -> CRS:
     if crs is None:
@@ -88,6 +93,43 @@ def _normalize_pseudo_mercator_crs(crs: CRS) -> CRS:
     if crs_text.startswith("LOCAL_CS") and "Pseudo-Mercator" in crs_text:
         return CRS.from_epsg(3857)
     return crs
+
+
+def _auto_tile_size(height: int, width: int, max_pixels: int) -> int:
+    max_pixels = max(128 * 128, int(max_pixels))
+    tile_size = int(math.sqrt(max_pixels))
+    tile_size = max(128, tile_size)
+    tile_size = min(tile_size, max(height, width))
+    return tile_size
+
+
+def _generate_tile_windows(width: int, height: int, tile_size: int, overlap: int) -> List[Tuple[int, int, int, int]]:
+    windows: List[Tuple[int, int, int, int]] = []
+    step = max(1, tile_size - max(0, overlap))
+    for row in range(0, height, step):
+        for col in range(0, width, step):
+            w = min(tile_size, width - col)
+            h = min(tile_size, height - row)
+            windows.append((row, col, h, w))
+    return windows
+
+
+def _resolve_tile_output_dir(base_path: Path, output_path: Optional[str], suffix: str) -> Path:
+    if output_path:
+        out_path = Path(output_path)
+        if out_path.suffix:
+            return out_path.with_name(out_path.stem + suffix)
+        return out_path
+    return base_path.with_name(base_path.stem + suffix)
+
+
+def _filter_geometries_by_bounds(geoms: List, bounds: Tuple[float, float, float, float]) -> List:
+    minx, miny, maxx, maxy = bounds
+    return [
+        geom for geom in geoms
+        if geom is not None and not geom.is_empty and
+        not (geom.bounds[2] < minx or geom.bounds[0] > maxx or geom.bounds[3] < miny or geom.bounds[1] > maxy)
+    ]
 
 
 def _web_mercator_forward(lon: float, lat: float) -> tuple:
@@ -143,6 +185,199 @@ def _transform_geometries_to_web_mercator(gdf):
     
     return gdf_copy
 from scipy.spatial.distance import cdist
+from scipy.ndimage import binary_dilation, maximum_filter, minimum_filter
+
+
+def _detect_structures_mask(raster_data: np.ndarray, brightness_threshold: int = 150, ndvi_threshold: float = 0.3) -> np.ndarray:
+    """
+    Detect potential structures (buildings/trees) based on spectral characteristics.
+    
+    Args:
+        raster_data: (bands, height, width) array
+        brightness_threshold: Minimum average brightness for structures (0-255)
+        ndvi_threshold: NDVI threshold for vegetation (trees)
+    
+    Returns:
+        Boolean mask indicating structure pixels
+    """
+    height, width = raster_data.shape[1], raster_data.shape[2]
+    
+    # Calculate brightness as mean of RGB bands
+    rgb_data = raster_data[:3] if raster_data.shape[0] >= 3 else raster_data
+    brightness = np.mean(rgb_data, axis=0)
+    
+    # High brightness mask (buildings, bright surfaces)
+    bright_mask = brightness > brightness_threshold
+    
+    # Vegetation mask using NDVI (trees)
+    vegetation_mask = np.zeros((height, width), dtype=bool)
+    if raster_data.shape[0] >= 4:
+        red = raster_data[2].astype(np.float32)
+        nir = raster_data[3].astype(np.float32)
+        ndvi = (nir - red) / (nir + red + 1e-6)
+        vegetation_mask = ndvi > ndvi_threshold
+    
+    # Combine: structures = bright areas + vegetation
+    structure_mask = bright_mask | vegetation_mask
+    
+    return structure_mask
+
+
+def _detect_shadows_and_infer(classification_raster: np.ndarray, original_raster: np.ndarray, dilation_radius: int = 5, brightness_threshold: int = 100) -> np.ndarray:
+    """
+    Detect shadows near structures and reclassify them with adjacent structure's material label.
+    
+    Args:
+        classification_raster: (height, width) labeled classification (class IDs)
+        original_raster: (bands, height, width) original raster data
+        dilation_radius: How many pixels to dilate structure regions
+        brightness_threshold: Max brightness to consider as shadow
+    
+    Returns:
+        Updated classification raster with shadows reclassified
+    """
+    height, width = classification_raster.shape
+    output_raster = classification_raster.astype(np.int32).copy()
+    
+    # Detect structure pixels
+    structure_mask = _detect_structures_mask(original_raster)
+    
+    # Dilate to create a "shadow zone" around structures
+    dilated_structures = binary_dilation(structure_mask, iterations=dilation_radius)
+    
+    # Calculate brightness
+    rgb_data = original_raster[:3] if original_raster.shape[0] >= 3 else original_raster
+    brightness = np.mean(rgb_data, axis=0)
+    
+    # Shadow pixels: low brightness within dilated structure zone
+    shadow_candidates = (brightness < brightness_threshold) & dilated_structures & ~structure_mask
+    
+    if np.any(shadow_candidates):
+        # For each shadow pixel, assign the most common adjacent structure class
+        # Use maximum_filter to get the most likely surrounding class
+        kernel_size = 2 * dilation_radius + 1
+        
+        # Find adjacent non-zero classes
+        labels_float = classification_raster.astype(np.float32)
+        local_max = maximum_filter(labels_float, size=kernel_size, mode='constant', cval=0)
+        
+        # Assign shadow pixels the value of their nearest structure
+        shadow_indices = np.where(shadow_candidates)
+        for y, x in zip(shadow_indices[0], shadow_indices[1]):
+            # Find most common class in local neighborhood
+            y_start = max(0, y - dilation_radius)
+            y_end = min(height, y + dilation_radius + 1)
+            x_start = max(0, x - dilation_radius)
+            x_end = min(width, x + dilation_radius + 1)
+            
+            neighborhood = classification_raster[y_start:y_end, x_start:x_end]
+            neighborhood_nonzero = neighborhood[neighborhood > 0]
+            
+            if len(neighborhood_nonzero) > 0:
+                # Get most common class
+                unique, counts = np.unique(neighborhood_nonzero, return_counts=True)
+                most_common_class = unique[np.argmax(counts)]
+                output_raster[y, x] = most_common_class
+    
+    return output_raster.astype(classification_raster.dtype)
+
+
+def _classify_tile_worker(args: Tuple[str, Tuple[int, int, int, int], Dict[str, bool], np.ndarray, np.ndarray, np.ndarray, List[Tuple[int, int, int]], str, str, str]) -> str:
+    raster_path, window_tuple, feature_flags, scaler_mean, scaler_scale, centers, color_table, smoothing, output_dir, tile_name = args
+    row, col, height, width = window_tuple
+    window = Window(col, row, width, height)
+
+    with rasterio.open(raster_path) as src:
+        tile_data = src.read(window=window)
+        profile = src.profile.copy()
+        tile_transform = window_transform(window, src.transform)
+        tile_crs = _normalize_pseudo_mercator_crs(src.crs)
+
+    profile.update(
+        height=height,
+        width=width,
+        transform=tile_transform,
+        crs=tile_crs,
+        count=3,
+        dtype=np.uint8,
+        interleave='band'
+    )
+
+    features = _extract_pixel_features(tile_data, feature_flags, verbose=False)
+    scale = np.where(scaler_scale == 0, 1.0, scaler_scale)
+    features_normalized = (features - scaler_mean) / scale
+    distances = cdist(features_normalized, centers, metric='euclidean')
+    labels = np.argmin(distances, axis=1) + 1
+    predicted_raster = labels.reshape(height, width)
+
+    if smoothing and smoothing != "none":
+        try:
+            kernel_size = int(smoothing.split("_")[1]) if "_" in smoothing else 2
+            predicted_raster = median(predicted_raster.astype(np.uint16), disk(kernel_size))
+        except Exception:
+            pass
+
+    rgb = _apply_color_table(predicted_raster, color_table, verbose=False)
+
+    output_path = Path(output_dir) / tile_name
+    with rasterio.open(output_path, 'w', **profile) as dst:
+        dst.write(rgb)
+
+    return str(output_path)
+
+
+def _rasterize_tile_worker(args: Tuple[str, Optional[Tuple[int, int, int, int]], List[Tuple[List, int]], str, str]) -> str:
+    classification_path, window_tuple, layer_geoms, output_dir, tile_name = args
+
+    if window_tuple is None:
+        with rasterio.open(classification_path) as src:
+            raster_array = src.read()
+            meta = src.meta.copy()
+            transform = src.transform
+            height = src.height
+            width = src.width
+            raster_crs = _normalize_pseudo_mercator_crs(src.crs)
+    else:
+        row, col, height, width = window_tuple
+        window = Window(col, row, width, height)
+        with rasterio.open(classification_path) as src:
+            raster_array = src.read(window=window)
+            meta = src.meta.copy()
+            transform = window_transform(window, src.transform)
+            raster_crs = _normalize_pseudo_mercator_crs(src.crs)
+
+        meta.update(height=height, width=width, transform=transform)
+
+    meta["crs"] = raster_crs
+
+    output_array = raster_array.copy()
+    bounds = array_bounds(height, width, transform)
+
+    for geoms, burn_value in layer_geoms:
+        filtered = _filter_geometries_by_bounds(geoms, bounds)
+        if not filtered:
+            continue
+        shapes = [(geom, burn_value) for geom in filtered]
+        burned_mask = rasterize(
+            shapes=shapes,
+            out_shape=(height, width),
+            transform=transform,
+            fill=0,
+            all_touched=True
+        )
+        if output_array.ndim == 2:
+            output_array[burned_mask > 0] = burn_value
+        else:
+            r, g, b = VECTOR_OVERLAY_COLOR
+            output_array[0][burned_mask > 0] = r
+            output_array[1][burned_mask > 0] = g
+            output_array[2][burned_mask > 0] = b
+
+    output_path = Path(output_dir) / tile_name
+    with rasterio.open(output_path, 'w', **meta) as dst:
+        dst.write(output_array)
+
+    return str(output_path)
 
 
 def rasterize_vector_onto_raster(raster_path: str, gdf, burn_value: int, output_path: str, crs):
@@ -320,10 +555,12 @@ def rasterize_vector_onto_raster(raster_path: str, gdf, burn_value: int, output_
         output_array = raster_array.copy()
         output_array[burned_mask > 0] = burn_value
     else:
-        # Multi-band - only modify first band
+        # Multi-band - paint overlay color on all bands
         output_array = raster_array.copy()
-        # Don't change dtype - keep it as original
-        output_array[0][burned_mask > 0] = burn_value
+        r, g, b = VECTOR_OVERLAY_COLOR
+        output_array[0][burned_mask > 0] = r
+        output_array[1][burned_mask > 0] = g
+        output_array[2][burned_mask > 0] = b
     
     print(f"    Output array dtype: {output_array.dtype}, shape: {output_array.shape}")
     print(f"    Output array range: min={np.min(output_array)}, max={np.max(output_array)}")
@@ -344,7 +581,14 @@ def classify(
     vector_layers: List[Dict[str, str]],
     smoothing: str,
     feature_flags: Dict[str, bool],
-    output_path: str | None = None
+    output_path: str | None = None,
+    tile_mode: bool = False,
+    tile_max_pixels: int = 512 * 512,
+    tile_overlap: int = 0,
+    tile_output_dir: str | None = None,
+    tile_workers: Optional[int] = None,
+    detect_shadows: bool = False,
+    max_threads: Optional[int] = None
 ) -> Dict[str, object]:
     """
     Complete classification pipeline: KMeans + Vector rasterization.
@@ -366,7 +610,12 @@ def classify(
         classes=classes,
         smoothing=smoothing,
         feature_flags=feature_flags,
-        output_path=str(temp_output)
+        output_path=str(temp_output) if not tile_mode else None,
+        tile_mode=tile_mode,
+        tile_max_pixels=tile_max_pixels,
+        tile_overlap=tile_overlap,
+        tile_output_dir=tile_output_dir,
+        tile_workers=tile_workers
     )
     
     if result1["status"] != "ok":
@@ -382,7 +631,13 @@ def classify(
             classification_path=classif_file,
             vector_layers=vector_layers,
             classes=classes,
-            output_path=output_path
+            output_path=output_path,
+            tile_mode=tile_mode,
+            tile_max_pixels=tile_max_pixels,
+            tile_overlap=tile_overlap,
+            tile_output_dir=tile_output_dir,
+            tile_workers=tile_workers,
+            max_threads=max_threads
         )
         
         if result2["status"] != "ok":
@@ -393,7 +648,7 @@ def classify(
         print("\n>>> STEP 2: No vectors provided, skipping")
         final_output = classif_file
         # Copy to final output path if provided
-        if output_path:
+        if output_path and not tile_mode:
             import shutil
             shutil.copy(classif_file, output_path)
             final_output = output_path
@@ -415,7 +670,14 @@ def classify_and_export(
     classes: List[Dict[str, str]],
     smoothing: str,
     feature_flags: Dict[str, bool],
-    output_path: str | None = None
+    output_path: str | None = None,
+    tile_mode: bool = False,
+    tile_max_pixels: int = 512 * 512,
+    tile_overlap: int = 0,
+    tile_output_dir: str | None = None,
+    tile_workers: Optional[int] = None,
+    detect_shadows: bool = False,
+    max_threads: Optional[int] = None
 ) -> Dict[str, object]:
     """
     Step 1: KMeans classification and color export (without vectors).
@@ -462,6 +724,60 @@ def classify_and_export(
     kmeans.fit(features_normalized)
     print(f"  [OK] KMeans fitted")
 
+    if tile_mode:
+        print(f"\n[4/5] Tiled classification (multiprocessing)...")
+        tile_size = _auto_tile_size(height, width, tile_max_pixels)
+        windows = _generate_tile_windows(width, height, tile_size, tile_overlap)
+        output_dir = _resolve_tile_output_dir(path, tile_output_dir, "_classified_tiles")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        color_table = _build_color_table(classes, n_clusters)
+        scaler_mean = scaler.mean_.astype(np.float32)
+        scaler_scale = scaler.scale_.astype(np.float32)
+        centers = kmeans.cluster_centers_.astype(np.float32)
+
+        # Determine max workers: use tile_workers if specified, or fill up to max_threads (if set), else all CPUs
+        if tile_workers and tile_workers > 0:
+            max_workers = tile_workers
+        elif max_threads and max_threads > 0:
+            max_workers = max_threads
+        else:
+            max_workers = max(1, os.cpu_count() or 1)
+        
+        jobs = []
+        for row, col, h, w in windows:
+            tile_name = f"{path.stem}_tile_r{row}_c{col}.tif"
+            jobs.append((
+                raster_path,
+                (row, col, h, w),
+                feature_flags,
+                scaler_mean,
+                scaler_scale,
+                centers,
+                color_table,
+                smoothing,
+                str(output_dir),
+                tile_name
+            ))
+
+        tile_outputs: List[str] = []
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_classify_tile_worker, job) for job in jobs]
+            for future in as_completed(futures):
+                tile_outputs.append(future.result())
+
+        print(f"  [OK] Wrote {len(tile_outputs)} tiles to {output_dir}")
+        print("\n" + "="*70)
+        print("[OK] STEP 1 COMPLETE: Classification & Export (Tiles)")
+        print("="*70)
+
+        return {
+            "status": "ok",
+            "outputPath": str(output_dir),
+            "tileOutputs": sorted(tile_outputs),
+            "message": "Classification complete (tiles). Use output directory for Step 2."
+        }
+
     # === NN assignment ===
     print(f"\n[4/5] Assigning pixels to clusters...")
     distances = cdist(features_normalized, kmeans.cluster_centers_, metric='euclidean')
@@ -484,13 +800,22 @@ def classify_and_export(
     
     print(f"  Classes after smoothing: {np.unique(predicted_raster)}")
 
+    # === Shadow detection and inference ===
+    if detect_shadows:
+        print(f"\n[6/6] Detecting and inferring shadows...")
+        predicted_raster = _detect_shadows_and_infer(predicted_raster, raster_data)
+        print(f"  [OK] Shadow detection complete")
+        step_num = 7
+    else:
+        step_num = 6
+    
     # === Save classification ===
     if output_path:
         output_color_path = Path(output_path)
     else:
         output_color_path = path.with_name(path.stem + "_classified.tif")
     
-    print(f"\n[6/6] Saving classified output...")
+    print(f"\n[{step_num}/{step_num}] Saving classified output...")
     print(f"  Output: {output_color_path}")
     
     # Compute colors
@@ -531,7 +856,13 @@ def rasterize_vectors_onto_classification(
     classification_path: str,
     vector_layers: List[Dict[str, str]],
     classes: List[Dict[str, str]],
-    output_path: str | None = None
+    output_path: str | None = None,
+    tile_mode: bool = False,
+    tile_max_pixels: int = 512 * 512,
+    tile_overlap: int = 0,
+    tile_output_dir: str | None = None,
+    tile_workers: Optional[int] = None,
+    max_threads: Optional[int] = None
 ) -> Dict[str, object]:
     """
     Step 2: Rasterize vector layers onto an existing classification file.
@@ -553,20 +884,38 @@ def rasterize_vectors_onto_classification(
     print("STEP 2: VECTOR RASTERIZATION")
     print("="*70)
     
-    # === Load classification ===
+    # === Load classification metadata ===
     print(f"\n[1/3] Loading classification: {classif_path.name}")
-    with rasterio.open(classif_path) as src:
-        classif_data = src.read(1)  # Read first band (classification values)
-        profile = src.profile.copy()
-        transform = src.transform
-        crs = _normalize_pseudo_mercator_crs(src.crs)
-        height, width = classif_data.shape
+    classif_data = None
+    if classif_path.is_dir():
+        tile_files = sorted(classif_path.glob("*.tif"))
+        if not tile_files:
+            return {"status": "error", "message": f"No tiles found in: {classification_path}"}
+        with rasterio.open(tile_files[0]) as src:
+            profile = src.profile.copy()
+            transform = src.transform
+            crs = _normalize_pseudo_mercator_crs(src.crs)
+            height, width = src.height, src.width
+    elif tile_mode:
+        with rasterio.open(classif_path) as src:
+            profile = src.profile.copy()
+            transform = src.transform
+            crs = _normalize_pseudo_mercator_crs(src.crs)
+            height, width = src.height, src.width
+    else:
+        with rasterio.open(classif_path) as src:
+            classif_data = src.read(1)  # Read first band (classification values)
+            profile = src.profile.copy()
+            transform = src.transform
+            crs = _normalize_pseudo_mercator_crs(src.crs)
+            height, width = classif_data.shape
 
     profile["crs"] = crs
     
     print(f"  Shape: {height}x{width}")
-    print(f"  Data range: {np.min(classif_data)}-{np.max(classif_data)}")
-    print(f"  Classes: {np.unique(classif_data)}")
+    if classif_data is not None:
+        print(f"  Data range: {np.min(classif_data)}-{np.max(classif_data)}")
+        print(f"  Classes: {np.unique(classif_data)}")
     
     # Update profile to single-band for intermediate processing
     profile.update(count=1, dtype=np.uint16, interleave='band')
@@ -619,6 +968,60 @@ def rasterize_vectors_onto_classification(
             "status": "ok",
             "outputPath": str(classif_path),
             "message": "No vectors to rasterize"
+        }
+
+    if tile_mode or classif_path.is_dir():
+        print(f"\n[3/3] Rasterizing vectors (tiles)...")
+        output_dir = _resolve_tile_output_dir(classif_path, tile_output_dir or output_path, "_with_vectors_tiles")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        layer_geoms: List[Tuple[List, int]] = []
+        n_clusters = len(classes)
+        for idx, (_, gdf) in enumerate(validated_vectors):
+            burn_value = n_clusters + idx + 1
+            geoms = [geom for geom in gdf.geometry if geom is not None and not geom.is_empty]
+            layer_geoms.append((geoms, burn_value))
+
+        jobs = []
+        if classif_path.is_dir():
+            tile_inputs = sorted(classif_path.rglob("*.tif"))
+            if not tile_inputs:
+                return {"status": "error", "message": f"No tiles found in: {classification_path}"}
+            print(f"  Tiles found: {len(tile_inputs)}")
+            for tile_path in tile_inputs:
+                rel_name = tile_path.relative_to(classif_path).as_posix().replace("/", "__")
+                jobs.append((str(tile_path), None, layer_geoms, str(output_dir), rel_name))
+        else:
+            tile_size = _auto_tile_size(height, width, tile_max_pixels)
+            windows = _generate_tile_windows(width, height, tile_size, tile_overlap)
+            print(f"  Tiles planned: {len(windows)} (tile_size={tile_size}, overlap={tile_overlap})")
+            for row, col, h, w in windows:
+                tile_name = f"{classif_path.stem}_tile_r{row}_c{col}.tif"
+                jobs.append((str(classif_path), (row, col, h, w), layer_geoms, str(output_dir), tile_name))
+
+        # Determine max workers: use tile_workers if specified, or fill up to max_threads (if set), else all CPUs
+        if tile_workers and tile_workers > 0:
+            max_workers = tile_workers
+        elif max_threads and max_threads > 0:
+            max_workers = max_threads
+        else:
+            max_workers = max(1, os.cpu_count() or 1)
+        
+        tile_outputs: List[str] = []
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_rasterize_tile_worker, job) for job in jobs]
+            for future in as_completed(futures):
+                tile_outputs.append(future.result())
+
+        print(f"\n[OK] Vector rasterization complete (tiles)")
+        print(f"  Output: {output_dir}")
+        print("="*70)
+
+        return {
+            "status": "ok",
+            "outputPath": str(output_dir),
+            "tileOutputs": sorted(tile_outputs),
+            "message": "Vector rasterization complete (tiles)"
         }
     
     # === Rasterize vectors ===
@@ -745,7 +1148,8 @@ def _build_class_map(classes: List[Dict[str, str]]) -> Dict[str, int]:
 def _extract_pixel_features(
     raster_data: np.ndarray, 
     feature_flags: Dict[str, bool],
-    window_size: int = 3
+    window_size: int = 3,
+    verbose: bool = True
 ) -> np.ndarray:
     """
     Extract features for each pixel directly (not superpixels).
@@ -766,7 +1170,8 @@ def _extract_pixel_features(
     feature_list = []
     half_win = window_size // 2
     
-    print(f"    Extracting features for {n_pixels} pixels...")
+    if verbose:
+        print(f"    Extracting features for {n_pixels} pixels...")
     
     # === Spectral features (mean of each band in local window) ===
     if feature_flags.get("spectral", True):
@@ -776,7 +1181,8 @@ def _extract_pixel_features(
             from scipy.ndimage import uniform_filter
             local_mean = uniform_filter(band, size=window_size, mode='reflect')
             feature_list.append(local_mean.reshape(-1))
-        print(f"    [OK] Spectral: {n_bands} features")
+        if verbose:
+            print(f"    [OK] Spectral: {n_bands} features")
     
     # === Texture features (variance in local window) ===
     if feature_flags.get("texture", True):
@@ -788,7 +1194,8 @@ def _extract_pixel_features(
         variance = np.maximum(variance, 0)  # Avoid negative due to numerical errors
         std_dev = np.sqrt(variance)
         feature_list.append(std_dev.reshape(-1))
-        print(f"    [OK] Texture: 1 feature (std dev)")
+        if verbose:
+            print(f"    [OK] Texture: 1 feature (std dev)")
     
     # === Spectral indices (NDVI, etc.) ===
     if feature_flags.get("indices", True):
@@ -798,9 +1205,11 @@ def _extract_pixel_features(
             nir = raster_hwb[:, :, 3].astype(np.float32)
             ndvi = (nir - red) / (nir + red + 1e-6)
             feature_list.append(ndvi.reshape(-1))
-            print(f"    [OK] Indices: 1 feature (NDVI)")
+            if verbose:
+                print(f"    [OK] Indices: 1 feature (NDVI)")
         else:
-            print(f"    [ERROR] Not enough bands for indices (need >= 4, got {n_bands})")
+            if verbose:
+                print(f"    [ERROR] Not enough bands for indices (need >= 4, got {n_bands})")
     
     if not feature_list:
         # Fallback: just use first band
@@ -808,7 +1217,8 @@ def _extract_pixel_features(
     
     # Stack features into (n_pixels, n_features)
     features = np.stack(feature_list, axis=1)
-    print(f"    Final feature shape: {features.shape}")
+    if verbose:
+        print(f"    Final feature shape: {features.shape}")
     
     return features
 
@@ -975,7 +1385,8 @@ def _hex_to_rgb(value: str) -> Tuple[int, int, int]:
 
 def _apply_color_table(
     class_raster: np.ndarray,
-    colors: List[Tuple[int, int, int]]
+    colors: List[Tuple[int, int, int]],
+    verbose: bool = True
 ) -> np.ndarray:
     """
     Apply colors to classification result - pure classification output.
@@ -984,13 +1395,14 @@ def _apply_color_table(
     height, width = class_raster.shape
     rgb = np.zeros((3, height, width), dtype=np.uint8)
     
-    print(f"    [Color Apply] Input raster shape: {class_raster.shape}, dtype: {class_raster.dtype}")
-    print(f"    [Color Apply] Input raster range: min={np.min(class_raster)}, max={np.max(class_raster)}")
-    print(f"    [Color Apply] Color table size: {len(colors)}")
-    unique_classes = np.unique(class_raster)
-    print(f"    [Color Apply] Unique class values: {unique_classes}")
-    print(f"    [Color Apply] Color table: {colors}")
-    print(f"    [Color Apply] Mapping: class N -> colors[N-1]")
+    if verbose:
+        print(f"    [Color Apply] Input raster shape: {class_raster.shape}, dtype: {class_raster.dtype}")
+        print(f"    [Color Apply] Input raster range: min={np.min(class_raster)}, max={np.max(class_raster)}")
+        print(f"    [Color Apply] Color table size: {len(colors)}")
+        unique_classes = np.unique(class_raster)
+        print(f"    [Color Apply] Unique class values: {unique_classes}")
+        print(f"    [Color Apply] Color table: {colors}")
+        print(f"    [Color Apply] Mapping: class N -> colors[N-1]")
     
     # Apply class colors
     total_pixels = height * width
@@ -1006,23 +1418,27 @@ def _apply_color_table(
             rgb[2][mask] = b
             applied_count += count
             uncolored_pixels -= count
-            print(f"      Mapping class {idx} -> color {idx-1}: ({r}, {g}, {b}) - {count} pixels")
+            if verbose:
+                print(f"      Mapping class {idx} -> color {idx-1}: ({r}, {g}, {b}) - {count} pixels")
         else:
-            print(f"      Class {idx} not found in raster (would use color {idx-1}: ({r}, {g}, {b}))")
+            if verbose:
+                print(f"      Class {idx} not found in raster (would use color {idx-1}: ({r}, {g}, {b}))")
     
     # Check for uncolored pixels
     black_mask = (rgb[0] == 0) & (rgb[1] == 0) & (rgb[2] == 0)
     black_count = np.sum(black_mask)
     
-    print(f"    [Color Apply] Pixels colored: {applied_count}/{total_pixels}")
-    print(f"    [Color Apply] Black (0,0,0) pixels: {black_count}/{total_pixels}")
-    print(f"    [Color Apply] RGB final ranges: R={np.min(rgb[0])}-{np.max(rgb[0])}, G={np.min(rgb[1])}-{np.max(rgb[1])}, B={np.min(rgb[2])}-{np.max(rgb[2])}")
+    if verbose:
+        print(f"    [Color Apply] Pixels colored: {applied_count}/{total_pixels}")
+        print(f"    [Color Apply] Black (0,0,0) pixels: {black_count}/{total_pixels}")
+        print(f"    [Color Apply] RGB final ranges: R={np.min(rgb[0])}-{np.max(rgb[0])}, G={np.min(rgb[1])}-{np.max(rgb[1])}, B={np.min(rgb[2])}-{np.max(rgb[2])}")
     
     # Check if all pixels are black
     if black_count == total_pixels:
-        print(f"    [Color Apply] ERROR: ALL PIXELS ARE BLACK!")
-        print(f"    [Color Apply] Class values found: {unique_classes}")
-        print(f"    [Color Apply] Expected class range: 1 to {len(colors)}")
-        print(f"    [Color Apply] Check if class values match the expected range")
+        if verbose:
+            print(f"    [Color Apply] ERROR: ALL PIXELS ARE BLACK!")
+            print(f"    [Color Apply] Class values found: {unique_classes}")
+            print(f"    [Color Apply] Expected class range: 1 to {len(colors)}")
+            print(f"    [Color Apply] Check if class values match the expected range")
     
     return rgb

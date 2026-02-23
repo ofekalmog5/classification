@@ -1,4 +1,5 @@
 import threading
+import os
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,10 @@ class App:
         self.use_texture = tk.BooleanVar(value=True)
         self.use_indices = tk.BooleanVar(value=True)
         self.class_count = tk.IntVar(value=3)
+        self.use_tiling = tk.BooleanVar(value=False)
+        self.tile_workers = tk.IntVar(value=max(1, os.cpu_count() or 1))
+        self.use_max_threads = tk.BooleanVar(value=False)
+        self.detect_shadows = tk.BooleanVar(value=False)
 
         self.classes: List[ClassItem] = []
         self.vector_layers: List[VectorLayer] = []
@@ -46,6 +51,8 @@ class App:
     def _build_ui(self) -> None:
         header = ttk.Frame(self.root, padding=12)
         header.pack(fill=tk.X)
+        header.columnconfigure(1, weight=1)
+        header.columnconfigure(3, weight=0)
 
         ttk.Label(header, text="Input raster:").grid(row=0, column=0, sticky=tk.W)
         ttk.Entry(header, textvariable=self.raster_path, width=60).grid(row=0, column=1, padx=6)
@@ -59,6 +66,17 @@ class App:
         smoothing_box = ttk.Combobox(header, textvariable=self.smoothing, values=["none", "median_1", "median_2", "median_3", "median_5"], width=20)
         smoothing_box.grid(row=2, column=1, sticky=tk.W, pady=(8, 0))
         smoothing_box.state(["readonly"])
+
+        perf_frame = ttk.LabelFrame(header, text="Performance", padding=8)
+        perf_frame.grid(row=0, column=3, rowspan=3, sticky=tk.NE, padx=(12, 0), pady=(0, 0))
+        ttk.Checkbutton(perf_frame, text="Use tile processing", variable=self.use_tiling).grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(perf_frame, text="Workers:").grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+        ttk.Spinbox(perf_frame, from_=1, to=64, textvariable=self.tile_workers, width=6).grid(row=1, column=1, padx=(6, 0), pady=(6, 0))
+        ttk.Checkbutton(perf_frame, text="Use max threads", variable=self.use_max_threads).grid(row=2, column=0, sticky=tk.W, pady=(6, 0))
+        
+        class_frame = ttk.LabelFrame(header, text="Classification", padding=8)
+        class_frame.grid(row=0, column=4, rowspan=3, sticky=tk.NE, padx=(8, 0), pady=(0, 0))
+        ttk.Checkbutton(class_frame, text="Detect shadows", variable=self.detect_shadows).grid(row=0, column=0, sticky=tk.W)
 
         mode_frame = ttk.LabelFrame(header, text="Imagery type", padding=8)
         mode_frame.grid(row=3, column=0, columnspan=3, sticky=tk.W + tk.E, pady=(12, 0))
@@ -333,6 +351,7 @@ class App:
     def _run_step1_job(self) -> None:
         """Execute Step 1: Classification and export"""
         output = self.output_path.get() if self.output_path.get() else None
+        max_threads = os.cpu_count() if self.use_max_threads.get() else None
         try:
             result = classify_and_export(
                 raster_path=self.raster_path.get(),
@@ -343,7 +362,14 @@ class App:
                     "texture": self.use_texture.get(),
                     "indices": self.use_indices.get()
                 },
-                output_path=output
+                output_path=output,
+                tile_mode=self.use_tiling.get(),
+                tile_max_pixels=512 * 512,
+                tile_overlap=0,
+                tile_output_dir=None,
+                tile_workers=self.tile_workers.get(),
+                detect_shadows=self.detect_shadows.get(),
+                max_threads=max_threads
             )
             self.root.after(0, lambda: self._finish_step1(result))
         except Exception as e:
@@ -353,6 +379,8 @@ class App:
     def _finish_step1(self, result: Dict[str, object]) -> None:
         if result.get("status") == "ok":
             output_file = result.get('outputPath')
+            if self.use_tiling.get() and output_file:
+                self.output_path.set(output_file)
             messagebox.showinfo("Step 1 Complete", f"Classification saved:\n{output_file}")
             self.status.set("Step 1 Done")
         else:
@@ -365,6 +393,9 @@ class App:
         if not self.output_path.get():
             messagebox.showwarning("Missing input", "Provide the classification file path from Step 1.")
             return
+        if self.use_tiling.get() and not Path(self.output_path.get()).is_dir():
+            messagebox.showwarning("Missing tiles", "When tile processing is enabled, select the tiles directory from Step 1.")
+            return
         if not self.vector_layers:
             messagebox.showwarning("No vectors", "Add at least one vector layer.")
             return
@@ -374,18 +405,27 @@ class App:
 
     def _run_step2_job(self) -> None:
         """Execute Step 2: Rasterize vectors onto classification"""
+        max_threads = os.cpu_count() if self.use_max_threads.get() else None
         try:
             # For Step 2, the output_path is the input classification file
             classification_file = self.output_path.get()
-            
-            # Generate output path if not explicitly set
-            output_path = str(Path(classification_file).parent / (Path(classification_file).stem + "_with_vectors.tif"))
+            if self.use_tiling.get() and Path(classification_file).is_dir():
+                output_path = str(Path(classification_file).with_name(Path(classification_file).name + "_with_vectors_tiles"))
+            else:
+                # Generate output path if not explicitly set
+                output_path = str(Path(classification_file).parent / (Path(classification_file).stem + "_with_vectors.tif"))
             
             result = rasterize_vectors_onto_classification(
                 classification_path=classification_file,
                 vector_layers=[item.__dict__ for item in self.vector_layers],
                 classes=[item.__dict__ for item in self.classes],
-                output_path=output_path
+                output_path=output_path,
+                tile_mode=self.use_tiling.get(),
+                tile_max_pixels=512 * 512,
+                tile_overlap=0,
+                tile_output_dir=None,
+                tile_workers=self.tile_workers.get(),
+                max_threads=max_threads
             )
             self.root.after(0, lambda: self._finish_step2(result))
         except Exception as e:
@@ -414,6 +454,7 @@ class App:
     def _run_full_job(self) -> None:
         """Execute full pipeline"""
         output = self.output_path.get() if self.output_path.get() else None
+        max_threads = os.cpu_count() if self.use_max_threads.get() else None
         try:
             result = classify(
                 raster_path=self.raster_path.get(),
@@ -425,7 +466,14 @@ class App:
                     "texture": self.use_texture.get(),
                     "indices": self.use_indices.get()
                 },
-                output_path=output
+                output_path=output,
+                tile_mode=self.use_tiling.get(),
+                tile_max_pixels=512 * 512,
+                tile_overlap=0,
+                tile_output_dir=None,
+                tile_workers=self.tile_workers.get(),
+                detect_shadows=self.detect_shadows.get(),
+                max_threads=max_threads
             )
             self.root.after(0, lambda: self._finish_full(result))
         except Exception as e:
