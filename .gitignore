@@ -19,3 +19,5 @@ data/
 *.log
 .env
 .DS_Store
+Resources/
+Resources.zip
