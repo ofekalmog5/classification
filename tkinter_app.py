@@ -11,7 +11,8 @@ from typing import Dict, List
 from backend.app.core import (classify, classify_and_export, rasterize_vectors_onto_classification,
                                MEA_CLASSES as _MEA_CLASSES_CORE, train_kmeans_model,
                                build_shared_color_table, suggest_tile_size,
-                               _fmt_duration, _build_stats_table)
+                               _fmt_duration, _build_stats_table,
+                               apply_road_object_removal)
 
 
 @dataclass
@@ -168,6 +169,7 @@ class App:
         
         ttk.Button(button_frame, text="Step 1: Run Classification", command=self._run_step1).pack(side=tk.RIGHT, padx=4)
         ttk.Button(button_frame, text="Step 2: Rasterize Vectors", command=self._run_step2).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(button_frame, text="Step 3: Remove Road Objects", command=self._run_remove_road_objects).pack(side=tk.RIGHT, padx=4)
         ttk.Button(button_frame, text="Full Pipeline", command=self._run_full).pack(side=tk.RIGHT, padx=4)
         ttk.Button(button_frame, text="Run for MEA", command=self._run_mea).pack(side=tk.RIGHT, padx=4)
         
@@ -498,6 +500,23 @@ class App:
         self.progressbar.configure(mode='determinate', maximum=100, value=100)
         self.progress_text.set("")
 
+    def _on_phase_progress(self, phase: str, done: int, total: int) -> None:
+        """Called from worker thread (via root.after) to show per-phase progress."""
+        if total <= 0:
+            if self.progressbar.cget('mode') != 'indeterminate':
+                self.progressbar.stop()
+                self.progressbar.configure(mode='indeterminate', maximum=100, value=0)
+            self.progressbar.start(12)
+            self.progress_text.set("...")
+        else:
+            if self.progressbar.cget('mode') != 'determinate' or int(self.progressbar.cget('maximum')) != total:
+                self.progressbar.stop()
+                self.progressbar.configure(mode='determinate', maximum=total, value=0)
+            self.progressbar['value'] = done
+            pct = int(done / total * 100)
+            self.progress_text.set(f"{pct}%")
+        self.status.set(phase)
+
     def _elapsed_str(self) -> str:
         secs = time.time() - getattr(self, '_run_start', time.time())
         if secs < 60:
@@ -626,6 +645,10 @@ class App:
                         pretrained_kmeans=_shared_kmeans,
                         pretrained_color_table=_shared_color_table,
                         pretrained_mea_mapping=_shared_mea_mapping,
+                        progress_callback=(
+                            (lambda p, d, t: self.root.after(0, lambda p2=p, d2=d, t2=t: self._on_phase_progress(p2, d2, t2)))
+                            if max_image_workers == 1 else None
+                        ),
                     )
                     if result.get("status") == "ok":
                         return ("ok", result.get("outputPath") or out_path, result.get("meaMapping"))
@@ -672,6 +695,8 @@ class App:
                 else:
                     output_for_single = None
                     tile_out_single = None
+                def _phase_cb(phase: str, done: int, total: int) -> None:
+                    self.root.after(0, lambda p=phase, d=done, t=total: self._on_phase_progress(p, d, t))
                 result = classify_and_export(
                     raster_path=str(raster_input),
                     classes=[item.__dict__ for item in self.classes],
@@ -688,7 +713,8 @@ class App:
                     tile_output_dir=tile_out_single,
                     tile_workers=self.tile_workers.get(),
                     detect_shadows=self.detect_shadows.get(),
-                    max_threads=max_threads
+                    max_threads=max_threads,
+                    progress_callback=_phase_cb
                 )
                 self.root.after(0, lambda: self._finish_step1(result))
         except Exception as e:
@@ -737,6 +763,55 @@ class App:
             error_msg = result.get("message", str(result))
             messagebox.showerror("Error", f"Step 1 failed:\n{error_msg}")
             self.status.set("Step 1 Error")
+
+    def _run_remove_road_objects(self) -> None:
+        """Step 3: post-process an existing classified raster to remove small
+        objects enclosed by asphalt (cars, lane paint, etc.)."""
+        out = self.output_path.get().strip()
+        # Resolve target file: use output_path if it points to an existing raster file.
+        if out and Path(out).is_file() and Path(out).suffix.lower() in (".tif", ".tiff", ".img"):
+            target = out
+            if not messagebox.askyesno(
+                "Remove Road Objects",
+                f"Run on:\n{target}\n\nThis overwrites the file in-place.",
+            ):
+                return
+        else:
+            default_dir = str(Path(out).parent) if out else os.getcwd()
+            target = filedialog.askopenfilename(
+                title="Select classified raster",
+                initialdir=default_dir,
+                filetypes=[("GeoTIFF", "*.tif *.tiff"), ("IMG", "*.img"), ("All files", "*.*")],
+            )
+            if not target:
+                return
+
+        self.status.set("Running: Remove Road Objects...")
+        self.root.after(0, self._start_progress)
+        _phase_cb = lambda p, d, t: self.root.after(0, lambda p2=p, d2=d, t2=t: self._on_phase_progress(p2, d2, t2))
+        thread = threading.Thread(
+            target=self._run_remove_road_objects_job,
+            args=(target, _phase_cb),
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_remove_road_objects_job(self, target: str, progress_callback) -> None:
+        try:
+            out_path = apply_road_object_removal(target, progress_callback=progress_callback)
+            self.root.after(0, lambda: self._finish_remove_road_objects(True, out_path))
+        except Exception as exc:
+            self.root.after(0, lambda msg=str(exc): self._finish_remove_road_objects(False, msg))
+
+    def _finish_remove_road_objects(self, ok: bool, msg: str) -> None:
+        self._stop_progress()
+        elapsed = self._elapsed_str()
+        if ok:
+            messagebox.showinfo("Remove Road Objects", f"Done  ({elapsed})\n\nSaved:\n{msg}")
+            self.status.set(f"Road objects removed  ({elapsed})")
+        else:
+            messagebox.showerror("Remove Road Objects", f"Failed:\n{msg}")
+            self.status.set("Remove Road Objects Error")
 
     def _run_step2(self) -> None:
         """Run only vector rasterization on existing classification"""

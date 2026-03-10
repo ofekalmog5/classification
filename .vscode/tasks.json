@@ -1,0 +1,37 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Backend: FastAPI Server",
+			"type": "shell",
+			"command": ".venv\\Scripts\\python.exe -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload",
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Frontend: Vite Dev Server",
+			"type": "shell",
+			"command": "npm run dev",
+			"options": {
+				"cwd": "${workspaceFolder}/web_app"
+			},
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Start Web App (Backend + Frontend)",
+			"dependsOn": [
+				"Backend: FastAPI Server",
+				"Frontend: Vite Dev Server"
+			],
+			"dependsOrder": "parallel",
+			"problemMatcher": [],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			}
+		}
+	]
+}

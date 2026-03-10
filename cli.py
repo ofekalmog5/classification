@@ -349,7 +349,14 @@ def main():
     parser.add_argument(
         "--detect-shadows",
         action="store_true",
-        help="Enable shadow detection and class inference.",
+        default=False,
+        help="Enable shadow detection, pre-processing balance and class inference (default: off).",
+    )
+    parser.add_argument(
+        "--no-detect-shadows",
+        action="store_false",
+        dest="detect_shadows",
+        help="Disable shadow detection and pre-processing.",
     )
     parser.add_argument(
         "--vector",

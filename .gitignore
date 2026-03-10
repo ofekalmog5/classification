@@ -3,9 +3,12 @@ dist/
 app/dist/
 app/node_modules/
 app/.venv/
+web_app/node_modules/
+web_app/dist/
 backend/.venv/
 backend/__pycache__/
 backend/*.pyc
+build/
 .venv/
 .venv-1/
 __pycache__/

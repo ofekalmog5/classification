@@ -5,7 +5,7 @@ import os
 import sys
 import site
 import time as _time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from rasterio.windows import Window
 from rasterio.windows import transform as window_transform
 from rasterio.transform import array_bounds
@@ -110,10 +110,10 @@ _setup_proj_lib()
 # ── GDAL / VSI I/O tuning (must come before any rasterio import) ────────────
 # Larger block-cache reduces tile re-reads; ALL_CPUS enables parallel
 # compression/decompression; VSI read-cache speeds up windowed reads.
-os.environ.setdefault("GDAL_CACHEMAX",      "512")        # 512 MB GDAL block cache
+os.environ.setdefault("GDAL_CACHEMAX",      "1024")       # 1 GB GDAL block cache
 os.environ.setdefault("GDAL_NUM_THREADS",   "ALL_CPUS")   # parallel compress/decompress
 os.environ.setdefault("VSI_CACHE",          "TRUE")        # per-handle read-ahead cache
-os.environ.setdefault("VSI_CACHE_SIZE",     "67108864")   # 64 MB per handle
+os.environ.setdefault("VSI_CACHE_SIZE",     "134217728")  # 128 MB per handle
 os.environ.setdefault("GDAL_TIFF_INTERNAL_MASK", "YES")   # keep masks inside TIFF
 
 import geopandas as gpd
@@ -127,13 +127,133 @@ from skimage.morphology import disk
 from skimage.measure import label as sk_label
 from sklearn.cluster import KMeans, MiniBatchKMeans
 from sklearn.preprocessing import StandardScaler
-from scipy.optimize import linear_sum_assignment
 
 # Max pixels sampled for KMeans training (quality is unchanged above ~50k)
 MAX_TRAIN_PIXELS = 100_000
+# Adaptive sampling bounds: PCA-based estimate will clamp to this range.
+_MIN_TRAIN_PIXELS = 20_000
+_MAX_TRAIN_PIXELS = 120_000
+_PCA_PRESAMPLE    = 8_000    # tiny pre-sample for variance estimation
 import math
 
 VECTOR_OVERLAY_COLOR = (255, 255, 0)
+
+
+def _pca_adaptive_n_train(
+    pixel_features: np.ndarray,
+    n_clusters: int,
+) -> int:
+    """Estimate an adequate training-sample size using a fast PCA on a tiny sub-sample.
+
+    **Idea** — the number of training pixels KMeans needs scales with the
+    *spectral complexity* of the image, not its pixel count.  A tile that is
+    almost entirely one material (road, bare soil) can be clustered perfectly
+    from 20 K pixels, while a mixed urban scene may need 100 K+.
+
+    Algorithm
+    ---------
+    1. Draw a tiny random sub-sample (``_PCA_PRESAMPLE`` pixels, default 8 K).
+    2. Standardise features (important: RGB 0-255 vs NDVI -1..1) then run PCA.
+    3. Compute the **normalised Shannon entropy** of the eigenvalue spectrum:
+       - *High entropy* (eigenvalues ≈ equal) → isotropic noise, one material,
+         uniform scene → **simple** → fewer training pixels.
+       - *Low entropy* (a few eigenvalues dominate) → clear cluster structure,
+         multiple distinct materials → **complex** → more training pixels.
+    4. Combine entropy-based *complexity* score with ``n_clusters`` to produce
+       the final pixel budget, linearly interpolated between
+       ``_MIN_TRAIN_PIXELS`` (20 K) and ``_MAX_TRAIN_PIXELS`` (120 K).
+
+    The PCA itself runs in < 5 ms on 8 K × 5 features — negligible overhead.
+
+    Returns
+    -------
+    int
+        Recommended number of training pixels, clamped to
+        [``_MIN_TRAIN_PIXELS``, ``_MAX_TRAIN_PIXELS``].
+    """
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
+
+    n_px, n_feat = pixel_features.shape
+    if n_px <= _MIN_TRAIN_PIXELS or n_feat <= 1:
+        return min(n_px, MAX_TRAIN_PIXELS)
+
+    # ---- tiny random sub-sample for speed ----------------------------------
+    rng = np.random.default_rng(42)
+    n_pre = min(_PCA_PRESAMPLE, n_px)
+    idx = rng.choice(n_px, n_pre, replace=False)
+    sample = pixel_features[idx].astype(np.float64)
+
+    # Standardise so that RGB (0-255) and NDVI (-1..1) contribute equally
+    sample = StandardScaler().fit_transform(sample)
+
+    # ---- lightweight PCA ---------------------------------------------------
+    n_comp = min(n_feat, n_pre)
+    pca = PCA(n_components=n_comp, random_state=42)
+    pca.fit(sample)
+
+    # ---- eigenvalue entropy → complexity -----------------------------------
+    ev_ratio = pca.explained_variance_ratio_               # sums to ~1.0
+    ev_ratio = np.clip(ev_ratio, 1e-12, None)              # avoid log(0)
+    entropy = -float(np.sum(ev_ratio * np.log(ev_ratio)))
+    max_entropy = float(np.log(n_comp))                    # uniform distrib.
+    norm_entropy = entropy / max(max_entropy, 1e-9)        # 0 → 1
+
+    # complexity: 0 = simple (high entropy), 1 = complex (low entropy)
+    complexity = 1.0 - norm_entropy
+
+    # ---- map complexity → pixel budget -------------------------------------
+    # Weight by n_clusters: more clusters → need more samples to separate
+    cluster_weight = min(1.0, n_clusters / 15.0)
+    # Final fraction: blend 60 % complexity + 40 % cluster demand
+    frac = 0.6 * complexity + 0.4 * cluster_weight
+
+    raw = _MIN_TRAIN_PIXELS + frac * (_MAX_TRAIN_PIXELS - _MIN_TRAIN_PIXELS)
+    result = int(np.clip(raw, _MIN_TRAIN_PIXELS, _MAX_TRAIN_PIXELS))
+    result = min(result, n_px)  # never exceed available pixels
+
+    print(f"    [PCA] feats={n_feat}, entropy={norm_entropy:.2f}, "
+          f"complexity={complexity:.2f}, clusters={n_clusters} "
+          f"→ train_pixels={result:,}")
+    return result
+
+
+_MEA_ROAD_MATERIALS = {"BM_ASPHALT", "BM_CONCRETE", "BM_PAINT_ASPHALT", "BM_ROCK"}
+_MEA_VEG_MATERIALS = {"BM_LAND_GRASS", "BM_LAND_DRY_GRASS", "BM_VEGETATION", "BM_FOLIAGE"}
+_MEA_SOIL_MATERIALS = {"BM_SOIL", "BM_EARTHEN", "BM_SAND"}
+_MEA_METAL_MATERIALS = {"BM_METAL", "BM_METAL_STEEL"}
+
+
+def _mea_material_type(name: str) -> str:
+    if name in _MEA_ROAD_MATERIALS:
+        return "ROAD_SURFACE"
+    if name in _MEA_VEG_MATERIALS:
+        return "VEGETATION"
+    if name in _MEA_SOIL_MATERIALS:
+        return "SOIL_EARTH"
+    if name in _MEA_METAL_MATERIALS:
+        return "METAL"
+    if name == "BM_WATER":
+        return "WATER"
+    if name == "BM_SHINGLE":
+        return "ROOFING"
+    return "OTHER"
+
+
+def _write_mea_palette_reference(output_dir: Path) -> str:
+    """Write a CSV reference of MEA classes/materials/final RGB values."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    palette_path = output_dir / "mea_palette_reference.csv"
+    lines = ["class_id,material,material_type,hex_color,final_rgb"]
+    for cls in MEA_CLASSES:
+        name = cls.get("name", "UNKNOWN")
+        hex_color = cls.get("color", "#000000")
+        rgb = _hex_to_rgb(hex_color)
+        lines.append(
+            f"{cls.get('id','')},{name},{_mea_material_type(name)},{hex_color},\"{rgb[0]},{rgb[1]},{rgb[2]}\""
+        )
+    palette_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(palette_path)
 
 # Shared MEA material class definitions (used by GUI and CLI)
 MEA_CLASSES = [
@@ -156,21 +276,21 @@ MEA_CLASSES = [
 
 # Relative expected prevalence in urban aerial scenes (higher = usually more common).
 MEA_MATERIAL_FREQUENCY_PRIOR_URBAN: Dict[str, float] = {
-    "BM_CONCRETE": 0.20,
-    "BM_ASPHALT": 0.18,
-    "BM_SOIL": 0.14,
-    "BM_EARTHEN": 0.10,
-    "BM_ROCK": 0.09,
-    "BM_SHINGLE": 0.07,
-    "BM_PAINT_ASPHALT": 0.05,
+    "BM_CONCRETE": 0.18,
+    "BM_ASPHALT": 0.16,
+    "BM_SOIL": 0.12,
+    "BM_EARTHEN": 0.09,
+    "BM_ROCK": 0.08,
+    "BM_SHINGLE": 0.06,
+    "BM_PAINT_ASPHALT": 0.04,
     "BM_SAND": 0.04,
     "BM_WATER": 0.04,
-    "BM_LAND_DRY_GRASS": 0.04,
-    "BM_LAND_GRASS": 0.03,
-    "BM_VEGETATION": 0.02,
-    "BM_FOLIAGE": 0.01,
-    "BM_METAL": 0.015,   # metal is rare in top-down urban aerial
-    "BM_METAL_STEEL": 0.008,
+    "BM_LAND_DRY_GRASS": 0.07,
+    "BM_LAND_GRASS": 0.06,
+    "BM_VEGETATION": 0.05,
+    "BM_FOLIAGE": 0.03,
+    "BM_METAL": 0.012,   # metal is rare in top-down urban aerial
+    "BM_METAL_STEEL": 0.006,
 }
 
 # Relative expected prevalence in open/rural scenes.
@@ -526,10 +646,9 @@ def suggest_tile_size(raster_path: str, workers: int = 4) -> int:
         return 1024
 
     avail = _available_ram_bytes()
-    # Budget: 50 % of available RAM shared across workers, ×6 scratch copies.
-    # We use 50 % (was 20 %) because GDAL + NumPy already own most of the
-    # other half, and the ×6 scratch multiplier is already conservative.
-    budget_bytes = avail * 0.50 / max(1, workers)
+    # Budget: 60 % of available RAM shared across workers, ×6 scratch copies.
+    # GDAL + NumPy own most of the rest; the ×6 scratch multiplier is conservative.
+    budget_bytes = avail * 0.60 / max(1, workers)
     bytes_per_px = max(bands, 3) * max(itemsize, 4) * 6  # ×6 for working copies
     max_px = int(budget_bytes / bytes_per_px)
     ideal = int(math.sqrt(max(max_px, 256 * 256)))
@@ -622,7 +741,6 @@ def _transform_geometries_to_web_mercator(gdf):
     
     return gdf_copy
 
-from scipy.spatial.distance import cdist
 from scipy.ndimage import binary_dilation, maximum_filter, minimum_filter, uniform_filter, distance_transform_edt
 import scipy.ndimage as ndi
 
@@ -630,7 +748,7 @@ import scipy.ndimage as ndi
 def _nearest_center_chunked(
     X: np.ndarray,
     centers: np.ndarray,
-    chunk: int = 65_536,
+    chunk: int = 262_144,
 ) -> np.ndarray:
     """Return the 0-based nearest-center index for every row in *X*.
 
@@ -640,26 +758,137 @@ def _nearest_center_chunked(
         ||x − c||² = ||x||² − 2 x·cᵀ + ||c||²
 
     Peak extra memory is bounded by ``chunk × K × dtype_bytes``
-    (≈ 8 MB for chunk=65 536, K=32, float32) regardless of N, whereas
+    (≈ 16 MB for chunk=131 072, K=32, float32) regardless of N, whereas
     ``cdist`` allocates the full N×K matrix at once.
 
     Both *X* and *centers* should be float32 for maximum throughput
     (BLAS SGEMM is typically 2× faster than DGEMM on float64).
+
+    When the data is large enough (> 2 chunks), processing is distributed
+    across multiple threads.  BLAS ``sgemm`` and NumPy ``argmin`` both
+    release the GIL, so thread-parallel chunks yield near-linear speed-up
+    on multi-core machines.
     """
     X = np.asarray(X, dtype=np.float32)
     centers = np.asarray(centers, dtype=np.float32)
     n = X.shape[0]
     labels = np.empty(n, dtype=np.int32)
     c2 = (centers * centers).sum(axis=1)    # (K,)
-    for start in range(0, n, chunk):
-        end = min(start + chunk, n)
-        xc = X[start:end]                    # (B, F)
-        x2 = (xc * xc).sum(axis=1)          # (B,)
-        dot = xc @ centers.T                 # (B, K)  — BLAS SGEMM
+
+    def _assign_chunk(start_end):
+        s, e = start_end
+        xc = X[s:e]                           # (B, F)
+        x2 = (xc * xc).sum(axis=1)           # (B,)
+        dot = xc @ centers.T                  # (B, K) — BLAS SGEMM
         sq = x2[:, None] + c2[None, :] - 2.0 * dot
-        np.maximum(sq, 0.0, out=sq)          # clip numerical noise
-        labels[start:end] = sq.argmin(axis=1)
+        np.maximum(sq, 0.0, out=sq)
+        labels[s:e] = sq.argmin(axis=1)
+
+    ranges = [(s, min(s + chunk, n)) for s in range(0, n, chunk)]
+
+    if len(ranges) <= 2:
+        # Small data — sequential is faster (no thread-spawn overhead)
+        for rng in ranges:
+            _assign_chunk(rng)
+    else:
+        _n_workers = min(len(ranges), max(1, (os.cpu_count() or 4)))
+        with ThreadPoolExecutor(max_workers=_n_workers) as pool:
+            list(pool.map(_assign_chunk, ranges))
+
     return labels
+
+
+# ---------------------------------------------------------------------------
+# Shadow pre-processing: balance / brighten shadows BEFORE classification
+# ---------------------------------------------------------------------------
+
+def _preprocess_shadow_balance(
+    raster_data: np.ndarray,
+    local_window: int = 61,
+    darkness_ratio: float = 0.62,
+    blend_strength: float = 0.80,
+    min_shadow_px: int = 120,
+) -> np.ndarray:
+    """Detect shadow regions and locally brighten them to match surrounding areas.
+
+    This is run **before** any classification so that shadow-darkened pixels
+    are spectrally closer to their true material colour.  The approach:
+
+    1. Compute per-pixel brightness (mean of RGB bands).
+    2. Build a local mean brightness map (``local_window``-sized box filter).
+    3. Mark shadow candidates: pixels whose brightness < ``darkness_ratio`` ×
+       local mean *and* that have low colour saturation (shadows are achromatic).
+    4. For each shadow pixel, compute a per-channel gain that lifts its
+       brightness to the surrounding non-shadow local mean, then blend it
+       back with ``blend_strength`` to avoid over-correction.
+
+    Returns a **new** raster array of the same shape and dtype with balanced
+    shadow pixels.  Non-shadow pixels are returned unchanged.
+    """
+    if raster_data.shape[0] < 3:
+        return raster_data.copy()
+
+    out = raster_data.astype(np.float32).copy()
+    r, g, b = out[0], out[1], out[2]
+
+    brightness = (r + g + b) / 3.0
+    local_mean_bright = uniform_filter(brightness, size=local_window, mode='reflect')
+
+    # Shadow candidate: darker than local context + low saturation
+    maxc = np.maximum(np.maximum(r, g), b)
+    minc = np.minimum(np.minimum(r, g), b)
+    sat = (maxc - minc) / (maxc + 1e-6)
+
+    dark_mask = brightness < (darkness_ratio * local_mean_bright)
+    low_sat_mask = sat < 0.25
+    shadow_mask = dark_mask & low_sat_mask & (brightness > 5.0)  # ignore pure black
+
+    # Remove tiny isolated noise blobs (vectorised — no Python loop)
+    shadow_labeled, n_blobs = ndi.label(shadow_mask)
+    if n_blobs > 0:
+        blob_sizes = np.bincount(shadow_labeled.ravel())
+        small_ids = np.where(blob_sizes < min_shadow_px)[0]
+        if len(small_ids) > 0:
+            shadow_mask[np.isin(shadow_labeled, small_ids)] = False
+
+    n_shadow = int(np.sum(shadow_mask))
+    if n_shadow == 0:
+        return raster_data.copy()
+
+    total_px = brightness.size
+    pct = 100.0 * n_shadow / total_px
+    print(f"    [shadow-balance] {n_shadow:,} shadow pixels ({pct:.1f}%) detected, balancing...")
+
+    # Target brightness for each shadow pixel: local mean of non-shadow neighbours.
+    # We compute local mean per band excluding shadow pixels via a simple trick:
+    # replace shadow pixels with NaN-like 0 weighting.
+    weight = np.where(shadow_mask, 0.0, 1.0).astype(np.float32)
+    weight_sum = uniform_filter(weight, size=local_window, mode='reflect')
+    weight_sum = np.maximum(weight_sum, 1e-6)
+
+    def _balance_band(band_idx):
+        """Correct one band — called from threads (uniform_filter releases GIL)."""
+        band = out[band_idx]
+        masked_band = np.where(shadow_mask, 0.0, band)
+        local_mean_band = uniform_filter(masked_band, size=local_window, mode='reflect') / weight_sum
+        current = np.maximum(band, 1e-2)
+        gain = local_mean_band / current
+        gain = np.clip(gain, 0.5, 4.0)
+        corrected = band * gain
+        band[shadow_mask] = (
+            blend_strength * corrected[shadow_mask]
+            + (1.0 - blend_strength) * band[shadow_mask]
+        )
+
+    _n_bands = min(raster_data.shape[0], 3)
+    with ThreadPoolExecutor(max_workers=_n_bands) as _tp:
+        list(_tp.map(_balance_band, range(_n_bands)))
+
+    # Clip to valid range
+    dtype_max = float(np.iinfo(raster_data.dtype).max) if np.issubdtype(raster_data.dtype, np.integer) else 1.0
+    np.clip(out, 0.0, dtype_max, out=out)
+
+    return out.astype(raster_data.dtype)
 
 
 def _detect_structures_mask(raster_data: np.ndarray, brightness_threshold: int = 150, ndvi_threshold: float = 0.3) -> np.ndarray:
@@ -722,13 +951,26 @@ def _detect_shadows_and_infer(
     # Detect structure pixels (buildings/trees and other high-object proxies)
     structure_mask = _detect_structures_mask(original_raster)
     
-    # Dilate to create a "shadow zone" around structures
-    dilated_structures = binary_dilation(structure_mask, iterations=dilation_radius)
-    
-    # Calculate brightness and local-relative darkness
+    # Parallel: dilation and brightness/local_mean are independent
     rgb_data = original_raster[:3] if original_raster.shape[0] >= 3 else original_raster
-    brightness = np.mean(rgb_data.astype(np.float32), axis=0)
-    local_mean = uniform_filter(brightness, size=11, mode='reflect')
+    _brightness = [None]
+    _local_mean = [None]
+    _dilated = [None]
+
+    def _compute_dilation():
+        _dilated[0] = binary_dilation(structure_mask, iterations=dilation_radius)
+
+    def _compute_brightness():
+        b = np.mean(rgb_data.astype(np.float32), axis=0)
+        _brightness[0] = b
+        _local_mean[0] = uniform_filter(b, size=11, mode='reflect')
+
+    with ThreadPoolExecutor(max_workers=2) as _tp:
+        list(_tp.map(lambda f: f(), [_compute_dilation, _compute_brightness]))
+
+    dilated_structures = _dilated[0]
+    brightness = _brightness[0]
+    local_mean = _local_mean[0]
     relative_shadow = brightness < np.minimum(brightness_threshold, local_mean * 0.72)
 
     # Low-saturation dark areas are more likely shadows than materials
@@ -774,28 +1016,30 @@ def _detect_shadows_and_infer(
                 sc_sizes = np.bincount(sc_labeled.ravel())
                 sc_slices = ndi.find_objects(sc_labeled)
                 _struct = ndi.generate_binary_structure(2, 1)
+                # Pre-filter: only look at blobs in [4..160] px range
+                _eligible_sc = [
+                    cid for cid in range(1, sc_n + 1)
+                    if sc_slices[cid - 1] is not None
+                    and 4 <= sc_sizes[cid] <= 160
+                ]
+                _context_ids_list = list(_context_ids)
                 excluded = 0
-                for comp_id, sl in enumerate(sc_slices, start=1):
-                    if sl is None:
-                        continue
+                for comp_id in _eligible_sc:
+                    sl = sc_slices[comp_id - 1]
                     area = int(sc_sizes[comp_id])
-                    if area < 4 or area > 160:
-                        continue  # only small-to-medium blobs
                     bb_h = sl[0].stop - sl[0].start
                     bb_w_d = sl[1].stop - sl[1].start
                     if bb_h == 0 or bb_w_d == 0:
                         continue
                     aspect = max(bb_h, bb_w_d) / max(min(bb_h, bb_w_d), 1)
                     if aspect > 5.0:
-                        continue  # very elongated → more likely a real shadow strip
+                        continue
                     compactness = area / max(bb_h * bb_w_d, 1)
                     if compactness < 0.20:
-                        continue  # very irregular shape
-                    # Check most of the blob is near building/road material
+                        continue
                     comp_px = (sc_labeled == comp_id)
                     if float(np.mean(_near_ctx[comp_px])) < 0.75:
                         continue
-                    # Verify border ring is dominated by building/road
                     r0 = max(0, sl[0].start - 2); r1 = min(height, sl[0].stop + 2)
                     c0 = max(0, sl[1].start - 2); c1 = min(width, sl[1].stop + 2)
                     loc_lbl = sc_labeled[r0:r1, c0:c1]
@@ -804,7 +1048,7 @@ def _detect_shadows_and_infer(
                     ring = ndi.binary_dilation(cmask, structure=_struct, iterations=2) & (~cmask) & (loc_cls > 0)
                     if not np.any(ring):
                         continue
-                    ctx_frac = float(np.mean(np.isin(loc_cls[ring], list(_context_ids))))
+                    ctx_frac = float(np.mean(np.isin(loc_cls[ring], _context_ids_list)))
                     if ctx_frac >= 0.50:
                         shadow_candidates[comp_px] = False
                         excluded += 1
@@ -852,20 +1096,22 @@ def _absorb_isolated_small_patches(
     """
     Absorb small isolated classification blobs into their dominant surrounding class.
 
-    Handles cases like:
-    - White paint stripes on asphalt  (small bright blob inside asphalt zone)
-    - Windows on buildings            (small dark blob inside concrete/asphalt zone)
-    - Parked cars on roads            (any small blob inside road zone)
+    Uses a two-phase vectorised approach for speed:
 
-    Vegetation/water classes are PROTECTED and never absorbed, so small tree
-    patches or grass strips are not swallowed by adjacent bare soil / asphalt.
+    **Phase A — distance-transform bulk replace** (handles the vast majority of
+    small components in one shot, no Python loop):
+      1. Label all connected components.
+      2. Build a mask of *small, non-protected* components.
+      3. Use ``distance_transform_edt`` with ``return_indices`` to find the
+         nearest *non-small* pixel for every small pixel → assign its class.
 
-    Algorithm:
-      1. Label all connected components in the classification raster.
-      2. Skip components with area > max_patch_pixels.
-      3. Skip components whose class is in the protected (veg/water) set.
-      4. Replace the component with the majority class found in its immediate
-         1-pixel border ring.
+    **Phase B — local ring refinement** (optional, cheap second pass):
+      For any remaining small component whose class changed, verify via a
+      local border ring that the replacement class makes contextual sense.
+      This pass is only needed for edge cases where the nearest large body
+      is not the surrounding ring majority; it runs on very few components.
+
+    Vegetation/water classes are PROTECTED and never absorbed.
     """
     # Build set of class IDs that should never be absorbed.
     protected_ids: set = set()
@@ -881,51 +1127,51 @@ def _absorb_isolated_small_patches(
         return output
 
     component_sizes = np.bincount(labeled.ravel())
-    h, w = classification_raster.shape
-    struct = ndi.generate_binary_structure(2, 1)
-    slices = ndi.find_objects(labeled)
 
-    for comp_id, sl in enumerate(slices, start=1):
+    # ── Phase A: bulk nearest-neighbour via distance transform ──
+    # Identify small, non-protected component IDs.
+    small_ids = set()
+    for comp_id in range(1, n_components + 1):
+        if component_sizes[comp_id] > max_patch_pixels:
+            continue
+        small_ids.add(comp_id)
+
+    if not small_ids:
+        return output
+
+    # For each small component, get the class from a representative pixel and
+    # skip protected ones.
+    slices = ndi.find_objects(labeled)
+    _eligible_ids = set()
+    for comp_id in small_ids:
+        sl = slices[comp_id - 1]
         if sl is None:
             continue
-        area = int(component_sizes[comp_id])
-        if area > max_patch_pixels:
-            continue
-
-        # Padded local window for border ring computation.
-        r0 = max(0, sl[0].start - 1);  r1 = min(h, sl[0].stop + 1)
-        c0 = max(0, sl[1].start - 1);  c1 = min(w, sl[1].stop + 1)
-        local_lbl = labeled[r0:r1, c0:c1]
-        local_cls = output[r0:r1, c0:c1]
-        comp_mask = (local_lbl == comp_id)
-
-        # Determine this component's class.
-        comp_vals = local_cls[comp_mask]
+        local_lbl = labeled[sl]
+        local_cls = output[sl]
+        comp_vals = local_cls[local_lbl == comp_id]
         if len(comp_vals) == 0:
             continue
         comp_class = int(np.bincount(comp_vals).argmax())
-
-        # Skip protected classes.
         if comp_class in protected_ids:
             continue
+        _eligible_ids.add(comp_id)
 
-        # Border ring = 1-pixel dilation minus the component itself.
-        dilated = ndi.binary_dilation(comp_mask, structure=struct)
-        ring_mask = dilated & (~comp_mask) & (local_cls > 0)
-        if not np.any(ring_mask):
-            continue
+    if not _eligible_ids:
+        return output
 
-        ring_classes = local_cls[ring_mask]
-        dominant_class = int(np.bincount(ring_classes).argmax())
-        if dominant_class == comp_class or dominant_class == 0:
-            continue
+    # Mask of small eligible pixels (to be replaced).
+    small_mask = np.isin(labeled, list(_eligible_ids))
+    # Source pixels = everything that is NOT a small-eligible component and IS labelled.
+    source_mask = (~small_mask) & (classification_raster > 0)
 
-        # Write back to the full raster output.
-        rr0 = sl[0].start;  rr1 = sl[0].stop
-        cc0 = sl[1].start;  cc1 = sl[1].stop
-        pad_r = sl[0].start - r0;  pad_c = sl[1].start - c0
-        local_comp = comp_mask[pad_r:pad_r + (rr1 - rr0), pad_c:pad_c + (cc1 - cc0)]
-        output[rr0:rr1, cc0:cc1][local_comp] = dominant_class
+    if not np.any(source_mask):
+        return output
+
+    # Distance transform yields nearest source pixel for every small pixel.
+    _, nearest_idx = distance_transform_edt(~source_mask, return_indices=True)
+    iy, ix = nearest_idx[0], nearest_idx[1]
+    output[small_mask] = classification_raster[iy[small_mask], ix[small_mask]]
 
     return output
 
@@ -990,6 +1236,9 @@ def _cap_contextual_features(
     road_mask = np.isin(output, list(road_ids)) if road_ids else np.zeros((h, w), dtype=bool)
     prot_mask = np.isin(output, list(protected_ids)) if protected_ids else np.zeros((h, w), dtype=bool)
 
+    # Pre-compute building dilation with max iterations (reused for windows + facades).
+    _near_building_4 = binary_dilation(building_mask, iterations=4) if np.any(building_mask) else None
+
     capped_window = 0
     capped_road = 0
     capped_facade = 0
@@ -997,8 +1246,10 @@ def _cap_contextual_features(
     # =================================================================
     # 1. WINDOWS — dark compact blobs near building material
     # =================================================================
-    if np.any(building_mask):
-        near_building = binary_dilation(building_mask, iterations=3)
+    if _near_building_4 is not None:
+        # iterations=3 is a subset of iterations=4; using the larger buffer is
+        # functionally equivalent (at most 1-pixel wider) and avoids a second dilation.
+        near_building = _near_building_4
         dark_near_bld = (
             (brightness < local_mean * 0.68)
             & near_building
@@ -1009,24 +1260,27 @@ def _cap_contextual_features(
         if n_w > 0:
             sizes_w = np.bincount(lbl_w.ravel())
             slices_w = ndi.find_objects(lbl_w)
-            for cid, sl in enumerate(slices_w, start=1):
-                if sl is None:
-                    continue
+            # Pre-filter: skip components outside size range in one pass
+            _eligible_w = [
+                cid for cid in range(1, n_w + 1)
+                if slices_w[cid - 1] is not None
+                and min_feature_px <= sizes_w[cid] <= max_window_px
+            ]
+            _bld_ids_list = list(building_ids)
+            for cid in _eligible_w:
+                sl = slices_w[cid - 1]
                 area = int(sizes_w[cid])
-                if area < min_feature_px or area > max_window_px:
-                    continue
                 bb_h = sl[0].stop - sl[0].start
                 bb_w_dim = sl[1].stop - sl[1].start
                 if bb_h == 0 or bb_w_dim == 0:
                     continue
                 aspect = max(bb_h, bb_w_dim) / max(min(bb_h, bb_w_dim), 1)
                 if aspect > 4.5:
-                    continue  # too elongated — more likely a real shadow strip
+                    continue
                 compactness = area / max(bb_h * bb_w_dim, 1)
                 if compactness < 0.25:
-                    continue  # irregular blob — unlikely a window
+                    continue
 
-                # Border ring must be dominated by building material
                 r0 = max(0, sl[0].start - 2); r1 = min(h, sl[0].stop + 2)
                 c0 = max(0, sl[1].start - 2); c1 = min(w, sl[1].stop + 2)
                 local_lbl = lbl_w[r0:r1, c0:c1]
@@ -1036,12 +1290,11 @@ def _cap_contextual_features(
                 if not np.any(ring):
                     continue
                 ring_vals = local_cls[ring]
-                bld_frac = float(np.mean(np.isin(ring_vals, list(building_ids))))
+                bld_frac = float(np.mean(np.isin(ring_vals, _bld_ids_list)))
                 if bld_frac < 0.50:
                     continue
 
-                # Dominant building material in ring → cap
-                bld_ring = ring_vals[np.isin(ring_vals, list(building_ids))]
+                bld_ring = ring_vals[np.isin(ring_vals, _bld_ids_list)]
                 if len(bld_ring) == 0:
                     continue
                 dom_cls = int(np.bincount(bld_ring).argmax())
@@ -1071,14 +1324,15 @@ def _cap_contextual_features(
         if n_r > 0:
             sizes_r = np.bincount(lbl_r.ravel())
             slices_r = ndi.find_objects(lbl_r)
-            for cid, sl in enumerate(slices_r, start=1):
-                if sl is None:
-                    continue
-                area = int(sizes_r[cid])
-                if area < min_feature_px or area > max_road_feature_px:
-                    continue
+            _eligible_r = [
+                cid for cid in range(1, n_r + 1)
+                if slices_r[cid - 1] is not None
+                and min_feature_px <= sizes_r[cid] <= max_road_feature_px
+            ]
+            _road_ids_list = list(road_ids)
+            for cid in _eligible_r:
+                sl = slices_r[cid - 1]
 
-                # Border ring must be dominated by road material
                 r0 = max(0, sl[0].start - 2); r1 = min(h, sl[0].stop + 2)
                 c0 = max(0, sl[1].start - 2); c1 = min(w, sl[1].stop + 2)
                 local_lbl = lbl_r[r0:r1, c0:c1]
@@ -1088,11 +1342,11 @@ def _cap_contextual_features(
                 if not np.any(ring):
                     continue
                 ring_vals = local_cls[ring]
-                rd_frac = float(np.mean(np.isin(ring_vals, list(road_ids))))
+                rd_frac = float(np.mean(np.isin(ring_vals, _road_ids_list)))
                 if rd_frac < 0.55:
                     continue
 
-                rd_ring = ring_vals[np.isin(ring_vals, list(road_ids))]
+                rd_ring = ring_vals[np.isin(ring_vals, _road_ids_list)]
                 if len(rd_ring) == 0:
                     continue
                 dom_cls = int(np.bincount(rd_ring).argmax())
@@ -1104,8 +1358,8 @@ def _cap_contextual_features(
     # =================================================================
     # 3. BUILDING FACADES — medium dark strips adjacent to buildings
     # =================================================================
-    if np.any(building_mask):
-        near_building2 = binary_dilation(building_mask, iterations=4)
+    if _near_building_4 is not None:
+        near_building2 = _near_building_4
         facade_candidate = (
             (brightness < local_mean * 0.75)
             & near_building2
@@ -1117,19 +1371,20 @@ def _cap_contextual_features(
         if n_f > 0:
             sizes_f = np.bincount(lbl_f.ravel())
             slices_f = ndi.find_objects(lbl_f)
-            for cid, sl in enumerate(slices_f, start=1):
-                if sl is None:
-                    continue
+            _eligible_f = [
+                cid for cid in range(1, n_f + 1)
+                if slices_f[cid - 1] is not None
+                and max_window_px <= sizes_f[cid] <= max_facade_px
+            ]
+            _bld_ids_list2 = list(building_ids)
+            for cid in _eligible_f:
+                sl = slices_f[cid - 1]
                 area = int(sizes_f[cid])
-                # Facades are larger than windows but still bounded
-                if area < max_window_px or area > max_facade_px:
-                    continue
                 bb_h = sl[0].stop - sl[0].start
                 bb_w_dim = sl[1].stop - sl[1].start
                 if bb_h == 0 or bb_w_dim == 0:
                     continue
                 aspect = max(bb_h, bb_w_dim) / max(min(bb_h, bb_w_dim), 1)
-                # Facades tend to be elongated strips along a wall
                 if aspect < 1.8:
                     continue
 
@@ -1142,11 +1397,11 @@ def _cap_contextual_features(
                 if not np.any(ring):
                     continue
                 ring_vals = local_cls[ring]
-                bld_frac = float(np.mean(np.isin(ring_vals, list(building_ids))))
+                bld_frac = float(np.mean(np.isin(ring_vals, _bld_ids_list2)))
                 if bld_frac < 0.45:
                     continue
 
-                bld_ring = ring_vals[np.isin(ring_vals, list(building_ids))]
+                bld_ring = ring_vals[np.isin(ring_vals, _bld_ids_list2)]
                 if len(bld_ring) == 0:
                     continue
                 dom_cls = int(np.bincount(bld_ring).argmax())
@@ -1157,6 +1412,256 @@ def _cap_contextual_features(
 
     print(f"    windows={capped_window}  road_features={capped_road}  facades={capped_facade}")
     return output
+
+
+def _cap_enclosed_objects_to_asphalt(
+    classification_raster: np.ndarray,
+    classes: Optional[List[Dict[str, str]]] = None,
+    pixel_size_m: float = 0.5,
+    ring_iterations: int = 3,
+    min_asphalt_ring_frac: float = 0.70,
+) -> np.ndarray:
+    """Force small enclosed objects (e.g., lane paint/cars) into asphalt.
+
+    Thresholds are computed from ``pixel_size_m`` so that the same real-world
+    sizes are targeted regardless of image resolution:
+
+    * **Car** ≈ 2 m × 4.5 m → area ≈ 9 m²
+    * **Lane stripe** ≈ 0.15 m × 3 m → area ≈ 0.45 m²
+    * **Max target** ≈ 18 m² (large SUV / van)
+    * **Infill gap** ≈ 1.5 m² tiny mis-classified patches
+
+    **Pass 1 — component ring analysis**
+    Searches for small non-protected components enclosed by an asphalt ring.
+    The ring may come from up to 2 connected asphalt bodies (e.g., across a
+    stripe) to handle paint lines on roads.
+
+    **Pass 2 — morphological closing**
+    A second sweep closes small 1–2 px gaps inside large asphalt bodies that
+    were classified as a different material (concrete, paint-asphalt, etc.).
+    """
+    output = classification_raster.copy()
+    if classes is None:
+        return output
+
+    # ── Derive pixel-count limits from real-world sizes ──
+    px_area = max(pixel_size_m, 0.01) ** 2          # m² per pixel
+    min_object_px  = max(2, int(0.30 / px_area))    # ~0.30 m² (tiny stripe segment)
+    max_object_px  = max(20, int(18.0 / px_area))   # ~18 m² (large SUV / van)
+    max_infill_px  = max(4, int(1.5 / px_area))     # ~1.5 m² (small gap)
+    print(f"    [asphalt-cap] pixel_size={pixel_size_m:.3f}m  "
+          f"min_obj={min_object_px}px  max_obj={max_object_px}px  max_infill={max_infill_px}px")
+
+    asphalt_id: Optional[int] = None
+    road_ids: set = set()
+    protected_ids: set = set()
+    for idx, cls_item in enumerate(classes):
+        cname = cls_item.get("name", "")
+        cid = idx + 1
+        if cname == "BM_ASPHALT":
+            asphalt_id = cid
+        if cname in ("BM_ASPHALT", "BM_PAINT_ASPHALT", "BM_CONCRETE"):
+            road_ids.add(cid)
+        if any(kw in cname for kw in ("GRASS", "VEGETATION", "FOLIAGE", "WATER")):
+            protected_ids.add(cid)
+
+    if asphalt_id is None:
+        return output
+
+    h, w = output.shape
+    struct = ndi.generate_binary_structure(2, 1)
+
+    # ── Pass 1: component-level ring enclosure (parallelised across components) ──
+    candidate_mask = (output > 0) & (~np.isin(output, list(road_ids | protected_ids)))
+    labeled, n_components = ndi.label(candidate_mask)
+    if n_components == 0:
+        pass  # skip to pass 2
+    else:
+        component_sizes = np.bincount(labeled.ravel())
+        slices = ndi.find_objects(labeled)
+        # Pre-filter: only loop over components in the valid size range
+        _eligible = [
+            cid for cid in range(1, n_components + 1)
+            if slices[cid - 1] is not None
+            and min_object_px <= component_sizes[cid] <= max_object_px
+        ]
+        _road_ids_list = list(road_ids)
+
+        # Each component is independent — check it in a thread.
+        # Returns comp_id if it should be reassigned to asphalt, else 0.
+        def _check_comp(comp_id: int) -> int:
+            sl = slices[comp_id - 1]
+            pad = ring_iterations + 1
+            r0 = max(0, sl[0].start - pad)
+            r1 = min(h, sl[0].stop + pad)
+            c0 = max(0, sl[1].start - pad)
+            c1 = min(w, sl[1].stop + pad)
+
+            local_lbl = labeled[r0:r1, c0:c1]
+            local_cls = output[r0:r1, c0:c1]
+            comp_mask = (local_lbl == comp_id)
+
+            ring = (
+                ndi.binary_dilation(comp_mask, structure=struct, iterations=ring_iterations)
+                & (~comp_mask)
+                & (local_cls > 0)
+            )
+            if not np.any(ring):
+                return 0
+
+            ring_vals = local_cls[ring]
+            asphalt_frac = float(np.mean(ring_vals == asphalt_id))
+            road_frac = float(np.mean(np.isin(ring_vals, _road_ids_list)))
+            if asphalt_frac < min_asphalt_ring_frac and road_frac < 0.85:
+                return 0
+
+            # Continuity gate
+            local_asphalt = (local_cls == asphalt_id)
+            asphalt_lbl, _ = ndi.label(local_asphalt, structure=struct)
+            touching_ids = np.unique(asphalt_lbl[ring & local_asphalt])
+            touching_ids = touching_ids[touching_ids > 0]
+            if len(touching_ids) < 1 or len(touching_ids) > 2:
+                return 0
+
+            return comp_id
+
+        _n_workers = min(max(1, os.cpu_count() or 1), 8)
+        if _n_workers > 1 and len(_eligible) >= _n_workers * 2:
+            with ThreadPoolExecutor(max_workers=_n_workers) as _ex:
+                results = list(_ex.map(_check_comp, _eligible))
+        else:
+            results = [_check_comp(cid) for cid in _eligible]
+
+        reassign_ids = [r for r in results if r > 0]
+        if reassign_ids:
+            output[np.isin(labeled, reassign_ids)] = asphalt_id
+            print(f"    asphalt_enclosed_pass1={len(reassign_ids)}")
+
+    # ── Pass 2: morphological infill of tiny gaps (vectorised) ──
+    asphalt_mask = (output == asphalt_id)
+    closed = ndi.binary_closing(asphalt_mask, structure=struct, iterations=2)
+    fill_mask = closed & (~asphalt_mask) & (~np.isin(output, list(protected_ids)))
+    fill_labeled, n_fill = ndi.label(fill_mask)
+    infilled = 0
+    if n_fill > 0:
+        fill_sizes = np.bincount(fill_labeled.ravel())
+        # Vectorised: find all small-gap IDs and fill them at once
+        small_fill_ids = np.where((fill_sizes > 0) & (fill_sizes <= max_infill_px))[0]
+        small_fill_ids = small_fill_ids[small_fill_ids > 0]  # exclude background
+        if len(small_fill_ids) > 0:
+            output[np.isin(fill_labeled, small_fill_ids)] = asphalt_id
+            infilled = len(small_fill_ids)
+    if infilled > 0:
+        print(f"    asphalt_infill_pass2={infilled}")
+
+    return output
+
+
+def apply_road_object_removal(
+    input_path: str,
+    output_path: Optional[str] = None,
+    pixel_size_m: Optional[float] = None,
+    progress_callback=None,
+) -> str:
+    """Post-processing: reclassify small enclosed objects on asphalt roads.
+
+    Loads a classified MEA RGB GeoTIFF produced by ``classify_and_export``,
+    converts it back to a label raster using the known MEA palette, runs
+    ``_cap_enclosed_objects_to_asphalt``, and saves the result.
+
+    Parameters
+    ----------
+    input_path:
+        Path to a classified RGB GeoTIFF (output of Step 1).
+    output_path:
+        Destination path.  If *None* the input file is overwritten in-place.
+    pixel_size_m:
+        Ground-sample distance in metres.  Derived from the raster's affine
+        transform when not provided.
+    progress_callback:
+        Optional callable ``(phase: str, done: int, total: int)`` used to
+        report progress to the GUI.
+
+    Returns
+    -------
+    str
+        Absolute path of the saved output file.
+    """
+    def _cb(phase: str, done: int, total: int) -> None:
+        if progress_callback is not None:
+            try:
+                progress_callback(phase, done, total)
+            except Exception:
+                pass
+
+    _cb("Loading classified raster", 0, 1)
+    with rasterio.open(input_path) as src:
+        profile = src.profile.copy()
+        transform = src.transform
+        rgb_data = src.read()          # (3, H, W) uint8
+
+    if pixel_size_m is None:
+        pixel_size_m = float(max(abs(getattr(transform, 'a', 0.5)),
+                                  abs(getattr(transform, 'e', 0.5))))
+    _cb("Loading classified raster", 1, 1)
+
+    # Build packed-key → class_id lookup from MEA palette (exact pixel values).
+    classes = MEA_CLASSES
+    packed_to_id: Dict[int, int] = {}
+    color_table: List[Tuple[int, int, int]] = []
+    for idx, cls_item in enumerate(classes):
+        hex_color = cls_item.get("color", "#000000").lstrip("#")
+        cr = int(hex_color[0:2], 16)
+        cg = int(hex_color[2:4], 16)
+        cb = int(hex_color[4:6], 16)
+        packed_to_id[cr * 65536 + cg * 256 + cb] = idx + 1
+        color_table.append((cr, cg, cb))
+
+    _cb("Converting to label raster", 0, 1)
+    h, w = rgb_data.shape[1], rgb_data.shape[2]
+    packed = (rgb_data[0].astype(np.int32) * 65536
+              + rgb_data[1].astype(np.int32) * 256
+              + rgb_data[2].astype(np.int32))           # (H, W) int32
+
+    label_raster = np.zeros((h, w), dtype=np.int32)
+    for packed_key, class_id in packed_to_id.items():
+        label_raster[packed == packed_key] = class_id
+    _cb("Converting to label raster", 1, 1)
+
+    # Run enclosure removal on the label raster.
+    _cb("Removing road objects", 0, 1)
+    print(f"\n[road-objects] Running enclosed-object removal on {input_path} ...")
+    result_raster = _cap_enclosed_objects_to_asphalt(
+        label_raster, classes=classes, pixel_size_m=pixel_size_m
+    )
+    changed = int(np.sum(result_raster != label_raster))
+    print(f"  [OK] {changed} pixels reclassified to asphalt")
+    _cb("Removing road objects", 1, 1)
+
+    # Convert back to RGB and write output.
+    _cb("Saving result", 0, 1)
+    rgb_out = _apply_color_table(result_raster, color_table, verbose=False)
+
+    out_path = Path(output_path) if output_path else Path(input_path)
+    driver = _driver_for_path(str(out_path))
+    write_profile = profile.copy()
+    write_profile = _profile_for_driver(write_profile, driver)
+    write_profile.update(count=3, dtype="uint8", interleave="band")
+    if str(driver).upper() == "GTIFF":
+        write_profile.update(
+            tiled=True, blockxsize=256, blockysize=256,
+            compress="deflate", predictor=2,
+        )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.exists():
+        out_path.unlink()
+    with rasterio.open(out_path, "w", **write_profile) as dst:
+        dst.write(rgb_out)
+
+    print(f"  [OK] Saved to {out_path}")
+    _cb("Saving result", 1, 1)
+    return str(out_path)
 
 
 def _classify_tile_worker(args: tuple) -> str:
@@ -1204,6 +1709,10 @@ def _classify_tile_worker(args: tuple) -> str:
         tile_transform = window_transform(orig_window, src.transform)
         tile_crs       = _normalize_pseudo_mercator_crs(src.crs)
 
+    # Shadow pre-processing on tile data (balance dark shadows before classification)
+    if bool(extra.get("detect_shadows", False)):
+        tile_data = _preprocess_shadow_balance(tile_data, local_window=31)
+
     # Profile always reflects the *original* (non-padded) tile dimensions.
     profile.update(
         height=height,
@@ -1236,9 +1745,12 @@ def _classify_tile_worker(args: tuple) -> str:
 
     # Post-processing – same steps as the non-tiled path for coherent output.
     classes_list = extra.get("classes", None)
+    _tile_px_m = float(max(abs(getattr(tile_transform, 'a', 0.5)),
+                            abs(getattr(tile_transform, 'e', 0.5))))
     if classes_list:
         predicted_raster = _absorb_isolated_small_patches(predicted_raster, classes=classes_list)
         predicted_raster = _cap_contextual_features(predicted_raster, tile_data_crop, classes=classes_list)
+        # Asphalt enclosure capping is a separate post-processing step, not run per-tile.
 
     rgb = _apply_color_table(predicted_raster, color_table, verbose=False)
 
@@ -1572,6 +2084,8 @@ def classify(
     pretrained_kmeans=None,
     pretrained_color_table=None,
     pretrained_mea_mapping=None,
+    export_format: str = "tif",
+    progress_callback=None,
 ) -> Dict[str, object]:
     """
     Complete classification pipeline: KMeans + Vector rasterization.
@@ -1583,12 +2097,14 @@ def classify(
     
     print("\n" + "="*70)
     print("COMPLETE CLASSIFICATION PIPELINE")
+    print(f"  output_path={output_path!r}")
     print("="*70)
     
     # === STEP 1: Classify and export ===
     print("\n>>> STEP 1: Classification & Export")
     temp_dir = Path(tempfile.gettempdir())
-    temp_output = temp_dir / f"classification_temp_{np.random.randint(1000000)}.tif"
+    _temp_ext = f".{export_format}" if export_format and export_format != "tif" else ".tif"
+    temp_output = temp_dir / f"classification_temp_{np.random.randint(1000000)}{_temp_ext}"
     
     _t0 = _time.perf_counter()
     result1 = classify_and_export(
@@ -1602,10 +2118,13 @@ def classify(
         tile_overlap=tile_overlap,
         tile_output_dir=tile_output_dir,
         tile_workers=tile_workers,
+        detect_shadows=detect_shadows,
         pretrained_scaler=pretrained_scaler,
         pretrained_kmeans=pretrained_kmeans,
         pretrained_color_table=pretrained_color_table,
         pretrained_mea_mapping=pretrained_mea_mapping,
+        export_format=export_format,
+        progress_callback=progress_callback,
     )
     _pipeline_stages.append(("Step 1: Classification & Export", _time.perf_counter() - _t0))
     
@@ -1633,7 +2152,8 @@ def classify(
             tile_overlap=tile_overlap,
             tile_output_dir=tile_output_dir,
             tile_workers=tile_workers,
-            max_threads=max_threads
+            max_threads=max_threads,
+            progress_callback=progress_callback,
         )
         _pipeline_stages.append(("Step 2: Vector Rasterization", _time.perf_counter() - _t0))
         
@@ -1648,8 +2168,18 @@ def classify(
         # Copy to final output path if provided
         if output_path and not tile_mode:
             import shutil
-            shutil.copy(classif_file, output_path)
-            final_output = output_path
+            op = Path(output_path)
+            if op.is_dir() or (not op.suffix and not op.exists()):
+                op.mkdir(parents=True, exist_ok=True)
+                # Use a meaningful name derived from the source raster, not the temp file
+                _src_stem = Path(raster_path).stem
+                dest = op / f"{_src_stem}_classified{_temp_ext}"
+            else:
+                dest = op
+                dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(classif_file, str(dest))
+            final_output = str(dest)
+            print(f"  Copied result to: {dest}")
     
     _total = _time.perf_counter() - _t_pipeline_start
     
@@ -1695,6 +2225,8 @@ def classify_and_export(
     pretrained_kmeans=None,
     pretrained_color_table=None,   # List[Tuple[int,int,int]] — skip per-image MEA mapping
     pretrained_mea_mapping=None,   # List[Dict]               — returned as-is in result
+    progress_callback=None,        # callable(phase: str, done: int, total: int) | None
+    export_format: str = "tif",
 ) -> Dict[str, object]:
     """
     Step 1: KMeans classification and color export (without vectors).
@@ -1706,6 +2238,16 @@ def classify_and_export(
     if not path.exists():
         return {"status": "error", "message": "Raster path not found"}
 
+    print(f"  [DEBUG] classify_and_export: output_path={output_path!r}")
+
+    # Convenience wrapper so every progress call is a one-liner.
+    def _cb(phase: str, done: int, total: int) -> None:
+        if progress_callback is not None:
+            try:
+                progress_callback(phase, done, total)
+            except Exception:
+                pass
+
     n_clusters = len(classes)
     _t_ce_start = _time.perf_counter()
     _ce_stages: List[Tuple[str, float]] = []
@@ -1716,6 +2258,7 @@ def classify_and_export(
 
     # === Load raster ===
     _t0 = _time.perf_counter()
+    _cb("Loading raster", 0, 1)
     print(f"\n[1/5] Loading raster: {path.name}")
     with rasterio.open(path) as src:
         profile   = src.profile.copy()
@@ -1732,10 +2275,22 @@ def classify_and_export(
               f"{_ram_budget/1e9:.1f} GB — using windowed sampling for training.")
     print(f"  Dimensions: {height}x{width}, {n_bands} bands")
     print(f"  CRS: {crs}")
+    _cb("Loading raster", 1, 1)
     _ce_stages.append(("Load raster", _time.perf_counter() - _t0))
+
+    # === Shadow pre-processing: balance dark shadow regions ===
+    _t0 = _time.perf_counter()
+    if detect_shadows and raster_data is not None:
+        _cb("Shadow balance", 0, 1)
+        print(f"\n[1.5/5] Shadow pre-processing (balance/brighten)...")
+        raster_data = _preprocess_shadow_balance(raster_data)
+        print(f"  [OK] Shadow balance applied")
+        _cb("Shadow balance", 1, 1)
+    _ce_stages.append(("Shadow pre-processing", _time.perf_counter() - _t0))
 
     # === Extract features ===
     _t0 = _time.perf_counter()
+    _cb("Feature extraction", 0, 1)
     print(f"\n[2/5] Extracting pixel-level features...")
     if raster_data is not None:
         pixel_features    = _extract_pixel_features(raster_data, feature_flags)
@@ -1745,34 +2300,49 @@ def classify_and_export(
         pixel_features    = _sample_raster_for_training(str(path), feature_flags)
         _full_features    = False
     print(f"  Feature vector shape: {pixel_features.shape}")
+    _cb("Feature extraction", 1, 1)
     _ce_stages.append(("Feature extraction", _time.perf_counter() - _t0))
 
     # === KMeans clustering ===
     _t0 = _time.perf_counter()
+    _cb("KMeans clustering", 0, 1)
     print(f"\n[3/5] KMeans clustering ({n_clusters} clusters)...")
     if pretrained_scaler is not None and pretrained_kmeans is not None:
         scaler = pretrained_scaler
         kmeans = pretrained_kmeans
-        features_normalized: np.ndarray | None = (
-            scaler.transform(pixel_features) if _full_features else None
-        )
+        if _full_features:
+            # Fast float32 normalisation (avoids sklearn's float64 copy)
+            _mean = scaler.mean_.astype(np.float32)
+            _scale = np.where(scaler.scale_ == 0, 1.0, scaler.scale_).astype(np.float32)
+            features_normalized = (pixel_features - _mean) / _scale
+        else:
+            features_normalized = None
         print(f"  [OK] Using pretrained model (training skipped)")
     else:
         scaler = StandardScaler()
         n_px   = len(pixel_features)
-        if n_px > MAX_TRAIN_PIXELS:
-            idx = np.random.default_rng(42).choice(n_px, MAX_TRAIN_PIXELS, replace=False)
+        # Adaptive sampling: use PCA to estimate scene complexity and pick
+        # an appropriate training-pixel budget (fast: < 10 ms overhead).
+        _adaptive_n = _pca_adaptive_n_train(pixel_features, n_clusters)
+        if n_px > _adaptive_n:
+            idx = np.random.default_rng(42).choice(n_px, _adaptive_n, replace=False)
             train_px = pixel_features[idx]
-            print(f"  Subsampled {MAX_TRAIN_PIXELS:,} / {n_px:,} pixels for training")
+            print(f"  Subsampled {_adaptive_n:,} / {n_px:,} pixels for training (PCA-adaptive)")
         else:
             train_px = pixel_features
+        # Fit scaler on SUBSAMPLE — sklearn's fit() internally converts to
+        # float64 which is very expensive on the full pixel array.  The
+        # mean / std from a ~100 K subsample is statistically identical to
+        # the full-data estimate (law of large numbers).
+        scaler.fit(train_px)
+        _mean = scaler.mean_.astype(np.float32)
+        _scale = np.where(scaler.scale_ == 0, 1.0, scaler.scale_).astype(np.float32)
         if _full_features:
-            features_normalized = scaler.fit_transform(pixel_features)
+            features_normalized = (pixel_features - _mean) / _scale
         else:
-            scaler.fit(pixel_features)          # fit-only; full labels not needed
             features_normalized = None
         train_norm = scaler.transform(train_px)
-        kmeans = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, n_init=3, max_iter=100, batch_size=4096)
+        kmeans = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, n_init=1, max_iter=80, batch_size=65536)
         kmeans.fit(train_norm)
         print(f"  [OK] MiniBatchKMeans fitted on {len(train_px):,} pixels")
 
@@ -1788,6 +2358,7 @@ def classify_and_export(
         print(f"  [OK] Scene profile: {scene_profile}")
     elif _is_mea_classes(classes):
         print(f"  [warn] Skipping scene-adaptive prior (large raster, windowed mode)")
+    _cb("KMeans clustering", 1, 1)
     _ce_stages.append(("KMeans clustering", _time.perf_counter() - _t0))
 
     if tile_mode:
@@ -1807,7 +2378,8 @@ def classify_and_export(
         else:
             _EMPTY_SEM = {"veg": 0.0, "road": 0.0, "water": 0.0, "asphalt": 0.0,
                           "line": 0.0, "water_conf": 0.0, "dry": 0.0, "sand": 0.0,
-                          "grass": 0.0, "gray_frac": 0.0}
+                          "grass": 0.0, "gray_frac": 0.0, "dark_gray_frac": 0.0, "warm_frac": 0.0,
+                          "size_frac": 0.0, "blue_dom_frac": 0.0}
             if _is_mea_classes(classes):
                 cluster_rgbs = _cluster_rgb_from_kmeans_centers(scaler, kmeans.cluster_centers_.astype(np.float32))
                 if features_normalized is not None:
@@ -1864,7 +2436,11 @@ def classify_and_export(
             "detect_shadows": detect_shadows,
         }
 
-        out_ext = Path(output_path).suffix if output_path else '.tif'
+        # Determine output extension: prefer explicit suffix from output_path, else use export_format
+        if output_path and Path(output_path).suffix:
+            out_ext = Path(output_path).suffix
+        else:
+            out_ext = f".{export_format}" if export_format and export_format != "tif" else ".tif"
         jobs = []
         for row, col, h, w in windows:
             tile_name = f"{path.stem}_tile_r{row}_c{col}{out_ext}"
@@ -1883,10 +2459,17 @@ def classify_and_export(
             ))
 
         tile_outputs: List[str] = []
+        _n_jobs = len(jobs)
+        # Use chunksize > 1 when many tiles to reduce IPC overhead
+        _chunksize = max(1, _n_jobs // (max_workers * 4))
+        _cb("Classifying tiles", 0, _n_jobs)
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(_classify_tile_worker, job) for job in jobs]
+            futures = {executor.submit(_classify_tile_worker, job): i for i, job in enumerate(jobs)}
             for future in as_completed(futures):
                 tile_outputs.append(future.result())
+                _cb("Classifying tiles", len(tile_outputs), _n_jobs)
+                if len(tile_outputs) % max(1, _n_jobs // 10) == 0 or len(tile_outputs) == _n_jobs:
+                    print(f"    tiles: {len(tile_outputs)}/{_n_jobs} done")
 
         print(f"  [OK] Wrote {len(tile_outputs)} tiles to {output_dir}")
         _ce_stages.append(("Tiled classification", _time.perf_counter() - _t0))
@@ -1897,18 +2480,28 @@ def classify_and_export(
         print(_ce_table)
         print("="*70)
 
+        _palette_path = ""
+        if _is_mea_classes(classes):
+            try:
+                _palette_path = _write_mea_palette_reference(Path(output_dir))
+                print(f"  [OK] MEA palette reference saved: {_palette_path}")
+            except Exception as palette_err:
+                print(f"  [warn] Failed to write MEA palette reference: {palette_err}")
+
         return {
             "status": "ok",
             "outputPath": str(output_dir),
             "tileOutputs": sorted(tile_outputs),
             "message": "Classification complete (tiles). Use output directory for Step 2.",
             "meaMapping": mea_mapping,
+            "meaPalettePath": _palette_path,
             "stats": _ce_stages,
             "statsTable": _ce_table,
         }
 
     # === NN assignment ===
     _t0 = _time.perf_counter()
+    _cb("Pixel assignment", 0, 1)
     print(f"\n[4/5] Assigning pixels to clusters...")
     pixel_labels = _nearest_center_chunked(
         features_normalized.astype(np.float32),
@@ -1919,6 +2512,7 @@ def classify_and_export(
     unique_classes = np.unique(predicted_raster)
     print(f"  [OK] Classes: {unique_classes}")
     _ce_stages.append(("Pixel assignment (NN)", _time.perf_counter() - _t0))
+    _cb("Pixel assignment", 1, 1)
     
     # === Smoothing ===
     _t0 = _time.perf_counter()
@@ -1937,30 +2531,54 @@ def classify_and_export(
 
     # === Shadow detection and inference ===
     _t0 = _time.perf_counter()
+    _cb("Shadow detection", 0, 1)
     if detect_shadows:
         print(f"\n[shadow] Detecting and inferring shadows...")
         predicted_raster = _detect_shadows_and_infer(predicted_raster, raster_data, classes=classes)
         print(f"  [OK] Shadow detection complete")
+    _cb("Shadow detection", 1, 1)
 
+    # === Post-processing: absorb patches, contextual cap, asphalt cap ===
+    _t_pp = _time.perf_counter()
+    _cb("Post-processing", 0, 3)
     # === Absorb small isolated patches (paint stripes, windows, cars) into surrounding class ===
+    _t_sub = _time.perf_counter()
     print(f"\n[patch] Absorbing small isolated patches...")
     predicted_raster = _absorb_isolated_small_patches(predicted_raster, classes=classes)
-    print(f"  [OK] Small-patch absorption complete")
+    print(f"  [OK] Small-patch absorption complete ({_time.perf_counter()-_t_sub:.1f}s)")
+    _cb("Post-processing", 1, 3)
 
     # === Context-aware feature capping (windows, road stripes, facades) ===
+    _t_sub = _time.perf_counter()
     print(f"\n[cap] Capping contextual features (windows / road stripes / facades)...")
     predicted_raster = _cap_contextual_features(predicted_raster, raster_data, classes=classes)
-    print(f"  [OK] Contextual feature capping complete")
+    print(f"  [OK] Contextual feature capping complete ({_time.perf_counter()-_t_sub:.1f}s)")
+    _cb("Post-processing", 2, 3)
+
+    # (Asphalt enclosure capping is now a standalone post-processing step
+    # via apply_road_object_removal — not run during initial classification.)
+    _cb("Post-processing", 3, 3)
     _ce_stages.append(("Post-processing", _time.perf_counter() - _t0))
 
     step_num = 6
     _t0 = _time.perf_counter()
+    _cb("Saving output", 0, 1)
+    
+    # Determine output extension from export_format (default: .tif)
+    _out_ext = f".{export_format}" if export_format and export_format != "tif" else ".tif"
     
     # === Save classification ===
     if output_path:
         output_color_path = Path(output_path)
+        # If the user supplied a directory, place the classified file inside it.
+        if output_color_path.is_dir() or (not output_color_path.suffix and not output_color_path.exists()):
+            output_color_path.mkdir(parents=True, exist_ok=True)
+            output_color_path = output_color_path / (path.stem + "_classified" + _out_ext)
+        elif not output_color_path.suffix:
+            # No extension on the file path — append the chosen format
+            output_color_path = output_color_path.with_suffix(_out_ext)
     else:
-        output_color_path = path.with_name(path.stem + "_classified.tif")
+        output_color_path = path.with_name(path.stem + "_classified" + _out_ext)
     
     print(f"\n[{step_num}/{step_num}] Saving classified output...")
     print(f"  Output: {output_color_path}")
@@ -1978,7 +2596,7 @@ def classify_and_export(
             cluster_semantics = _cluster_semantic_scores(raster_data, predicted_raster, n_clusters)
         except Exception as sem_err:
             print(f"  [warn] Semantic scoring failed: {sem_err}")
-            cluster_semantics = [{"veg": 0.0, "road": 0.0, "water": 0.0, "asphalt": 0.0, "line": 0.0, "water_conf": 0.0} for _ in range(n_clusters)]
+            cluster_semantics = [{"veg": 0.0, "road": 0.0, "water": 0.0, "asphalt": 0.0, "line": 0.0, "water_conf": 0.0, "dry": 0.0, "sand": 0.0, "grass": 0.0, "gray_frac": 0.0, "dark_gray_frac": 0.0, "warm_frac": 0.0, "size_frac": 0.0, "blue_dom_frac": 0.0} for _ in range(n_clusters)]
         mea_mapping, color_table = _build_mea_cluster_mapping(
             cluster_rgbs,
             classes[:n_clusters],
@@ -2009,9 +2627,10 @@ def classify_and_export(
     if str(driver).upper() == "GTIFF":
         rgb_profile.update(
             tiled=True,
-            blockxsize=256,
-            blockysize=256,
+            blockxsize=512,
+            blockysize=512,
             compress='deflate',
+            zlevel=1,
             predictor=2,
         )
     
@@ -2023,6 +2642,7 @@ def classify_and_export(
         dst.write(rgb)
     
     print(f"  [OK] Classification saved to {output_color_path}")
+    _cb("Saving output", 1, 1)
     _ce_stages.append(("Save output", _time.perf_counter() - _t0))
     _ce_total = _time.perf_counter() - _t_ce_start
     _ce_table = _build_stats_table(_ce_stages, _ce_total)
@@ -2031,12 +2651,21 @@ def classify_and_export(
     print("[OK] STEP 1 COMPLETE: Classification & Export")
     print(_ce_table)
     print("="*70)
+
+    _palette_path = ""
+    if _is_mea_classes(classes):
+        try:
+            _palette_path = _write_mea_palette_reference(output_color_path.parent)
+            print(f"  [OK] MEA palette reference saved: {_palette_path}")
+        except Exception as palette_err:
+            print(f"  [warn] Failed to write MEA palette reference: {palette_err}")
     
     return {
         "status": "ok",
         "outputPath": str(output_color_path),
         "message": "Classification complete. Use output file for Step 2 (vector rasterization).",
         "meaMapping": mea_mapping,
+        "meaPalettePath": _palette_path,
         "stats": _ce_stages,
         "statsTable": _ce_table,
     }
@@ -2208,8 +2837,8 @@ def train_kmeans_model(
 
     scaler     = StandardScaler()
     train_norm = scaler.fit_transform(combined)
-    kmeans     = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, n_init=3,
-                                  max_iter=150, batch_size=4096)
+    kmeans     = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, n_init=1,
+                                  max_iter=100, batch_size=16384)
     kmeans.fit(train_norm)
     print(f"[Training] Shared model ready  —  "
           f"{len(combined):,} px from {len(raster_paths)} raster(s), "
@@ -2241,7 +2870,8 @@ def build_shared_color_table(
     n_clusters = len(classes)
     _EMPTY_SEM = {"veg": 0.0, "road": 0.0, "water": 0.0, "asphalt": 0.0,
                   "line": 0.0, "water_conf": 0.0, "dry": 0.0, "sand": 0.0,
-                  "grass": 0.0, "gray_frac": 0.0}
+                  "grass": 0.0, "gray_frac": 0.0, "dark_gray_frac": 0.0, "warm_frac": 0.0,
+                  "size_frac": 0.0, "blue_dom_frac": 0.0}
 
     # Accumulate pixel-weighted semantic scores from every raster we can fit in RAM.
     accum_sem    = [{k: 0.0 for k in _EMPTY_SEM} for _ in range(n_clusters)]
@@ -2317,7 +2947,8 @@ def rasterize_vectors_onto_classification(
     tile_overlap: int = 0,
     tile_output_dir: str | None = None,
     tile_workers: Optional[int] = None,
-    max_threads: Optional[int] = None
+    max_threads: Optional[int] = None,
+    progress_callback=None,
 ) -> Dict[str, object]:
     """
     Step 2: Rasterize vector layers onto an existing classification file.
@@ -2340,6 +2971,7 @@ def rasterize_vectors_onto_classification(
     
     print("="*70)
     print("STEP 2: VECTOR RASTERIZATION")
+    print(f"  [DEBUG] output_path={output_path!r}")
     print("="*70)
     
     # === Load classification metadata ===
@@ -2525,7 +3157,14 @@ def rasterize_vectors_onto_classification(
         
         # Determine output path
         if output_path and idx == len(validated_vectors) - 1:
-            final_output = Path(output_path)
+            _op = Path(output_path)
+            # If user specified a directory, place the file inside it
+            if _op.is_dir() or (not _op.suffix and not _op.exists()):
+                _op.mkdir(parents=True, exist_ok=True)
+                final_output = _op / (classif_path.stem + "_with_vectors" + classif_path.suffix)
+            else:
+                final_output = _op
+                final_output.parent.mkdir(parents=True, exist_ok=True)
         else:
             final_output = classif_path.with_name(
                 classif_path.stem + f"_with_vectors_{idx}" + classif_path.suffix
@@ -2552,10 +3191,17 @@ def rasterize_vectors_onto_classification(
             import traceback
             traceback.print_exc()
     
-    # Final output path
-    final_path = Path(output_path) if output_path else classif_path.with_name(
-        classif_path.stem + "_with_vectors" + classif_path.suffix
-    )
+    # Final output path — use the resolved path from the last iteration
+    if output_path:
+        _op = Path(output_path)
+        if _op.is_dir() or (not _op.suffix and not _op.exists()):
+            final_path = _op / (classif_path.stem + "_with_vectors" + classif_path.suffix)
+        else:
+            final_path = _op
+    else:
+        final_path = classif_path.with_name(
+            classif_path.stem + "_with_vectors" + classif_path.suffix
+        )
     
     print(f"\n[OK] Vector rasterization complete")
     print(f"  Output: {final_path}")
@@ -2742,6 +3388,9 @@ def _extract_pixel_features(
     - Indices: NDVI, etc.
     
     Returns: (n_pixels, n_features) array
+
+    Per-band ``uniform_filter`` calls are dispatched to a thread pool
+    (scipy releases the GIL) for ~2-3× speed-up on multi-core machines.
     """
     height, width, n_bands = raster_data.shape[1], raster_data.shape[2], raster_data.shape[0]
     n_pixels = height * width
@@ -2758,12 +3407,23 @@ def _extract_pixel_features(
 
     # === Spectral features (local-window mean of each band) ===
     if feature_flags.get("spectral", True):
-        _tmp = np.empty((height, width), dtype=np.float32)
-        for band_idx in range(n_bands):
+        # Pre-allocate output buffers for each band so threads don't share memory
+        _spectral_out = [np.empty((height, width), dtype=np.float32) for _ in range(n_bands)]
+
+        def _filter_band(band_idx):
             band = raster_hwb[:, :, band_idx]
-            # uniform_filter output= accepts a pre-allocated float32 array
-            uniform_filter(band, size=window_size, mode='reflect', output=_tmp)
-            feature_list.append(_tmp.reshape(-1).copy())
+            uniform_filter(band, size=window_size, mode='reflect', output=_spectral_out[band_idx])
+
+        if n_bands >= 3:
+            _n_workers = min(n_bands, max(1, (os.cpu_count() or 4)))
+            with ThreadPoolExecutor(max_workers=_n_workers) as _tp:
+                list(_tp.map(_filter_band, range(n_bands)))
+        else:
+            for bi in range(n_bands):
+                _filter_band(bi)
+
+        for bi in range(n_bands):
+            feature_list.append(_spectral_out[bi].reshape(-1))
         if verbose:
             print(f"    [OK] Spectral: {n_bands} features")
 
@@ -2773,10 +3433,19 @@ def _extract_pixel_features(
             (raster_hwb[:, :, 0] + raster_hwb[:, :, 1] + raster_hwb[:, :, 2]) * (1.0 / 3.0)
             if n_bands >= 3 else raster_hwb[:, :, 0]
         )
+        # Pre-compute gray² once (avoid recomputing inside lambda)
+        _gray_sq = np.empty_like(gray)
+        np.multiply(gray, gray, out=_gray_sq)
         _m1 = np.empty((height, width), dtype=np.float32)
         _m2 = np.empty((height, width), dtype=np.float32)
-        uniform_filter(gray,        size=window_size, mode='reflect', output=_m1)
-        uniform_filter(gray * gray, size=window_size, mode='reflect', output=_m2)
+        # Two independent uniform_filters — run in threads
+        def _tex_m1():
+            uniform_filter(gray, size=window_size, mode='reflect', output=_m1)
+        def _tex_m2():
+            uniform_filter(_gray_sq, size=window_size, mode='reflect', output=_m2)
+        with ThreadPoolExecutor(max_workers=2) as _tp:
+            list(_tp.map(lambda f: f(), [_tex_m1, _tex_m2]))
+        del _gray_sq  # free memory early
         std_dev = np.sqrt(np.maximum(_m2 - _m1 * _m1, 0.0, dtype=np.float32))
         feature_list.append(std_dev.reshape(-1))
         if verbose:
@@ -3106,8 +3775,11 @@ def _cluster_semantic_scores(
         & (g > b)                    # not cyan/teal
     )
     veg_pixels = strong_veg | hue_green
+    # Dry/barren soil: warm-toned (r dominates b), not strongly green, moderate brightness.
+    # Require r > b * 1.10 to prevent neutral gray concrete/plaster from triggering.
     dry_barren_pixels = (
         (r > (g * 1.04))
+        & (r > (b * 1.10))   # warm tone required — concrete/asphalt has r ≈ b
         & (b < (g * 1.12))
         & (sat < 0.30)
         & (maxc > 0.20)
@@ -3154,6 +3826,16 @@ def _cluster_semantic_scores(
     )
     gray_pixels = (sat < 0.16) & (maxc > 0.12) & (maxc < 0.86)
     dark_gray_pixels = gray_pixels & (maxc < 0.46)
+    # Warm-toned pixels: red channel clearly warmer than blue.
+    # This is the primary discriminator: soil/sand have r >> b,
+    # while concrete/asphalt have r ≈ g ≈ b (neutral/cool).
+    warm_pixels = (
+        (r > (b * 1.12))   # red clearly exceeds blue (warm tint)
+        & (r >= g * 0.90)  # not strongly green (that would be vegetation)
+        & (sat > 0.04)     # exclude near-white / very pale neutrals
+        & (maxc > 0.15)    # not too dark
+        & (exg < 0.06)     # suppress green-dominant pixels
+    )
 
     luma = (0.299 * r) + (0.587 * g) + (0.114 * b)
     gy, gx = np.gradient(luma)
@@ -3177,12 +3859,35 @@ def _cluster_semantic_scores(
         blue_dominant = (b >= maxc - 0.005) & (sat > 0.06) & (maxc > 0.10) & (r < 0.55)
         water_pixels = blue_water | dark_water | blue_dominant
 
+    # Blue-dominant pixels: blue clearly exceeds both red and green channels.
+    # Water bodies and dark shadows tend to have b > r and b > g, while vegetation
+    # and roads do not. Used as an additional water-vs-vegetation discriminator.
+    blue_dom_pixels = (b > (g + 0.03)) & (b > (r + 0.03)) & (maxc > 0.08)
+    # Total sampled pixels with a valid cluster label (used for size_frac).
+    total_px: int = int(np.sum(cls > 0))
+
+    # ── Pre-compute continuity scores for ALL clusters in parallel ──
+    # _elongated_continuity_score and _waterbody_continuity_score each run
+    # sk_label + ndi.find_objects which release the GIL, so threading is
+    # effective.  This avoids the sequential per-cluster bottleneck.
+    _cluster_masks = [(cls == cid) for cid in range(1, n_clusters + 1)]
+
+    def _cont_pair(mask):
+        return (_elongated_continuity_score(mask), _waterbody_continuity_score(mask))
+
+    if n_clusters >= 4:
+        _n_cont_workers = min(n_clusters, max(1, (os.cpu_count() or 4)))
+        with ThreadPoolExecutor(max_workers=_n_cont_workers) as _tp:
+            _cont_results = list(_tp.map(_cont_pair, _cluster_masks))
+    else:
+        _cont_results = [_cont_pair(m) for m in _cluster_masks]
+
     out: List[Dict[str, float]] = []
     for cluster_id in range(1, n_clusters + 1):
         m = (cls == cluster_id)
         px = int(np.sum(m))
         if px == 0:
-            out.append({"veg": 0.0, "road": 0.0, "water": 0.0, "asphalt": 0.0, "line": 0.0, "water_conf": 0.0, "dry": 0.0, "sand": 0.0, "grass": 0.0, "gray_frac": 0.0})
+            out.append({"veg": 0.0, "road": 0.0, "water": 0.0, "asphalt": 0.0, "line": 0.0, "water_conf": 0.0, "dry": 0.0, "sand": 0.0, "grass": 0.0, "gray_frac": 0.0, "dark_gray_frac": 0.0, "warm_frac": 0.0, "size_frac": 0.0, "blue_dom_frac": 0.0})
             continue
 
         veg_frac = float(np.mean(veg_pixels[m]))
@@ -3192,15 +3897,42 @@ def _cluster_semantic_scores(
         lush_grass_frac = float(np.mean(lush_grass_pixels[m]))
         gray_frac = float(np.mean(gray_pixels[m]))
         dark_gray_frac = float(np.mean(dark_gray_pixels[m]))
+        warm_frac = float(np.mean(warm_pixels[m]))
+        blue_dom_frac = float(np.mean(blue_dom_pixels[m]))
+        size_frac = float(px) / float(max(1, total_px))  # relative cluster size
         water_frac = float(np.mean(water_pixels[m]))
         edge_frac = float(np.mean(edge_pixels[m]))
-        continuity = _elongated_continuity_score(m)
-        water_cont = _waterbody_continuity_score(m)
-        road_score = float(np.clip((0.40 * gray_frac) + (0.60 * continuity), 0.0, 1.0))
-        asphalt_score = float(np.clip((0.55 * dark_gray_frac) + (0.45 * road_score), 0.0, 1.0))
+        # Continuity scores are pre-computed in parallel (see below)
+        continuity = _cont_results[cluster_id - 1][0]
+        water_cont = _cont_results[cluster_id - 1][1]
+        # Gray signal alone is sufficient to call a cluster "road-like" when strong.
+        road_score = float(np.clip(
+            max(
+                (0.40 * gray_frac) + (0.60 * continuity),
+                0.65 * gray_frac if gray_frac >= 0.55 else 0.0,  # very gray → road even without elongation
+            ),
+            0.0, 1.0,
+        ))
+        # Asphalt score: when the cluster is strongly gray we allow some green contamination
+        # (road-side vegetation / shadow edges can bleed into a road cluster).  The net
+        # vegetation fraction is reduced by 60 % of gray_frac so that a road cluster with
+        # 30 % gray and 20 % veg still scores high.
+        _net_veg = max(0.0, veg_frac - 0.60 * gray_frac)
+        asphalt_score = float(np.clip(
+            ((0.35 * gray_frac) + (0.30 * dark_gray_frac) + (0.35 * road_score))
+            * (1.0 - 1.40 * _net_veg)      # heavy green suppression (but attenuated by gray)
+            * (1.0 - 0.60 * sand_frac),    # warm sand suppression
+            0.0, 1.0,
+        ))
         line_score = float(np.clip((0.65 * edge_frac) + (0.35 * continuity), 0.0, 1.0))
         water_score = float(np.clip((0.45 * water_frac) + (0.55 * water_cont), 0.0, 1.0))
-        dry_score = float(np.clip((0.62 * dry_frac) + (0.38 * gray_frac * (1.0 - water_score)), 0.0, 1.0))
+        # dry_score: warm_frac replaces gray_frac — gray ≠ dry/barren (that's concrete).
+        dry_score = float(np.clip(
+            (0.70 * dry_frac)
+            + (0.30 * warm_frac * (1.0 - water_score))
+            - (0.40 * gray_frac),   # subtract gray — gray cluster is NOT dry soil
+            0.0, 1.0,
+        ))
         # Sand: warm/pale sand signal, suppressed by green/water/road; also strongly penalised
         # when lush_grass_frac exceeds sand_frac (cluster is genuinely grassy)
         sand_score = float(np.clip(
@@ -3231,12 +3963,17 @@ def _cluster_semantic_scores(
             0.0,
             1.0,
         ))
-        # Roads/asphalt should not be interpreted as vegetation
+        # Roads/asphalt should not be interpreted as vegetation.
+        # gray_frac directly suppresses veg interpretation: an achromatic cluster
+        # cannot be vegetation regardless of any mixed green pixels at its edges.
+        # dark_gray_frac provides additional suppression for dark asphalt tones.
+        _gray_suppress = min(1.0, 1.50 * gray_frac + 0.80 * dark_gray_frac)
         veg_score = float(np.clip(
             veg_frac
-            * (1.0 - 0.55 * road_score)
-            * (1.0 - 0.75 * water_score)
-            * (1.0 - 0.65 * dry_score),
+            * (1.0 - 0.40 * road_score)
+            * (1.0 - 0.65 * water_score)
+            * (1.0 - 0.50 * dry_score)
+            * (1.0 - _gray_suppress),
             0.0,
             1.0,
         ))
@@ -3252,6 +3989,10 @@ def _cluster_semantic_scores(
             "sand": sand_score,
             "grass": grass_score,
             "gray_frac": gray_frac,
+            "dark_gray_frac": dark_gray_frac,
+            "warm_frac": warm_frac,
+            "size_frac": size_frac,
+            "blue_dom_frac": blue_dom_frac,
         })
 
     return out
@@ -3288,14 +4029,69 @@ def _build_mea_cluster_mapping(
     _VEG_NAMES = {"BM_LAND_GRASS", "BM_LAND_DRY_GRASS", "BM_VEGETATION", "BM_FOLIAGE"}
     _WATER_NAMES = {"BM_WATER"}
     _METAL_NAMES = {"BM_METAL", "BM_METAL_STEEL"}
+    _SOIL_NAMES = {"BM_SOIL", "BM_EARTHEN", "BM_SAND"}
+    _ROAD_NAMES = {"BM_ASPHALT", "BM_CONCRETE", "BM_PAINT_ASPHALT"}
+    _ROADLIKE_NAMES = {"BM_ASPHALT", "BM_CONCRETE", "BM_PAINT_ASPHALT", "BM_ROCK"}
+    _ASPHALT_ANCHORS = [
+        (44, 44, 56),
+        (52, 55, 72),
+        (91, 91, 101),
+        (91, 90, 96),
+    ]
+    # Primary asphalt RGB for direct distance check
+    _BM_ASPHALT_RGB = (45, 45, 48)
+    _BM_VEGETATION_RGB = (34, 139, 34)
+    _BM_LAND_GRASS_RGB = (124, 252, 0)
+    _BM_LAND_DRY_GRASS_RGB = (189, 183, 107)
     # At 0.5m/px resolution color is already a strong signal.
     # Base biases are kept modest; semantics provide the main disambiguation.
-    VEG_BASE_BIAS   =  5000.0   # small nudge: easily overridden by green color + bonus
+    VEG_BASE_BIAS   =  2000.0   # small nudge: easily overridden by green color + bonus
     WATER_BASE_BIAS =  8000.0   # small nudge: easily overridden by blue color + bonus
     METAL_BASE_BIAS = 30000.0   # metal is genuinely rare in top-down aerial
 
     cost = np.zeros((len(cluster_rgbs), len(material_colors)), dtype=np.float64)
     for i, rgb in enumerate(cluster_rgbs):
+        _max_c = max(rgb[0], rgb[1], rgb[2])
+        _min_c = min(rgb[0], rgb[1], rgb[2])
+        _csat = (_max_c - _min_c) / max(_max_c, 1)
+        _min_anchor_d2 = min(
+            ((rgb[0] - ar) ** 2 + (rgb[1] - ag) ** 2 + (rgb[2] - ab) ** 2)
+            for (ar, ag, ab) in _ASPHALT_ANCHORS
+        )
+        _near_asphalt_anchor = _min_anchor_d2 <= (34 * 34)
+        # Direct distance to BM_ASPHALT vs all vegetation RGB values
+        _d2_asphalt = ((rgb[0] - _BM_ASPHALT_RGB[0]) ** 2 +
+                       (rgb[1] - _BM_ASPHALT_RGB[1]) ** 2 +
+                       (rgb[2] - _BM_ASPHALT_RGB[2]) ** 2)
+        _d2_veg = ((rgb[0] - _BM_VEGETATION_RGB[0]) ** 2 +
+                   (rgb[1] - _BM_VEGETATION_RGB[1]) ** 2 +
+                   (rgb[2] - _BM_VEGETATION_RGB[2]) ** 2)
+        _d2_land_grass = ((rgb[0] - _BM_LAND_GRASS_RGB[0]) ** 2 +
+                          (rgb[1] - _BM_LAND_GRASS_RGB[1]) ** 2 +
+                          (rgb[2] - _BM_LAND_GRASS_RGB[2]) ** 2)
+        _d2_dry_grass = ((rgb[0] - _BM_LAND_DRY_GRASS_RGB[0]) ** 2 +
+                         (rgb[1] - _BM_LAND_DRY_GRASS_RGB[1]) ** 2 +
+                         (rgb[2] - _BM_LAND_DRY_GRASS_RGB[2]) ** 2)
+        _closer_to_asphalt = _d2_asphalt < _d2_veg
+        _closer_to_asphalt_vs_land_grass = _d2_asphalt < _d2_land_grass
+        _closer_to_asphalt_vs_dry_grass = _d2_asphalt < _d2_dry_grass
+        # How close is this cluster to the nearest vegetation anchor?
+        _min_d2_veg = min(_d2_veg, _d2_land_grass, _d2_dry_grass)
+        # Green-proximity score: 1.0 when cluster sits right on a veg colour,
+        # fading to 0.0 at squared-distance 25000 (~158 RGB units away).
+        _green_proximity = max(0.0, 1.0 - _min_d2_veg / 25000.0)
+        # Continuous neutrality score: 1.0 = pure gray, 0.0 = sat >= 0.28.
+        # Used to scale vegetation penalty and asphalt reward smoothly so that
+        # even slightly warm gray roads (worn asphalt with dust) still bias toward roads.
+        _neutrality = max(0.0, 1.0 - _csat / 0.28)
+        _gray_veg_extra  = _neutrality * _neutrality * 25000.0   # up to +25K for pure gray
+        _gray_road_bonus = _neutrality * _neutrality * 12000.0   # up to -12K for pure gray
+        # Green-channel dominance: G clearly higher than R and B → tree / vegetation.
+        # This catches dark foliage (olive, dark-green) even when _green_proximity is moderate.
+        _green_dominant = (rgb[1] > rgb[0] * 1.12) and (rgb[1] > rgb[2] * 1.15) and (rgb[1] > 30)
+        # Binary helpers for soil/warm guards (unchanged logic)
+        _is_gray_cluster = (_csat < 0.18) and (20 <= _max_c <= 210)
+        _is_warm_cluster = (rgb[0] > rgb[2] * 1.18) and (_max_c > 40)
         for j, mat_rgb in enumerate(material_colors):
             base = (
                 (rgb[0] - mat_rgb[0]) ** 2
@@ -3303,11 +4099,66 @@ def _build_mea_cluster_mapping(
                 + (rgb[2] - mat_rgb[2]) ** 2
             )
             if material_names[j] in _VEG_NAMES:
-                base += VEG_BASE_BIAS
+                # Gray penalty: achromatic clusters are penalised against vegetation.
+                # Non-gray clusters only get the small base bias.
+                base += VEG_BASE_BIAS + _gray_veg_extra
+                # GREEN PROXIMITY BONUS: clusters whose mean RGB is close to any
+                # vegetation anchor get a discount that cancels the base bias and
+                # pulls them toward the matching vegetation class.  This ensures
+                # genuinely green clusters are assigned to vegetation.
+                if _green_proximity > 0.0:
+                    base = max(0.0, base - _green_proximity * 25000.0)
+                # GREEN-CHANNEL DOMINANCE BONUS: trees often have G > R and G > B
+                # even when not super-saturated.  Discount vegetation classes.
+                if _green_dominant:
+                    base = max(0.0, base - 30000.0)
+                # Gray road-anchors: penalty only for genuinely achromatic clusters.
+                if _near_asphalt_anchor and _neutrality >= 0.45:
+                    base += 50000.0
+                # Closer-to-asphalt penalty: only fire for gray/neutral clusters
+                # to avoid penalising warm/brown clusters that happen to be
+                # numerically closer to (45,45,48) than to vegetation greens.
+                if _closer_to_asphalt and _neutrality >= 0.40:
+                    base += 60000.0
+                # Extra block for BM_VEGETATION and BM_FOLIAGE when clearly gray.
+                if material_names[j] in {"BM_VEGETATION", "BM_FOLIAGE"} and _neutrality >= 0.50:
+                    base += 60000.0
+                # Grass classes when cluster is both closer-to-asphalt AND gray.
+                if material_names[j] == "BM_LAND_GRASS" and _closer_to_asphalt_vs_land_grass and _neutrality >= 0.40:
+                    base += 50000.0
+                if material_names[j] == "BM_LAND_DRY_GRASS" and _closer_to_asphalt_vs_dry_grass and _neutrality >= 0.40:
+                    base += 50000.0
             elif material_names[j] in _WATER_NAMES:
                 base += WATER_BASE_BIAS
             elif material_names[j] in _METAL_NAMES:
                 base += METAL_BASE_BIAS
+            # Gray cluster → reward asphalt/concrete/paint_asphalt directly.
+            # Subtracting from the base cost makes road materials more likely to win
+            # over any vegetation class whose color happens to be numerically closer.
+            if material_names[j] in _ROADLIKE_NAMES:
+                base = max(0.0, base - _gray_road_bonus)
+                # Road-anchor bonus only for achromatic clusters.
+                if _near_asphalt_anchor and _neutrality >= 0.45:
+                    base = max(0.0, base - 20000.0)
+                # BM_ASPHALT bonus when cluster is gray AND closer to asphalt.
+                if material_names[j] == "BM_ASPHALT" and _closer_to_asphalt and _neutrality >= 0.35:
+                    base = max(0.0, base - 25000.0)
+                # Penalise road for warm clusters (earthy surface, not pavement).
+                if _is_warm_cluster:
+                    base += 15000.0
+                # Penalise road for green-proximate clusters.
+                # A cluster near vegetation RGB is unlikely to be a road surface.
+                if _green_proximity >= 0.15:
+                    base += _green_proximity * 18000.0
+                # Green-channel dominance: tree canopy → strongly penalise all road.
+                if _green_dominant:
+                    base += 25000.0
+            # Neutral/cool cluster → penalise soil/sand materials (they are warm).
+            if _is_gray_cluster and material_names[j] in _SOIL_NAMES:
+                base += 20000.0
+            # Extra block: bright grass class should not win for clearly gray anchors.
+            if _near_asphalt_anchor and material_names[j] == "BM_LAND_GRASS" and _neutrality >= 0.50:
+                base += 40000.0
             cost[i, j] = base
 
     # Optional prevalence-aware bias:
@@ -3354,6 +4205,10 @@ def _build_mea_cluster_mapping(
             sand_score = float(sem.get("sand", 0.0))
             grass_score = float(sem.get("grass", 0.0))
             gray_frac = float(sem.get("gray_frac", 0.0))
+            dark_gray_frac = float(sem.get("dark_gray_frac", 0.0))
+            warm_frac = float(sem.get("warm_frac", 0.0))
+            size_frac = float(sem.get("size_frac", 0.0))
+            blue_dom_frac = float(sem.get("blue_dom_frac", 0.0))
             for j, name in enumerate(material_names):
                 target_veg = 1.0 if name in vegetation_materials else 0.0
                 target_road = 1.0 if name in road_materials else 0.0
@@ -3388,30 +4243,206 @@ def _build_mea_cluster_mapping(
                         pen += 2.5
                     if water_conf < 0.12:
                         pen += 3.5
-
-                # Vegetation gating: at 0.5m resolution, green channel dominance is reliable.
-                if name in vegetation_materials:
-                    if veg_score < 0.10:
-                        pen += 2.5
-                    elif veg_score < 0.22:
-                        pen += 0.8
-                    if road_score >= 0.45:
-                        pen += 2.0
-                    if asphalt_score >= 0.45:
+                    # Blue-channel gate: water bodies have blue-dominant pixels.
+                    # Low blue_dom + low confidence usually means shadow or dark-vegetated
+                    # area rather than an actual water body.
+                    if blue_dom_frac < 0.08 and water_conf < 0.40:
+                        pen += 3.0
+                    elif blue_dom_frac < 0.15 and water_conf < 0.30:
                         pen += 1.5
+                    # Cluster-size gate: very small fragments are unlikely water bodies.
+                    if size_frac < 0.005 and water_conf < 0.45:
+                        pen += 2.0
+                    elif size_frac < 0.015 and water_conf < 0.35:
+                        pen += 1.0
+                    # Ambiguity tie-breaker: when vegetation signal is present alongside
+                    # a moderate water signal, prefer vegetation over water.
+                    # Misclassifying vegetation as water is worse than the reverse.
+                    if veg_score >= 0.15 and water_score < 0.50:
+                        pen += 1.5
+                    if veg_score >= 0.25 and water_score < 0.65:
+                        pen += 1.5   # stacks: +3.0 for moderate veg + non-dominant water
+
+                # Vegetation preferred over water when signals are ambiguous.
+                if name in vegetation_materials and water_score >= 0.20 and veg_score >= 0.10:
+                    pen -= 0.8   # slight bias: vegetation is more common than water bodies
+                if name in vegetation_materials:
+                    if veg_score < 0.06:
+                        pen += 2.5
+                    elif veg_score < 0.15:
+                        pen += 0.6
+                    if road_score >= 0.40 and veg_score < 0.30:
+                        pen += 2.5
+                    if asphalt_score >= 0.35 and veg_score < 0.30:
+                        pen += 2.5
+                    if road_score >= 0.30 and gray_frac >= 0.18 and veg_score < 0.25:
+                        pen += 3.5  # near-gray road-like cluster: strongly block vegetation
+                    if asphalt_score >= 0.25 and gray_frac >= 0.18 and veg_score < 0.25:
+                        pen += 3.5
                     if water_score >= 0.50:
                         pen += 2.0
                     if dry_score >= 0.50 and name in lush_vegetation_materials:
                         pen += 1.5
+                    # Gray-toned clusters: tiered gate — achromatic → not vegetation.
+                    # BUT: dampen when veg_score is moderate-to-high (tree clusters
+                    # often have shadow pixels that inflate gray_frac).
+                    _gray_dampen = 1.0
+                    if veg_score >= 0.40:
+                        _gray_dampen = 0.15   # strong veg signal → almost ignore gray_frac
+                    elif veg_score >= 0.25:
+                        _gray_dampen = 0.40   # moderate veg → halve gray penalty
+                    elif veg_score >= 0.15:
+                        _gray_dampen = 0.70   # weak veg → slightly reduce
+                    if gray_frac >= 0.50:
+                        pen += 5.0 * _gray_dampen
+                    elif gray_frac >= 0.35:
+                        pen += 3.5 * _gray_dampen
+                    elif gray_frac >= 0.20:
+                        pen += 2.0 * _gray_dampen
+                    elif gray_frac >= 0.12:
+                        pen += 0.8 * _gray_dampen
+                    # Dark gray confirms road/asphalt, not vegetation.
+                    if dark_gray_frac >= 0.40:
+                        pen += 6.0 * _gray_dampen   # very strong dark gray → almost certainly asphalt
+                    elif dark_gray_frac >= 0.25:
+                        pen += 4.0 * _gray_dampen
+                    elif dark_gray_frac >= 0.12:
+                        pen += 1.5 * _gray_dampen
+                    # Dark gray + asphalt signal → block vegetation aggressively
+                    if dark_gray_frac >= 0.20 and asphalt_score >= 0.15 and veg_score < 0.25:
+                        pen += 4.0
+                    # Combined: gray + asphalt signal → push away from vegetation.
+                    if gray_frac >= 0.25 and asphalt_score >= 0.15 and veg_score < 0.25:
+                        pen += 2.5
+                    # Gray cluster + low veg → block vegetation.
+                    if gray_frac >= 0.20 and veg_score < 0.15 and grass_score < 0.10:
+                        pen += 3.0
+                    if gray_frac >= 0.35 and veg_score < 0.10:
+                        pen += 3.0
+                    if gray_frac >= 0.18 and (road_score >= 0.28 or asphalt_score >= 0.22) and veg_score < 0.20:
+                        pen += 2.5
+                    # BM_LAND_GRASS: penalise for gray clusters (only when veg_score is low).
+                    if name == "BM_LAND_GRASS" and (gray_frac >= 0.20 or dark_gray_frac >= 0.12) and veg_score < 0.25:
+                        pen += 4.0
+                    if name == "BM_LAND_GRASS" and (road_score >= 0.30 or asphalt_score >= 0.25) and veg_score < 0.20:
+                        pen += 3.5
+                    # BM_LAND_DRY_GRASS: penalise for gray clusters (only when veg_score is low).
+                    if name == "BM_LAND_DRY_GRASS" and (gray_frac >= 0.20 or dark_gray_frac >= 0.12) and veg_score < 0.25:
+                        pen += 3.5
+                    if name == "BM_LAND_DRY_GRASS" and (road_score >= 0.30 or asphalt_score >= 0.25) and veg_score < 0.20:
+                        pen += 3.0
+                    # BM_VEGETATION / BM_FOLIAGE: penalise for gray/road clusters
+                    # ONLY when veg evidence is weak.
+                    if name in {"BM_VEGETATION", "BM_FOLIAGE"}:
+                        if (gray_frac >= 0.18 or dark_gray_frac >= 0.10) and veg_score < 0.20:
+                            pen += 4.5
+                        if (road_score >= 0.25 or asphalt_score >= 0.20) and veg_score < 0.25:
+                            pen += 4.0
+                        if gray_frac >= 0.25 and (road_score >= 0.22 or asphalt_score >= 0.18) and veg_score < 0.20:
+                            pen += 4.0  # gray + road signal → unlikely dark-green vegetation
                 if name in dry_vegetation_materials and veg_score >= 0.62 and dry_score < 0.20:
                     pen += 0.8
-                # Strong bonus: if green signal is clear, reward vegetation assignment.
-                if name in vegetation_materials and veg_score >= 0.30:
-                    pen -= 1.8
-                if name in vegetation_materials and veg_score >= 0.55:
-                    pen -= 1.8  # stacks: -3.6 for clearly green clusters
+                # Vegetation bonus: awarded when cluster is genuinely green.
+                # Tiered: stronger bonus for higher veg confidence.
+                if name in vegetation_materials and veg_score >= 0.12 and gray_frac < 0.35:
+                    pen -= 2.5
+                if name in vegetation_materials and veg_score >= 0.20 and gray_frac < 0.30:
+                    pen -= 4.0
+                if name in vegetation_materials and veg_score >= 0.35 and gray_frac < 0.25:
+                    pen -= 4.0
+                if name in vegetation_materials and veg_score >= 0.50 and gray_frac < 0.20:
+                    pen -= 3.5
+                if name in vegetation_materials and veg_score >= 0.65 and gray_frac < 0.15:
+                    pen -= 3.0  # stacks: up to -17.0 for very green, non-gray clusters
+                # Grass bonus: strong lush-grass signal confirms grass assignment.
+                if name in vegetation_materials and grass_score >= 0.08 and gray_frac < 0.25:
+                    pen -= 3.0
+                if name in vegetation_materials and grass_score >= 0.20 and gray_frac < 0.20:
+                    pen -= 3.0
+                if name in vegetation_materials and grass_score >= 0.35 and gray_frac < 0.15:
+                    pen -= 2.5  # stacks: up to -8.5 for strong grass signal
 
-                # Soil should be less likely for strong asphalt/road signatures.
+                # ── Asphalt guard: penalise asphalt when cluster has green signal ──
+                if name in asphalt_materials:
+                    if veg_score >= 0.35:
+                        pen += 4.0   # clearly vegetation-green → not asphalt
+                    elif veg_score >= 0.22:
+                        pen += 2.5
+                    elif veg_score >= 0.12:
+                        pen += 1.0   # even low veg signal → mild asphalt doubt
+                    if grass_score >= 0.20:
+                        pen += 2.5   # grass pixels in cluster → not asphalt
+                    if grass_score >= 0.35:
+                        pen += 2.5   # stacks: +5.0 for very grassy cluster
+                    # Gray cluster: tiered reward for asphalt assignment.
+                    if gray_frac >= 0.50:
+                        pen -= 2.5
+                    elif gray_frac >= 0.35:
+                        pen -= 1.8
+                    elif gray_frac >= 0.20:
+                        pen -= 1.2
+                    elif gray_frac >= 0.12:
+                        pen -= 0.5
+                    # Dark gray confirms asphalt.
+                    if dark_gray_frac >= 0.40:
+                        pen -= 4.0   # very strong dark gray → almost certainly asphalt
+                    elif dark_gray_frac >= 0.20:
+                        pen -= 2.5
+                    elif dark_gray_frac >= 0.10:
+                        pen -= 1.0
+                    # Dark gray + low warm: asphalt signal.
+                    if dark_gray_frac >= 0.25 and warm_frac < 0.15:
+                        pen -= 2.5
+                    # Gray cluster with weak vegetation → prefer asphalt.
+                    # GUARD: only reward when veg signal is truly weak.
+                    if gray_frac >= 0.20 and veg_score < 0.15 and grass_score < 0.10:
+                        pen -= 2.0
+                    if gray_frac >= 0.35 and veg_score < 0.10 and grass_score < 0.08:
+                        pen -= 2.0
+                    if gray_frac >= 0.18 and (road_score >= 0.28 or asphalt_score >= 0.22) and veg_score < 0.18:
+                        pen -= 1.8
+                    if name == "BM_ASPHALT" and (gray_frac >= 0.20 or dark_gray_frac >= 0.12) and veg_score < 0.18:
+                        pen -= 2.0
+                    if name == "BM_ASPHALT" and (road_score >= 0.28 or asphalt_score >= 0.22) and veg_score < 0.20:
+                        pen -= 1.8
+
+                # ── Sand-vs-asphalt guard: penalise asphalt if cluster looks warm/sandy ──
+                if name in asphalt_materials and sand_score >= 0.35:
+                    pen += 1.8
+                if name in asphalt_materials and sand_score >= 0.55:
+                    pen += 1.5   # stacks: +3.3 for very sandy clusters
+                # ── Warm-tone guard: warm clusters → penalise asphalt/concrete ──
+                # Concrete and asphalt are neutral/cool gray; warm-toned clusters are soil/sand.
+                if name in asphalt_materials or name == "BM_CONCRETE":
+                    if warm_frac >= 0.55:
+                        pen += 5.0   # strongly warm → definitely not road
+                    elif warm_frac >= 0.40:
+                        pen += 3.5
+                    elif warm_frac >= 0.25:
+                        pen += 2.0
+                    elif warm_frac >= 0.12:
+                        pen += 0.8
+                    # Compound: warm AND low gray → earth, not asphalt
+                    if warm_frac >= 0.20 and gray_frac < 0.20:
+                        pen += 2.5
+
+                # ── Sand guard: penalise sand when cluster is dark/achromatic (→ asphalt) ──
+                if name == "BM_SAND" and dark_gray_frac >= 0.30:
+                    pen += 2.5   # dark gray cluster is asphalt, not sand
+                if name == "BM_SAND" and asphalt_score >= 0.40:
+                    pen += 1.8
+                # Sand requires warm tone; neutral/cool gray cluster is concrete, not sand.
+                if name == "BM_SAND":
+                    if gray_frac >= 0.40 and warm_frac < 0.20:
+                        pen += 4.0   # achromatic cluster → not sand
+                    elif gray_frac >= 0.25 and warm_frac < 0.20:
+                        pen += 2.0
+                    if warm_frac >= 0.35:
+                        pen -= 1.0   # bonus: warm cluster confirms sand possibility
+
+                # ── Soil/Earthen guard: warm required, penalise when neutral/gray ──
+                # Soil and earthen are inherently warm-brown; a gray-dominant cluster is
+                # concrete/asphalt, never soil.
                 if name in soil_materials:
                     if road_score >= 0.52:
                         pen += 1.4
@@ -3419,6 +4450,33 @@ def _build_mea_cluster_mapping(
                         pen += 1.3
                     if line_score >= 0.45:
                         pen += 0.8
+                    # Neutral/gray cluster → strongly penalise soil/earthen.
+                    if gray_frac >= 0.45 and warm_frac < 0.15:
+                        pen += 5.0
+                    elif gray_frac >= 0.30 and warm_frac < 0.20:
+                        pen += 3.0
+                    elif gray_frac >= 0.20 and warm_frac < 0.20:
+                        pen += 1.5
+                    # Dark gray directly confirms asphalt/concrete, NEVER soil/earthen.
+                    # BM_EARTHEN (RGB 139,90,43) and BM_SOIL (RGB 101,67,33) are warm-brown;
+                    # a dark-gray cluster (e.g. worn asphalt) has none of those warm tones.
+                    if dark_gray_frac >= 0.35:
+                        pen += 5.0
+                    elif dark_gray_frac >= 0.20:
+                        pen += 3.0
+                    elif dark_gray_frac >= 0.10:
+                        pen += 1.5
+                    # Dark gray + low warm = road surface; strongest combined soil exclusion.
+                    if dark_gray_frac >= 0.20 and warm_frac < 0.15:
+                        pen += 3.0
+                    # Compound: high gray + low dry → road surface, not earth.
+                    if gray_frac >= 0.25 and dry_score < 0.15:
+                        pen += 2.5
+                    # Warm cluster with dry signal → reward.
+                    if warm_frac >= 0.30 and dry_score >= 0.20:
+                        pen -= 1.5
+                    elif warm_frac >= 0.20:
+                        pen -= 0.6
 
                 # Vegetation penalized for clear water-like signatures.
                 if name in vegetation_materials and water_score >= 0.55:
@@ -3433,12 +4491,54 @@ def _build_mea_cluster_mapping(
                     pen -= 1.2
                 if name == "BM_CONCRETE" and road_score >= 0.30:
                     pen -= 1.1
+                if name == "BM_CONCRETE" and road_score >= 0.50:
+                    pen -= 1.0   # stacks: -2.1 for strong road signal
+                if name == "BM_CONCRETE" and gray_frac >= 0.50 and veg_score < 0.15:
+                    pen -= 2.0
+                elif name == "BM_CONCRETE" and gray_frac >= 0.35 and veg_score < 0.18:
+                    pen -= 1.5
+                elif name == "BM_CONCRETE" and gray_frac >= 0.20 and veg_score < 0.20:
+                    pen -= 1.0   # concrete roads are light-gray
+                # Concrete also benefits from dark_gray (shaded concrete).
+                if name == "BM_CONCRETE" and dark_gray_frac >= 0.15 and veg_score < 0.15:
+                    pen -= 0.6
+                # Gray cluster with weak vegetation → prefer concrete.
+                # GUARD: only reward when veg/grass signals are truly absent.
+                if name == "BM_CONCRETE" and gray_frac >= 0.20 and veg_score < 0.15 and grass_score < 0.10:
+                    pen -= 2.0
+                if name == "BM_CONCRETE" and gray_frac >= 0.35 and veg_score < 0.10 and grass_score < 0.08:
+                    pen -= 2.0
+                # Concrete guard: penalise when cluster has green/veg signal
+                if name == "BM_CONCRETE" and veg_score >= 0.25:
+                    pen += 3.0
+                if name == "BM_CONCRETE" and veg_score >= 0.40:
+                    pen += 2.5   # stacks: +5.5 for clearly green cluster → not concrete
+                if name == "BM_CONCRETE" and grass_score >= 0.15:
+                    pen += 2.0
+                if name == "BM_CONCRETE" and grass_score >= 0.30:
+                    pen += 2.0   # stacks: +4.0 for grassy cluster → not concrete
                 if name in paint_materials and line_score >= 0.30:
                     pen -= 1.0
                 if name in soil_materials and dry_score >= 0.30:
                     pen -= 1.2
+                if name in soil_materials and warm_frac >= 0.30 and dry_score >= 0.20:
+                    pen -= 0.8   # extra bonus: warm + dry = classic soil signal
                 if name == "BM_ROCK" and dry_score >= 0.30:
                     pen -= 1.0
+                # BM_ROCK (130,123,115): use as neutral road-like fallback for gray asphalt
+                # shades that are not strongly saturated/green.
+                if name == "BM_ROCK" and gray_frac >= 0.18:
+                    pen -= 2.0
+                if name == "BM_ROCK" and dark_gray_frac >= 0.12:
+                    pen -= 1.4
+                if name == "BM_ROCK" and road_score >= 0.28:
+                    pen -= 1.6
+                if name == "BM_ROCK" and asphalt_score >= 0.22:
+                    pen -= 1.4
+                if name == "BM_ROCK" and gray_frac >= 0.18 and veg_score < 0.35:
+                    pen -= 2.2
+                if name == "BM_ROCK" and veg_score >= 0.45 and gray_frac < 0.15:
+                    pen += 2.0
                 # Water bonus when there is any water confidence.
                 if name in water_materials and water_conf >= 0.22:
                     pen -= 1.5
@@ -3488,42 +4588,19 @@ def _build_mea_cluster_mapping(
 
         cost = ((1.0 - MEA_SEMANTIC_WEIGHT) * cost) + (MEA_SEMANTIC_WEIGHT * sem_penalty)
 
-    # Global optimal one-to-one matching (min total color distance)
-    row_ind, col_ind = linear_sum_assignment(cost)
-    used_materials = set()
-    for i, j in zip(row_ind, col_ind):
-        used_materials.add(j)
-        assigned_rgb = material_colors[j]
+    # Many-to-one assignment: each cluster picks its lowest-cost material
+    # independently.  This allows multiple clusters to share the same
+    # material (e.g. two road clusters can both get BM_ASPHALT).
+    col_ind = np.argmin(cost, axis=1)  # shape (n_clusters,)
+    for i, j in enumerate(col_ind):
+        assigned_rgb = material_colors[int(j)]
         assigned[i] = assigned_rgb
         mapping[i] = {
             "cluster": i + 1,
-            "material": material_names[j],
-            "colorHex": material_hex[j],
+            "material": material_names[int(j)],
+            "colorHex": material_hex[int(j)],
             "colorRGB": assigned_rgb,
         }
-
-    # If clusters > materials, assign remaining clusters by nearest material (with reuse)
-    if len(cluster_rgbs) > len(material_colors):
-        for i in range(len(cluster_rgbs)):
-            if mapping[i]["material"] != "UNKNOWN":
-                continue
-            rgb = cluster_rgbs[i]
-            j = min(
-                range(len(material_colors)),
-                key=lambda idx: (
-                    (rgb[0] - material_colors[idx][0]) ** 2
-                    + (rgb[1] - material_colors[idx][1]) ** 2
-                    + (rgb[2] - material_colors[idx][2]) ** 2
-                ),
-            )
-            assigned_rgb = material_colors[j]
-            assigned[i] = assigned_rgb
-            mapping[i] = {
-                "cluster": i + 1,
-                "material": material_names[j],
-                "colorHex": material_hex[j],
-                "colorRGB": assigned_rgb,
-            }
 
     # Final semantic guardrails to reduce severe confusions.
     if cluster_semantics is not None and len(cluster_semantics) == len(cluster_rgbs):
@@ -3549,6 +4626,7 @@ def _build_mea_cluster_mapping(
             water_conf = float(sem.get("water_conf", 0.0))
             dry_score = float(sem.get("dry", 0.0))
             sand_score = float(sem.get("sand", 0.0))
+            dark_gray_frac = float(sem.get("dark_gray_frac", 0.0))
             current_mat = str(mapping[i].get("material", "UNKNOWN"))
             road_like = max(road_score, asphalt_score, line_score)
             water_like = (water_conf >= 0.28) or (
@@ -3701,6 +4779,35 @@ def _build_mea_cluster_mapping(
                     }
                     current_mat = str(mapping[i].get("material", "UNKNOWN"))
 
+            # Asphalt mapped but strong green signal → remap to vegetation.
+            asphalt_idx_local = next((idx for idx, n in enumerate(material_names) if n == "BM_ASPHALT"), None)
+            if current_mat in {"BM_ASPHALT", "BM_PAINT_ASPHALT"} and veg_score >= 0.35 and grass_score >= 0.12:
+                veg_candidates = [idx for idx, n in enumerate(material_names) if n in vegetation_materials]
+                if veg_candidates:
+                    rgb = cluster_rgbs[i]
+                    best_idx = min(
+                        veg_candidates,
+                        key=lambda idx: (
+                            (rgb[0] - material_colors[idx][0]) ** 2
+                            + (rgb[1] - material_colors[idx][1]) ** 2
+                            + (rgb[2] - material_colors[idx][2]) ** 2
+                        ),
+                    )
+                    _remap_cluster_to(best_idx)
+                    current_mat = material_names[best_idx]
+
+            # Sand → asphalt guardrail: cluster mapped to sand but is dark-achromatic.
+            if current_mat == "BM_SAND" and asphalt_score >= 0.35 and dark_gray_frac >= 0.25 and sand_score < 0.40:
+                if asphalt_idx_local is not None:
+                    _remap_cluster_to(asphalt_idx_local)
+                    current_mat = "BM_ASPHALT"
+
+            # Asphalt → sand guardrail: cluster mapped to asphalt but is warm/sandy.
+            if current_mat == "BM_ASPHALT" and sand_score >= 0.50 and asphalt_score < 0.25:
+                if sand_idx_local is not None:
+                    _remap_cluster_to(sand_idx_local)
+                    current_mat = "BM_SAND"
+
             # If mapped to vegetation but water evidence is strong, force water.
             if current_mat in vegetation_materials and (water_like or water_conf >= 0.30) and water_idx is not None:
                 assigned[i] = material_colors[water_idx]
@@ -3801,56 +4908,43 @@ def _apply_color_table(
     verbose: bool = True
 ) -> np.ndarray:
     """
-    Apply colors to classification result - pure classification output.
-    Map class values to color indices (class N -> colors[N-1])
+    Apply colors to classification result using a vectorised LUT lookup.
+    Map class values to color indices (class N -> colors[N-1]).
     """
     height, width = class_raster.shape
-    rgb = np.zeros((3, height, width), dtype=np.uint8)
-    
+    n_colors = len(colors)
+
     if verbose:
         print(f"    [Color Apply] Input raster shape: {class_raster.shape}, dtype: {class_raster.dtype}")
         print(f"    [Color Apply] Input raster range: min={np.min(class_raster)}, max={np.max(class_raster)}")
-        print(f"    [Color Apply] Color table size: {len(colors)}")
+        print(f"    [Color Apply] Color table size: {n_colors}")
         unique_classes = np.unique(class_raster)
         print(f"    [Color Apply] Unique class values: {unique_classes}")
-        print(f"    [Color Apply] Color table: {colors}")
-        print(f"    [Color Apply] Mapping: class N -> colors[N-1]")
-    
-    # Apply class colors
-    total_pixels = height * width
-    applied_count = 0
-    uncolored_pixels = total_pixels
-    
+
+    # Build LUT: index 0 = background (black), 1..n_colors = class colours
+    lut = np.zeros((n_colors + 1, 3), dtype=np.uint8)
     for idx, (r, g, b) in enumerate(colors, start=1):
-        mask = class_raster == idx
-        count = np.sum(mask)
-        if count > 0:
-            rgb[0][mask] = r
-            rgb[1][mask] = g
-            rgb[2][mask] = b
-            applied_count += count
-            uncolored_pixels -= count
-            if verbose:
-                print(f"      Mapping class {idx} -> color {idx-1}: ({r}, {g}, {b}) - {count} pixels")
-        else:
-            if verbose:
-                print(f"      Class {idx} not found in raster (would use color {idx-1}: ({r}, {g}, {b}))")
-    
-    # Check for uncolored pixels
-    black_mask = (rgb[0] == 0) & (rgb[1] == 0) & (rgb[2] == 0)
-    black_count = np.sum(black_mask)
-    
+        if idx <= n_colors:
+            lut[idx] = (r, g, b)
+
+    # Clip class raster to valid LUT range, then fancy-index
+    flat = class_raster.ravel().astype(np.intp)
+    np.clip(flat, 0, n_colors, out=flat)
+    mapped = lut[flat]  # (H*W, 3)
+    rgb = mapped.reshape(height, width, 3).transpose(2, 0, 1).copy()  # (3, H, W)
+
     if verbose:
+        applied_count = int(np.sum(class_raster > 0))
+        total_pixels = height * width
+        black_count = total_pixels - applied_count
         print(f"    [Color Apply] Pixels colored: {applied_count}/{total_pixels}")
         print(f"    [Color Apply] Black (0,0,0) pixels: {black_count}/{total_pixels}")
-        print(f"    [Color Apply] RGB final ranges: R={np.min(rgb[0])}-{np.max(rgb[0])}, G={np.min(rgb[1])}-{np.max(rgb[1])}, B={np.min(rgb[2])}-{np.max(rgb[2])}")
-    
-    # Check if all pixels are black
-    if black_count == total_pixels:
-        if verbose:
+        print(f"    [Color Apply] RGB final ranges: R={np.min(rgb[0])}-{np.max(rgb[0])}, "
+              f"G={np.min(rgb[1])}-{np.max(rgb[1])}, B={np.min(rgb[2])}-{np.max(rgb[2])}")
+
+        if applied_count == 0:
             print(f"    [Color Apply] ERROR: ALL PIXELS ARE BLACK!")
             print(f"    [Color Apply] Class values found: {unique_classes}")
-            print(f"    [Color Apply] Expected class range: 1 to {len(colors)}")
-            print(f"    [Color Apply] Check if class values match the expected range")
-    
+            print(f"    [Color Apply] Expected class range: 1 to {n_colors}")
+
     return rgb

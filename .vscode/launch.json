@@ -1,0 +1,29 @@
+{
+	"version": "0.2.0",
+	"configurations": [
+		{
+			"name": "Web App: Open Browser",
+			"type": "chrome",
+			"request": "launch",
+			"url": "http://localhost:5173",
+			"webRoot": "${workspaceFolder}/web_app/src",
+			"preLaunchTask": "Start Web App (Backend + Frontend)"
+		},
+		{
+			"name": "Backend Only",
+			"type": "debugpy",
+			"request": "launch",
+			"module": "uvicorn",
+			"args": [
+				"backend.app.main:app",
+				"--host", "0.0.0.0",
+				"--port", "8000",
+				"--reload"
+			],
+			"cwd": "${workspaceFolder}",
+			"env": {
+				"PYTHONPATH": "${workspaceFolder}"
+			}
+		}
+	]
+}
