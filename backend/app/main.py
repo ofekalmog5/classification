@@ -1,3 +1,15 @@
+import sys
+import os
+
+# Force UTF-8 for stdout/stderr on Windows so that print() calls with
+# special characters (arrows, checkmarks, etc.) don't throw UnicodeEncodeError.
+# PYTHONIOENCODING is inherited by child processes (ProcessPoolExecutor workers).
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
@@ -16,6 +28,7 @@ from .core import classify as run_classify
 from .core import classify_and_export as run_classify_and_export
 from .core import rasterize_vectors_onto_classification as run_rasterize_vectors
 from .core import apply_road_object_removal as run_road_object_removal
+from .core import train_kmeans_model, build_shared_color_table
 
 # ─── SSE progress streaming infrastructure ───────────────────────────────
 
@@ -27,18 +40,21 @@ _PHASE_WEIGHTS: Dict[str, float] = {
     # Step 1 phases
     "Loading raster": 3,
     "Shadow balance": 2,
-    "Feature extraction": 20,
-    "KMeans clustering": 20,
-    "Pixel assignment": 12,
-    "Classifying tiles": 35,
-    "Shadow detection": 3,
-    "Post-processing": 25,
-    "Saving output": 15,
+    "Feature extraction": 30,   # increased: now includes VARI, Saturation, Entropy
+    "KMeans clustering": 18,
+    "Pixel assignment": 10,
+    "Classifying tiles": 30,
+    "Shadow detection": 2,
+    "Post-processing": 22,      # includes morphological road cleanup
+    "Saving output": 13,
     # Step 2 / Step 3 phases
     "Loading classified raster": 5,
     "Converting to label raster": 10,
     "Removing road objects": 50,
     "Saving result": 15,
+    # Batch phases
+    "Training shared model": 15,
+    "Classifying": 5,
 }
 
 # Approximate total weight per pipeline (for normalising to 0–100 %).
@@ -66,7 +82,7 @@ class _ProgressTracker:
 
     def __call__(self, phase: str, done: int, total: int):
         if phase != self.current_phase:
-            # Entering a new phase → mark previous as fully complete.
+            # Entering a new phase -> mark previous as fully complete.
             if self.current_phase is not None:
                 self.completed_weight += self.current_weight
             self.current_phase = phase
@@ -103,12 +119,16 @@ class VectorLayer(BaseModel):
     name: str
     filePath: str
     classId: str
+    overrideColor: list | None = None
 
 
 class FeatureFlags(BaseModel):
     spectral: bool
     texture: bool
     indices: bool
+    colorIndices: bool = True
+    entropy: bool = False
+    morphCleanup: bool = True
 
 
 class ClassifyRequest(BaseModel):
@@ -205,7 +225,7 @@ async def progress_sse(task_id: str):
         while True:
             try:
                 evt = await loop.run_in_executor(None, lambda: q.get(timeout=0.5))
-                if evt is None:  # sentinel → task finished
+                if evt is None:  # sentinel -> task finished
                     yield "event: done\ndata: {}\n\n"
                     break
                 yield f"data: {_json.dumps(evt)}\n\n"
@@ -228,19 +248,19 @@ def classify(request: ClassifyRequest) -> dict:
     tracker = _ProgressTracker(request.taskId, "full") if request.taskId else None
     try:
         result = run_classify(
-            request.rasterPath,
-            [item.model_dump() for item in request.classes],
-            [layer.model_dump() for layer in request.vectorLayers],
-            request.smoothing,
-            request.featureFlags.model_dump(),
-            request.outputPath,
-            request.tileMode,
-            request.tileMaxPixels or 512 * 512,
-            request.tileOverlap,
-            request.tileOutputDir,
-            request.tileWorkers,
-            request.detectShadows,
-            request.maxThreads,
+            raster_path=request.rasterPath,
+            classes=[item.model_dump() for item in request.classes],
+            vector_layers=[layer.model_dump() for layer in request.vectorLayers],
+            smoothing=request.smoothing,
+            feature_flags=request.featureFlags.model_dump(),
+            output_path=request.outputPath,
+            tile_mode=request.tileMode,
+            tile_max_pixels=request.tileMaxPixels or 512 * 512,
+            tile_overlap=request.tileOverlap,
+            tile_output_dir=request.tileOutputDir,
+            tile_workers=request.tileWorkers,
+            detect_shadows=request.detectShadows,
+            max_threads=request.maxThreads,
             export_format=request.exportFormat,
             progress_callback=tracker,
         )
@@ -259,23 +279,216 @@ def classify_step1(request: ClassifyStep1Request) -> dict:
     tracker = _ProgressTracker(request.taskId, "step1") if request.taskId else None
     try:
         result = run_classify_and_export(
-            request.rasterPath,
-            [item.model_dump() for item in request.classes],
-            request.smoothing,
-            request.featureFlags.model_dump(),
-            request.outputPath,
-            request.tileMode,
-            request.tileMaxPixels or 512 * 512,
-            request.tileOverlap,
-            request.tileOutputDir,
-            request.tileWorkers,
-            request.detectShadows,
-            request.maxThreads,
+            raster_path=request.rasterPath,
+            classes=[item.model_dump() for item in request.classes],
+            smoothing=request.smoothing,
+            feature_flags=request.featureFlags.model_dump(),
+            output_path=request.outputPath,
+            tile_mode=request.tileMode,
+            tile_max_pixels=request.tileMaxPixels or 512 * 512,
+            tile_overlap=request.tileOverlap,
+            tile_output_dir=request.tileOutputDir or request.outputPath,
+            tile_workers=request.tileWorkers,
+            detect_shadows=request.detectShadows,
+            max_threads=request.maxThreads,
             export_format=request.exportFormat,
             progress_callback=tracker,
         )
         return result
     except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+    finally:
+        if tracker:
+            tracker.finish()
+
+
+# ─── Batch classify (shared model across all files) ──────────────────────
+
+
+class BatchClassifyRequest(BaseModel):
+    """Classify multiple rasters with a single shared KMeans model."""
+    rasterPaths: List[str]
+    classes: List[ClassItem]
+    vectorLayers: List[VectorLayer] = []
+    smoothing: str = "none"
+    featureFlags: FeatureFlags
+    outputPath: str | None = None
+    exportFormat: str = "tif"
+    tileMode: bool = False
+    tileMaxPixels: int | None = None
+    tileOverlap: int = 0
+    tileWorkers: int | None = None
+    detectShadows: bool = False
+    maxThreads: int | None = None
+    taskId: str | None = None
+
+
+@app.post("/classify-batch")
+def classify_batch(request: BatchClassifyRequest) -> dict:
+    """Train ONE shared model on all rasters, then classify each with it."""
+    import time as _time
+
+    n = len(request.rasterPaths)
+    print(f"\n[API /classify-batch] {n} raster(s), shared model")
+    tracker = _ProgressTracker(request.taskId, "full") if request.taskId else None
+    classes_raw = [item.model_dump() for item in request.classes]
+    vectors_raw = [layer.model_dump() for layer in request.vectorLayers]
+    ff = request.featureFlags.model_dump()
+    has_vectors = len(vectors_raw) > 0
+
+    try:
+        # ── Phase 1: Train shared model ──
+        if tracker:
+            tracker("Training shared model", 0, 1)
+        t0 = _time.perf_counter()
+        scaler, kmeans = train_kmeans_model(
+            request.rasterPaths, classes_raw, ff,
+            detect_shadows=request.detectShadows,
+        )
+        # Build ONE shared color table from all rasters
+        mea_mapping, color_table = build_shared_color_table(
+            request.rasterPaths, scaler, kmeans, classes_raw, ff,
+        )
+        if tracker:
+            tracker("Training shared model", 1, 1)
+        train_time = _time.perf_counter() - t0
+        print(f"[Batch] Shared model trained in {train_time:.1f}s")
+
+        # ── Phase 2: Classify each raster (Step 1 only) ──
+        all_results: list[dict] = []
+        all_tile_outputs: list[str] = []
+        all_output_paths: list[str] = []
+        errors: list[tuple[str, str]] = []
+        # Track classified outputs for later vector rasterization
+        classified_outputs: list[tuple[str, str]] = []  # (raster_path, classified_output_path)
+
+        for i, rpath in enumerate(request.rasterPaths):
+            fname = Path(rpath).name
+            if tracker:
+                tracker(f"Classifying {fname}", i, n)
+            print(f"\n[Batch] ({i+1}/{n}) {fname}")
+
+            try:
+                result = run_classify_and_export(
+                    raster_path=rpath,
+                    classes=classes_raw,
+                    smoothing=request.smoothing,
+                    feature_flags=ff,
+                    output_path=request.outputPath,
+                    tile_mode=request.tileMode,
+                    tile_max_pixels=request.tileMaxPixels or 512 * 512,
+                    tile_overlap=request.tileOverlap,
+                    tile_output_dir=request.outputPath,
+                    tile_workers=request.tileWorkers,
+                    detect_shadows=request.detectShadows,
+                    max_threads=request.maxThreads,
+                    pretrained_scaler=scaler,
+                    pretrained_kmeans=kmeans,
+                    pretrained_color_table=color_table,
+                    pretrained_mea_mapping=mea_mapping,
+                    export_format=request.exportFormat,
+                    progress_callback=tracker,
+                )
+
+                all_results.append(result)
+                if result.get("status") == "ok":
+                    op = result.get("outputPath", "")
+                    if op:
+                        # Only add classified paths to output list when no vectors;
+                        # when vectors present, we only show with_vectors outputs.
+                        if not has_vectors:
+                            all_output_paths.append(str(op))
+                        classified_outputs.append((rpath, str(op)))
+                    tiles = result.get("tileOutputs")
+                    if tiles:
+                        all_tile_outputs.extend(tiles)
+                        if not has_vectors:
+                            all_output_paths.extend(str(t) for t in tiles)
+                else:
+                    errors.append((rpath, result.get("message", "unknown error")))
+            except Exception as e:
+                import traceback
+                error_log = Path("classification_error.log")
+                with open(error_log, "a", encoding="utf-8") as f:
+                    f.write(f"--- Error classifying {fname} ---\n")
+                    f.write(f"Exception: {e}\n")
+                    f.write(traceback.format_exc())
+                    f.write("-" * 50 + "\n")
+                errors.append((rpath, str(e)))
+                print(f"[Batch][error] {fname}: {e}")
+        if tracker:
+            tracker(f"Classifying", n, n)
+
+        # ── Phase 3: Rasterize vectors onto ALL classified outputs ──
+        if has_vectors and classified_outputs:
+            n_vec = len(classified_outputs)
+            print(f"\n[Batch] Phase 3: Rasterizing vectors onto {n_vec} classified image(s)")
+            for vi, (rpath, classif_output) in enumerate(classified_outputs):
+                fname = Path(rpath).name
+                if tracker:
+                    tracker(f"Rasterizing vectors {fname}", vi, n_vec)
+                print(f"\n[Batch][Vec] ({vi+1}/{n_vec}) {fname}")
+                try:
+                    _classif_path = Path(classif_output)
+                    _vec_dir = _classif_path.parent / "with_vectors"
+                    _vec_dir.mkdir(parents=True, exist_ok=True)
+                    vec_result = run_rasterize_vectors(
+                        classification_path=classif_output,
+                        vector_layers=vectors_raw,
+                        classes=classes_raw,
+                        output_path=str(_vec_dir),
+                        raster_stem_hint=Path(rpath).stem,
+                        tile_mode=request.tileMode,
+                        tile_max_pixels=request.tileMaxPixels or 512 * 512,
+                        tile_overlap=request.tileOverlap,
+                        tile_output_dir=request.outputPath,
+                        tile_workers=request.tileWorkers,
+                        max_threads=request.maxThreads,
+                        progress_callback=tracker,
+                    )
+                    if vec_result.get("status") == "ok":
+                        vec_op = vec_result.get("outputPath", "")
+                        if vec_op:
+                            all_output_paths.append(str(vec_op))
+                        vec_tiles = vec_result.get("tileOutputs")
+                        if vec_tiles:
+                            all_tile_outputs.extend(vec_tiles)
+                            all_output_paths.extend(str(t) for t in vec_tiles)
+                        print(f"  [OK] Vectors rasterized -> {vec_op}")
+                    else:
+                        print(f"  [WARN] Vector rasterize failed: {vec_result.get('message')}")
+                        errors.append((rpath, f"vector rasterize: {vec_result.get('message', 'unknown')}"))
+                except Exception as e:
+                    print(f"  [ERROR] Vector rasterize: {e}")
+                    errors.append((rpath, f"vector rasterize: {e}"))
+            if tracker:
+                tracker(f"Rasterizing vectors", n_vec, n_vec)
+
+        ok_count = sum(1 for r in all_results if r.get("status") == "ok")
+        return {
+            "status": "ok" if ok_count > 0 else "error",
+            "message": f"Batch complete: {ok_count}/{n} succeeded",
+            "outputPaths": all_output_paths,
+            "tileOutputs": sorted(all_tile_outputs) if all_tile_outputs else None,
+            "results": all_results,
+            "errors": errors if errors else None,
+            "meaMapping": mea_mapping,
+        }
+    except Exception as e:
+        import traceback
+        # Write full traceback to file (stdout/stderr may fail with charmap on Windows)
+        try:
+            with open("classification_error.log", "a", encoding="utf-8") as _ef:
+                _ef.write(f"\n{'='*60}\n")
+                _ef.write(f"Exception in /classify-batch: {e!r}\n")
+                traceback.print_exc(file=_ef)
+                _ef.write(f"{'='*60}\n")
+        except Exception:
+            pass
+        try:
+            traceback.print_exc()
+        except Exception:
+            pass
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
     finally:
         if tracker:
@@ -289,16 +502,16 @@ def classify_step2(request: ClassifyStep2Request) -> dict:
     tracker = _ProgressTracker(request.taskId, "step2") if request.taskId else None
     try:
         result = run_rasterize_vectors(
-            request.classificationPath,
-            [layer.model_dump() for layer in request.vectorLayers],
-            [item.model_dump() for item in request.classes],
-            request.outputPath,
-            request.tileMode,
-            request.tileMaxPixels or 512 * 512,
-            request.tileOverlap,
-            request.tileOutputDir,
-            request.tileWorkers,
-            request.maxThreads,
+            classification_path=request.classificationPath,
+            vector_layers=[layer.model_dump() for layer in request.vectorLayers],
+            classes=[item.model_dump() for item in request.classes],
+            output_path=request.outputPath,
+            tile_mode=request.tileMode,
+            tile_max_pixels=request.tileMaxPixels or 512 * 512,
+            tile_overlap=request.tileOverlap,
+            tile_output_dir=request.tileOutputDir or request.outputPath,
+            tile_workers=request.tileWorkers,
+            max_threads=request.maxThreads,
             progress_callback=tracker,
         )
         return result
@@ -348,7 +561,7 @@ class ListDirRequest(BaseModel):
 def list_dir(request: ListDirRequest) -> dict:
     """List contents of a directory. If no path given, list drive roots (Windows) or /."""
     try:
-        # No path → list drive roots on Windows, or / on Unix
+        # No path -> list drive roots on Windows, or / on Unix
         if not request.path:
             if os.name == "nt":
                 drives = []
@@ -549,7 +762,7 @@ def _render_raster_as_image(file_path: str, max_dim: int = 1536):
         arr = arr[0]  # squeeze to (H, W)
 
     mn, mx = float(np.nanmin(arr)), float(np.nanmax(arr))
-    # If source was already uint8, values are in [0,255] — just clip.
+    # If source was already uint8, values are in [0,255] - just clip.
     # Otherwise stretch to full 0–255 range.
     if is_uint8_source:
         arr = np.clip(arr, 0, 255)
@@ -563,7 +776,7 @@ def _render_raster_as_image(file_path: str, max_dim: int = 1536):
     # ── Build output image ──
     media_type = "image/png"
     if arr.ndim == 3:
-        rgb = np.transpose(arr, (1, 2, 0))  # (C,H,W) → (H,W,C)
+        rgb = np.transpose(arr, (1, 2, 0))  # (C,H,W) -> (H,W,C)
         # For classification results, add alpha channel to hide nodata (black)
         if is_uint8_source:
             # Pixel is nodata when all bands are 0
@@ -600,7 +813,7 @@ def _render_raster_as_image(file_path: str, max_dim: int = 1536):
 
 @app.post("/raster-as-png")
 def raster_as_png_post(request: RasterAsPngRequest):
-    """POST version — accepts filePath in body (robust for Windows paths)."""
+    """POST version - accepts filePath in body (robust for Windows paths)."""
     try:
         payload, media_type, err = _render_raster_as_image(request.filePath, request.maxDim)
         if err:
@@ -608,7 +821,7 @@ def raster_as_png_post(request: RasterAsPngRequest):
         return StreamingResponse(
             io.BytesIO(payload),
             media_type=media_type,
-            headers={"Cache-Control": "public, max-age=3600"},
+            headers={"Cache-Control": "no-cache"},
         )
     except Exception as e:
         import traceback
@@ -618,7 +831,7 @@ def raster_as_png_post(request: RasterAsPngRequest):
 
 @app.get("/raster-as-png/{file_path:path}")
 def raster_as_png(file_path: str, max_dim: int = 1536):
-    """GET version (legacy) — file path encoded in URL."""
+    """GET version (legacy) - file path encoded in URL."""
     try:
         payload, media_type, err = _render_raster_as_image(file_path, max_dim)
         if err:
