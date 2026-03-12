@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useCallback, useRef, type DragEvent } from "react";
 import { useAppState, useAppDispatch } from "../store";
 import type { LayerGroup, MapLayer } from "../types";
 
@@ -6,6 +6,8 @@ export default function LayerPanel() {
   const { mapLayers, layerGroups } = useAppState();
   const dispatch = useAppDispatch();
   const [newGroupName, setNewGroupName] = useState("");
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const lastClickedRef = useRef<string | null>(null);
 
   const addGroup = () => {
     if (!newGroupName.trim()) return;
@@ -19,23 +21,139 @@ export default function LayerPanel() {
     setNewGroupName("");
   };
 
+  /** Select layers: plain = single, Ctrl = toggle-add one, Shift = range */
+  const handleSelect = useCallback(
+    (id: string, e: React.MouseEvent) => {
+      // Build flat ordered list of all layer ids for range selection
+      const allIds = mapLayers.map((l) => l.id);
+
+      setSelectedIds((prev) => {
+        if (e.shiftKey && lastClickedRef.current) {
+          // Range select: from last-clicked to current
+          const anchorIdx = allIds.indexOf(lastClickedRef.current);
+          const targetIdx = allIds.indexOf(id);
+          if (anchorIdx >= 0 && targetIdx >= 0) {
+            const lo = Math.min(anchorIdx, targetIdx);
+            const hi = Math.max(anchorIdx, targetIdx);
+            const rangeIds = allIds.slice(lo, hi + 1);
+            const next = new Set(prev);
+            for (const rid of rangeIds) next.add(rid);
+            return next;
+          }
+        }
+
+        if (e.ctrlKey || e.metaKey) {
+          // Toggle-add single
+          const next = new Set(prev);
+          if (next.has(id)) next.delete(id);
+          else next.add(id);
+          lastClickedRef.current = id;
+          return next;
+        }
+
+        // Plain click — select only this one
+        lastClickedRef.current = id;
+        return new Set([id]);
+      });
+    },
+    [mapLayers],
+  );
+
+  /** Start dragging selected layers (or just the one being dragged) */
+  const handleDragStart = useCallback(
+    (layerId: string, e: DragEvent) => {
+      const ids = selectedIds.has(layerId)
+        ? Array.from(selectedIds)
+        : [layerId];
+      e.dataTransfer.setData("application/layer-ids", JSON.stringify(ids));
+      e.dataTransfer.effectAllowed = "move";
+    },
+    [selectedIds],
+  );
+
   // Layers not in any group
   const ungrouped = mapLayers.filter(
     (l) => !layerGroups.some((g) => g.layerIds.includes(l.id))
   );
 
+  const hasSelected = selectedIds.size > 0;
+
   return (
     <div className="flex flex-col h-full">
-      <div className="px-3 py-2 border-b border-surface-700">
-        <h2 className="text-xs font-semibold uppercase tracking-wider text-surface-400">
+      {/* Header + bulk visibility buttons */}
+      <div className="px-3 py-2 border-b border-surface-700 flex items-center gap-2">
+        <h2 className="text-xs font-semibold uppercase tracking-wider text-surface-400 flex-1">
           Layers
         </h2>
+        {mapLayers.length > 0 && (
+          <div className="flex gap-1">
+            {hasSelected ? (
+              <>
+                <button
+                  className="text-[9px] px-1.5 py-0.5 rounded bg-surface-700 text-surface-300 hover:bg-surface-600"
+                  onClick={() =>
+                    dispatch({ type: "SET_LAYERS_VISIBLE", ids: Array.from(selectedIds), visible: true })
+                  }
+                  title="Show selected layers"
+                >
+                  👁 Sel
+                </button>
+                <button
+                  className="text-[9px] px-1.5 py-0.5 rounded bg-surface-700 text-surface-300 hover:bg-surface-600"
+                  onClick={() =>
+                    dispatch({ type: "SET_LAYERS_VISIBLE", ids: Array.from(selectedIds), visible: false })
+                  }
+                  title="Hide selected layers"
+                >
+                  ◌ Sel
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  className="text-[9px] px-1.5 py-0.5 rounded bg-surface-700 text-surface-300 hover:bg-surface-600"
+                  onClick={() => dispatch({ type: "SET_ALL_LAYERS_VISIBLE", visible: true })}
+                  title="Show all layers"
+                >
+                  👁 All
+                </button>
+                <button
+                  className="text-[9px] px-1.5 py-0.5 rounded bg-surface-700 text-surface-300 hover:bg-surface-600"
+                  onClick={() => dispatch({ type: "SET_ALL_LAYERS_VISIBLE", visible: false })}
+                  title="Hide all layers"
+                >
+                  ◌ All
+                </button>
+              </>
+            )}
+          </div>
+        )}
       </div>
+
+      {/* Selection indicator */}
+      {hasSelected && (
+        <div className="px-3 py-1 bg-primary-900/30 border-b border-primary-700/40 flex items-center gap-2">
+          <span className="text-[10px] text-primary-300">{selectedIds.size} selected</span>
+          <button
+            className="text-[9px] text-primary-400 hover:text-primary-200 underline"
+            onClick={() => setSelectedIds(new Set())}
+          >
+            Clear
+          </button>
+        </div>
+      )}
 
       <div className="flex-1 overflow-y-auto p-2 space-y-2">
         {/* Layer groups */}
         {layerGroups.map((group) => (
-          <GroupCard key={group.id} group={group} layers={mapLayers} />
+          <GroupCard
+            key={group.id}
+            group={group}
+            layers={mapLayers}
+            selectedIds={selectedIds}
+            onSelect={handleSelect}
+            onDragStart={handleDragStart}
+          />
         ))}
 
         {/* Ungrouped layers */}
@@ -45,7 +163,13 @@ export default function LayerPanel() {
               <p className="text-[10px] text-surface-600 px-1 mb-1">Ungrouped</p>
             )}
             {ungrouped.map((layer) => (
-              <LayerRow key={layer.id} layer={layer} />
+              <LayerRow
+                key={layer.id}
+                layer={layer}
+                selected={selectedIds.has(layer.id)}
+                onSelect={handleSelect}
+                onDragStart={handleDragStart}
+              />
             ))}
           </div>
         )}
@@ -108,16 +232,53 @@ export default function LayerPanel() {
 function GroupCard({
   group,
   layers,
+  selectedIds,
+  onSelect,
+  onDragStart,
 }: {
   group: LayerGroup;
   layers: MapLayer[];
+  selectedIds: Set<string>;
+  onSelect: (id: string, e: React.MouseEvent) => void;
+  onDragStart: (id: string, e: DragEvent) => void;
 }) {
   const dispatch = useAppDispatch();
   const groupLayers = layers.filter((l) => group.layerIds.includes(l.id));
   const [expanded, setExpanded] = useState(true);
+  const [dragOver, setDragOver] = useState(false);
+
+  const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
+    if (e.dataTransfer.types.includes("application/layer-ids")) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      setDragOver(true);
+    }
+  };
+
+  const handleDragLeave = () => setDragOver(false);
+
+  const handleDrop = (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setDragOver(false);
+    const raw = e.dataTransfer.getData("application/layer-ids");
+    if (!raw) return;
+    try {
+      const ids: string[] = JSON.parse(raw);
+      if (ids.length > 0) {
+        dispatch({ type: "ADD_MANY_TO_GROUP", layerIds: ids, groupId: group.id });
+      }
+    } catch { /* ignore */ }
+  };
 
   return (
-    <div className="rounded border border-surface-700 bg-surface-800/50">
+    <div
+      className={`rounded border bg-surface-800/50 transition-colors ${
+        dragOver ? "border-primary-500 bg-primary-900/20" : "border-surface-700"
+      }`}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
       <div className="flex items-center gap-2 px-2 py-1.5">
         <button
           className={`toggle-switch ${group.visible ? "active" : "inactive"}`}
@@ -144,13 +305,21 @@ function GroupCard({
       {expanded && groupLayers.length > 0 && (
         <div className="border-t border-surface-700 px-1 py-0.5">
           {groupLayers.map((l) => (
-            <LayerRow key={l.id} layer={l} inGroup groupId={group.id} />
+            <LayerRow
+              key={l.id}
+              layer={l}
+              inGroup
+              groupId={group.id}
+              selected={selectedIds.has(l.id)}
+              onSelect={onSelect}
+              onDragStart={onDragStart}
+            />
           ))}
         </div>
       )}
       {expanded && groupLayers.length === 0 && (
-        <p className="text-[10px] text-surface-600 px-2 pb-1.5">
-          Drag layers here or use + to add
+        <p className={`text-[10px] px-2 pb-1.5 ${dragOver ? "text-primary-300" : "text-surface-600"}`}>
+          {dragOver ? "Drop layers here" : "Drag layers here or use + to add"}
         </p>
       )}
     </div>
@@ -163,10 +332,16 @@ function LayerRow({
   layer,
   inGroup,
   groupId,
+  selected,
+  onSelect,
+  onDragStart,
 }: {
   layer: MapLayer;
   inGroup?: boolean;
   groupId?: string;
+  selected: boolean;
+  onSelect: (id: string, e: React.MouseEvent) => void;
+  onDragStart: (id: string, e: DragEvent) => void;
 }) {
   const dispatch = useAppDispatch();
   const { layerGroups } = useAppState();
@@ -178,7 +353,18 @@ function LayerRow({
   }[layer.type];
 
   return (
-    <div className="flex items-center gap-1.5 px-1.5 py-1 rounded hover:bg-surface-700/50 group">
+    <div
+      className={`flex items-center gap-1.5 px-1.5 py-1 rounded hover:bg-surface-700/50 group cursor-pointer transition-colors ${
+        selected ? "bg-primary-900/40 ring-1 ring-primary-500/50" : ""
+      }`}
+      draggable
+      onClick={(e) => {
+        // Don't select when clicking controls
+        if ((e.target as HTMLElement).closest("button, input, select")) return;
+        onSelect(layer.id, e);
+      }}
+      onDragStart={(e) => onDragStart(layer.id, e as unknown as DragEvent)}
+    >
       <button
         className={`toggle-switch ${layer.visible ? "active" : "inactive"}`}
         onClick={() => dispatch({ type: "TOGGLE_MAP_LAYER", id: layer.id })}

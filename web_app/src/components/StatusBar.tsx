@@ -5,6 +5,7 @@ export default function StatusBar() {
   const { running, progress, statusText } = useAppState();
   const isRunning = running !== "idle";
   const runStartedAtRef = useRef<number | null>(null);
+  const peakTotalRef = useRef<number>(0);
   const [tick, setTick] = useState(0);
 
   useEffect(() => {
@@ -13,6 +14,7 @@ export default function StatusBar() {
     }
     if (!isRunning) {
       runStartedAtRef.current = null;
+      peakTotalRef.current = 0;
     }
   }, [isRunning]);
 
@@ -35,10 +37,13 @@ export default function StatusBar() {
     if (progress && progress.total > 0 && progress.done > 0) {
       const pct = Math.min(99, Math.max(0, (progress.done / progress.total) * 100));
       // ETA: estimate remaining time from progress rate.
-      // Use a smoothed rate to avoid jumps between fast/slow phases.
-      const etaSec = pct > 0
-        ? Math.max(0, Math.round(elapsedSec * (100 - pct) / pct))
-        : 0;
+      const rawTotal = pct > 0
+        ? Math.round(elapsedSec * 100 / pct)
+        : elapsedSec;
+      // Total estimated must never decrease below elapsed or below previous peak.
+      const clampedTotal = Math.max(rawTotal, elapsedSec, peakTotalRef.current);
+      peakTotalRef.current = clampedTotal;
+      const etaSec = clampedTotal - elapsedSec;
       return {
         percent: pct,
         elapsedSec,
@@ -74,7 +79,7 @@ export default function StatusBar() {
 
       {/* Progress bar + ETA */}
       {isRunning && timing && (
-        <div className="flex items-center gap-2 flex-1 max-w-[460px]">
+        <div className="flex items-center gap-2 flex-1 max-w-[280px]">
           <div className={`progress-bar flex-1${isIndeterminate ? " progress-indeterminate" : ""}`}>
             {!isIndeterminate && (
               <div
@@ -89,7 +94,7 @@ export default function StatusBar() {
           <span className="text-[10px] text-surface-500 whitespace-nowrap" title="Progress and ETA">
             {isIndeterminate
               ? `${formatSeconds(timing.elapsedSec)} elapsed`
-              : `${Math.round(timing.percent)}% · ETA ${formatSeconds(timing.etaSec)} · ${formatSeconds(timing.elapsedSec)} elapsed`
+              : `${Math.round(timing.percent)}% · ETA ${formatSeconds(timing.etaSec)} · ${formatSeconds(timing.elapsedSec)} elapsed · total ~${formatSeconds(timing.elapsedSec + timing.etaSec)}`
             }
           </span>
         </div>

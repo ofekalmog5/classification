@@ -1981,36 +1981,32 @@ def rasterize_vector_onto_raster(raster_path: str, gdf, burn_value: int, output_
     print(f"    Vector features: {len(gdf)}")
     print(f"    Vector CRS: {gdf.crs}")
     print(f"    Raster CRS: {raster_crs}")
-    
+
     # Use the raster's own CRS (authoritative) as the target
     _target_crs = raster_crs
-    
-    if gdf.crs is None:
+
+    if _target_crs is None:
+        print(f"    [WARN] Raster has no CRS; skipping reprojection")
+    elif gdf.crs is None:
+        print(f"    Vector has no CRS; assigning raster CRS directly")
         gdf = gdf.set_crs(_target_crs, allow_override=True)
-        print(f"    Set vector CRS to match raster")
-    elif not CRS(gdf.crs).equals(CRS(_target_crs)):
-        print(f"    [INFO] CRS mismatch - transforming geometries")
-        print(f"      From: {gdf.crs} (EPSG:{CRS(gdf.crs).to_epsg()})")
-        print(f"      To:   {_target_crs} (EPSG:{CRS(_target_crs).to_epsg()})")
+    else:
+        # Always reproject unconditionally - eliminates false-negative CRS.equals() mismatches
         _orig_bounds = gdf.total_bounds
-        
+        print(f"    Reprojecting vector -> raster CRS")
+        print(f"      Vector CRS: {gdf.crs}")
+        print(f"      Raster CRS: {_target_crs}")
         try:
             gdf = gdf.to_crs(_target_crs)
-            print(f"      OK Transformation successful!")
-            print(f"      Original bounds: {_orig_bounds}")
-            print(f"      Transformed bounds: {gdf.total_bounds}")
+            print(f"      [OK] Reprojected. Bounds: {_orig_bounds} -> {gdf.total_bounds}")
         except Exception as e:
-            print(f"      [ERROR] Standard transformation failed: {e}")
-            print(f"      Attempting manual transformation...")
+            print(f"      [ERROR] Reprojection failed: {e}")
+            print(f"      Attempting manual Web Mercator fallback...")
             try:
-                # Fall back to manual Web Mercator if standard transformation fails
                 gdf = _transform_geometries_to_web_mercator(gdf)
-                print(f"      OK Manual transformation successful!")
+                print(f"      [OK] Manual transformation successful")
             except Exception as e2:
-                print(f"      [ERROR] Manual transformation also failed: {e2}")
-                raise RuntimeError("CRS transformation failed; cannot rasterize with mismatched coordinates")
-    else:
-        print(f"    CRS already matches raster")
+                raise RuntimeError(f"CRS transformation failed: {e2}")
     
     print(f"    Vector CRS after processing: {gdf.crs}")
     
@@ -3181,13 +3177,14 @@ def rasterize_vectors_onto_classification(
                 pass
     print(f"  Class color map: {_class_color_map}")
 
-    # Inject overrideColor from classId when not already set
+    # Always resolve color from classId (material assigned in 'attach to vector')
     for layer in vector_layers:
-        if not layer.get("overrideColor"):
-            _cid = layer.get("classId", "")
-            if _cid in _class_color_map:
-                layer["overrideColor"] = list(_class_color_map[_cid])
-                print(f"  Resolved classId={_cid!r} -> overrideColor={layer['overrideColor']}")
+        _cid = layer.get("classId", "")
+        if _cid in _class_color_map:
+            layer["overrideColor"] = list(_class_color_map[_cid])
+            print(f"  Resolved classId={_cid!r} -> overrideColor={layer['overrideColor']}")
+        elif not layer.get("overrideColor"):
+            print(f"  WARNING: classId={_cid!r} not found in class map; auto-color will be used")
 
     # === Load and validate vectors ===
     _t0 = _time.perf_counter()
@@ -3213,19 +3210,24 @@ def rasterize_vectors_onto_classification(
             print(f"    Raster CRS: {crs} (EPSG:{CRS(crs).to_epsg() if crs else None})")
             
             # Always reproject vector to match the classification raster CRS
-            if gdf.crs is None:
+            if crs is None:
+                print(f"    [WARN] Raster has no CRS; cannot reproject vector - assuming coordinates already match")
+            elif gdf.crs is None:
                 gdf = gdf.set_crs(crs, allow_override=True)
                 print(f"    [OK] Set CRS to match classification")
             elif not CRS(gdf.crs).equals(CRS(crs)):
                 _orig_bounds = gdf.total_bounds
+                print(f"    [CRS MISMATCH] Reprojecting shapefile to match raster CRS")
+                print(f"      From: {gdf.crs}")
+                print(f"      To:   {crs}")
                 try:
                     gdf = gdf.to_crs(crs)
-                    print(f"    [OK] Transformed CRS: {gdf.crs}")
+                    print(f"    [OK] Reprojected CRS: {gdf.crs}")
                     print(f"      Original bounds: {_orig_bounds}")
-                    print(f"      Transformed bounds: {gdf.total_bounds}")
+                    print(f"      Reprojected bounds: {gdf.total_bounds}")
                 except Exception as e:
-                    print(f"    [ERROR] CRS transform failed: {e}")
-                    print(f"    [SKIP] Not forcing CRS; vector would be in the wrong coordinates")
+                    print(f"    [ERROR] CRS reproject failed: {e}")
+                    print(f"    [SKIP] Vector skipped due to CRS reproject failure")
                     continue
             else:
                 print(f"    [OK] CRS already matches classification")

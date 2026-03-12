@@ -1,22 +1,38 @@
 import { useAppState, useAppDispatch } from "../../store";
+import type { FeatureFlags } from "../../types";
+
+const FEATURE_DEFS: Array<{
+  key: keyof FeatureFlags;
+  label: string;
+  tip?: string;
+  requiresMulti?: boolean;
+}> = [
+  { key: "spectral",     label: "Spectral",      tip: "Per-band local mean" },
+  { key: "texture",      label: "Texture",        tip: "Gray-level std-dev" },
+  { key: "indices",      label: "NDVI",           tip: "Needs NIR band", requiresMulti: true },
+  { key: "colorIndices", label: "VARI / HSV",     tip: "Visible color indices" },
+  { key: "entropy",      label: "Entropy",        tip: "Local entropy (slow)" },
+  { key: "morphCleanup", label: "Road cleanup",   tip: "Morphological post-process" },
+];
 
 export default function FeaturesSection() {
   const { featureFlags, imageryMode } = useAppState();
   const dispatch = useAppDispatch();
 
-  const toggle = (key: keyof typeof featureFlags) => {
+  const toggle = (key: keyof FeatureFlags) => {
     if (key === "indices" && imageryMode === "regular") return;
     dispatch({ type: "SET_FEATURE_FLAGS", flags: { [key]: !featureFlags[key] } });
   };
 
   return (
-    <SidebarSection title="Features">
-      <div className="flex gap-4">
-        {(["spectral", "texture", "indices"] as const).map((k) => {
-          const disabled = k === "indices" && imageryMode === "regular";
+    <SidebarSection title="Algorithms">
+      <div className="grid grid-cols-2 gap-x-4 gap-y-0.5">
+        {FEATURE_DEFS.map(({ key, label, tip, requiresMulti }) => {
+          const disabled = requiresMulti && imageryMode === "regular";
           return (
             <label
-              key={k}
+              key={key}
+              title={tip}
               className={`flex items-center gap-1.5 text-xs cursor-pointer ${
                 disabled ? "text-surface-700 cursor-not-allowed" : "text-surface-300"
               }`}
@@ -24,11 +40,11 @@ export default function FeaturesSection() {
               <input
                 type="checkbox"
                 className="accent-primary-500"
-                checked={featureFlags[k]}
+                checked={featureFlags[key]}
                 disabled={disabled}
-                onChange={() => toggle(k)}
+                onChange={() => toggle(key)}
               />
-              {k.charAt(0).toUpperCase() + k.slice(1)}
+              {label}
             </label>
           );
         })}

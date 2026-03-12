@@ -185,6 +185,57 @@ export async function runStep3(params: Step3Params): Promise<ClassifyResult> {
   return parseApiResponse<ClassifyResult>(r);
 }
 
+/* ── Batch classify (shared model) ───────────────────────────────── */
+export interface BatchParams {
+  rasterPaths: string[];
+  classes: ClassItem[];
+  vectorLayers: VectorLayer[];
+  featureFlags: FeatureFlags;
+  outputPath?: string;
+  exportFormat?: string;
+  tileMode?: boolean;
+  tileMaxPixels?: number;
+  tileWorkers?: number;
+  detectShadows?: boolean;
+  maxThreads?: number | null;
+  taskId?: string;
+}
+
+export interface BatchResult {
+  status: "ok" | "error";
+  message?: string;
+  outputPaths?: string[];
+  tileOutputs?: string[];
+  results?: ClassifyResult[];
+  errors?: Array<[string, string]>;
+  meaMapping?: any[];
+}
+
+export async function runBatchClassify(params: BatchParams): Promise<BatchResult> {
+  const body = {
+    rasterPaths: params.rasterPaths,
+    classes: params.classes,
+    vectorLayers: params.vectorLayers,
+    smoothing: "none",
+    featureFlags: params.featureFlags,
+    outputPath: params.outputPath || null,
+    exportFormat: params.exportFormat || "tif",
+    tileMode: params.tileMode ?? false,
+    tileMaxPixels: params.tileMaxPixels ?? 2048 * 2048,
+    tileOverlap: 0,
+    tileWorkers: params.tileWorkers ?? 4,
+    detectShadows: params.detectShadows ?? false,
+    maxThreads: params.maxThreads ?? null,
+    taskId: params.taskId ?? null,
+  };
+  const r = await fetch(`${BASE}/classify-batch`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return parseApiResponse<BatchResult>(r);
+}
+
 /* ── Task ID helper ──────────────────────────────────────────────── */
 export function generateTaskId(): string {
   return crypto.randomUUID();

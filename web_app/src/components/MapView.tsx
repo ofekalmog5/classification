@@ -65,9 +65,11 @@ export default function MapView() {
   const boundsRef = useRef<Record<string, L.LatLngBounds>>({});
   const blobUrlsRef = useRef<Record<string, string>>({});
   const loadingRef = useRef<Set<string>>(new Set());
+  const failedRef = useRef<Record<string, number>>({});  // id → retry count
   const { mapLayers } = useAppState();
   const [queuePulse, setQueuePulse] = useState(0);
   const MAX_PARALLEL_LOADS = 4;
+  const MAX_RETRIES = 2;
 
   // Initialise map (no base tile layer — local only)
   useEffect(() => {
@@ -127,6 +129,7 @@ export default function MapView() {
         map.removeLayer(layersRef.current[id]);
         delete layersRef.current[id];
         delete boundsRef.current[id];
+        delete failedRef.current[id];
         // Revoke blob URL
         if (blobUrlsRef.current[id]) {
           URL.revokeObjectURL(blobUrlsRef.current[id]);
@@ -135,8 +138,14 @@ export default function MapView() {
       }
     }
 
+    // Prioritise classification-result layers so they load before input rasters
+    const sorted = [...mapLayers].sort((a, b) => {
+      const pri = (t: string) => (t === "classification-result" ? 0 : 1);
+      return pri(a.type) - pri(b.type);
+    });
+
     // Add / update layers
-    for (const ml of mapLayers) {
+    for (const ml of sorted) {
       const existing = layersRef.current[ml.id];
 
       if (existing) {
@@ -150,6 +159,9 @@ export default function MapView() {
 
       // Skip if already loading
       if (loadingRef.current.has(ml.id)) continue;
+
+      // Skip if permanently failed (exceeded retries)
+      if ((failedRef.current[ml.id] ?? 0) >= MAX_RETRIES) continue;
 
       // Throttle concurrent raster requests to keep UI responsive
       if (loadingRef.current.size >= MAX_PARALLEL_LOADS) continue;
@@ -182,13 +194,21 @@ export default function MapView() {
             layersRef.current[ml.id] = overlay;
             if (ml.visible) overlay.addTo(map);
 
-            // Auto-fit on first layer
-            if (Object.keys(layersRef.current).length === 1) {
+            // Clear any previous failure count
+            delete failedRef.current[ml.id];
+
+            // Auto-fit: always fit when a classification result loads,
+            // or when it is the very first layer.
+            if (
+              ml.type === "classification-result" ||
+              Object.keys(layersRef.current).length === 1
+            ) {
               map.fitBounds(lb, { padding: [20, 20], maxZoom: 22 });
             }
           })
           .catch((err) => {
             console.warn(`[MapView] Failed to load layer "${ml.name}" (${ml.filePath}):`, err);
+            failedRef.current[ml.id] = (failedRef.current[ml.id] ?? 0) + 1;
           })
           .finally(() => {
             loadingRef.current.delete(ml.id);

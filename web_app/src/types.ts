@@ -18,6 +18,9 @@ export interface FeatureFlags {
   spectral: boolean;
   texture: boolean;
   indices: boolean;
+  colorIndices: boolean;
+  entropy: boolean;
+  morphCleanup: boolean;
 }
 
 export type ImageryMode = "regular" | "multispectral";
@@ -69,6 +72,7 @@ export interface MeaMapping {
 export interface ClassifyResult {
   status: "ok" | "error";
   outputPath?: string;
+  tileOutputs?: string[];
   message?: string;
   meaMapping?: MeaMapping[];
   statsTable?: string;

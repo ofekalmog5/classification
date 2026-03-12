@@ -22,7 +22,7 @@ export const initialState: AppState = {
   outputPath: "",
   lastResultPath: "",
   imageryMode: "regular",
-  featureFlags: { spectral: true, texture: true, indices: false },
+  featureFlags: { spectral: true, texture: true, indices: false, colorIndices: true, entropy: false, morphCleanup: true },
   classes: [],
   classCount: 3,
   vectorLayers: [],
@@ -70,7 +70,10 @@ export type Action =
   | { type: "REMOVE_LAYER_GROUP"; id: string }
   | { type: "TOGGLE_LAYER_GROUP"; id: string }
   | { type: "ADD_TO_GROUP"; layerId: string; groupId: string }
+  | { type: "ADD_MANY_TO_GROUP"; layerIds: string[]; groupId: string }
   | { type: "REMOVE_FROM_GROUP"; layerId: string; groupId: string }
+  | { type: "SET_ALL_LAYERS_VISIBLE"; visible: boolean }
+  | { type: "SET_LAYERS_VISIBLE"; ids: string[]; visible: boolean }
   // Run state
   | { type: "SET_RUNNING"; step: PipelineStep }
   | { type: "SET_PROGRESS"; progress: ProgressEvent | null }
@@ -92,7 +95,7 @@ function reducer(state: AppState, action: Action): AppState {
     case "SET_IMAGERY_MODE": {
       const flags =
         action.mode === "regular"
-          ? { ...state.featureFlags, indices: false }
+          ? { ...state.featureFlags, indices: false, colorIndices: true }
           : state.featureFlags;
       return { ...state, imageryMode: action.mode, featureFlags: flags };
     }
@@ -208,6 +211,37 @@ function reducer(state: AppState, action: Action): AppState {
           g.id === action.groupId && !g.layerIds.includes(action.layerId)
             ? { ...g, layerIds: [...g.layerIds, action.layerId] }
             : g
+        ),
+      };
+
+    case "ADD_MANY_TO_GROUP": {
+      const newIds = action.layerIds;
+      return {
+        ...state,
+        // first remove these layers from any other group
+        layerGroups: state.layerGroups.map((g) => {
+          if (g.id === action.groupId) {
+            const merged = [...g.layerIds, ...newIds.filter((id) => !g.layerIds.includes(id))];
+            return { ...g, layerIds: merged };
+          }
+          // remove from other groups
+          return { ...g, layerIds: g.layerIds.filter((id) => !newIds.includes(id)) };
+        }),
+      };
+    }
+
+    case "SET_ALL_LAYERS_VISIBLE":
+      return {
+        ...state,
+        mapLayers: state.mapLayers.map((l) => ({ ...l, visible: action.visible })),
+        layerGroups: state.layerGroups.map((g) => ({ ...g, visible: action.visible })),
+      };
+
+    case "SET_LAYERS_VISIBLE":
+      return {
+        ...state,
+        mapLayers: state.mapLayers.map((l) =>
+          action.ids.includes(l.id) ? { ...l, visible: action.visible } : l
         ),
       };
 
