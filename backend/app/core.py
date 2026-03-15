@@ -3163,28 +3163,65 @@ def rasterize_vectors_onto_classification(
     _rv_stages.append(("Load classification", _time.perf_counter() - _t0))
     
     # === Resolve classId -> overrideColor from class definitions ===
-    # Build a lookup: classId -> (R, G, B) from the class hex colors
+    # Build two lookups: classId -> RGB  AND  material-name -> RGB
     _class_color_map: Dict[str, Tuple[int, int, int]] = {}
+    _name_color_map: Dict[str, Tuple[int, int, int]] = {}
     for cls in classes:
-        _cid = cls.get("id", "")
-        _hex = cls.get("color", "")
-        if _cid and _hex.startswith("#") and len(_hex) == 7:
+        _cid  = cls.get("id", "")
+        _name = cls.get("name", "")
+        _hex  = cls.get("color", "")
+        if _hex.startswith("#") and len(_hex) == 7:
             try:
-                _class_color_map[_cid] = (
-                    int(_hex[1:3], 16), int(_hex[3:5], 16), int(_hex[5:7], 16)
-                )
+                _rgb = (int(_hex[1:3], 16), int(_hex[3:5], 16), int(_hex[5:7], 16))
+                if _cid:
+                    _class_color_map[_cid] = _rgb
+                if _name:
+                    _name_color_map[_name] = _rgb
             except ValueError:
                 pass
-    print(f"  Class color map: {_class_color_map}")
+    print(f"  Class color map (by id):   {_class_color_map}")
+    print(f"  Class color map (by name): {_name_color_map}")
 
-    # Always resolve color from classId (material assigned in 'attach to vector')
+    # Also build a fallback from MEA_CLASSES so color resolution works even
+    # when the caller passes only a classId that matches the built-in MEA palette.
+    _mea_id_map:   Dict[str, Tuple[int, int, int]] = {}
+    _mea_name_map: Dict[str, Tuple[int, int, int]] = {}
+    for _mcls in MEA_CLASSES:
+        _mhex = _mcls.get("color", "")
+        if _mhex.startswith("#") and len(_mhex) == 7:
+            try:
+                _mrgb = (int(_mhex[1:3], 16), int(_mhex[3:5], 16), int(_mhex[5:7], 16))
+                _mea_id_map[_mcls.get("id", "")]     = _mrgb
+                _mea_name_map[_mcls.get("name", "")] = _mrgb
+            except ValueError:
+                pass
+
+    # Always resolve color from classId / material name (material assigned in 'attach to vector').
+    # Priority: classId in caller classes > material name in caller classes >
+    #           classId in MEA palette > material name in MEA palette > keep existing > auto-color.
     for layer in vector_layers:
-        _cid = layer.get("classId", "")
-        if _cid in _class_color_map:
-            layer["overrideColor"] = list(_class_color_map[_cid])
-            print(f"  Resolved classId={_cid!r} -> overrideColor={layer['overrideColor']}")
-        elif not layer.get("overrideColor"):
-            print(f"  WARNING: classId={_cid!r} not found in class map; auto-color will be used")
+        _cid  = layer.get("classId", "")
+        _lname = layer.get("name", "")   # sometimes the layer name IS the material name
+        _resolved: Optional[Tuple[int, int, int]] = None
+
+        if _cid and _cid in _class_color_map:
+            _resolved = _class_color_map[_cid]
+            print(f"  Resolved by classId={_cid!r} (caller classes) -> {_resolved}")
+        elif _lname and _lname in _name_color_map:
+            _resolved = _name_color_map[_lname]
+            print(f"  Resolved by layer name={_lname!r} (caller classes) -> {_resolved}")
+        elif _cid and _cid in _mea_id_map:
+            _resolved = _mea_id_map[_cid]
+            print(f"  Resolved by classId={_cid!r} (MEA palette) -> {_resolved}")
+        elif _lname and _lname in _mea_name_map:
+            _resolved = _mea_name_map[_lname]
+            print(f"  Resolved by layer name={_lname!r} (MEA palette) -> {_resolved}")
+        else:
+            print(f"  WARNING: classId={_cid!r} / name={_lname!r} not found in any color map; "
+                  f"existing overrideColor={layer.get('overrideColor')!r} will be used (or auto-color)")
+
+        if _resolved is not None:
+            layer["overrideColor"] = list(_resolved)
 
     # === Load and validate vectors ===
     _t0 = _time.perf_counter()
@@ -3209,28 +3246,26 @@ def rasterize_vectors_onto_classification(
             print(f"    Vector CRS: {gdf.crs} (EPSG:{gdf.crs.to_epsg() if gdf.crs else None})")
             print(f"    Raster CRS: {crs} (EPSG:{CRS(crs).to_epsg() if crs else None})")
             
-            # Always reproject vector to match the classification raster CRS
+            # Always reproject vector to match the classification raster CRS.
+            # Unconditional to_crs() avoids false-negative CRS.equals() mismatches
+            # (e.g. LOCAL_CS vs EPSG:3857).
             if crs is None:
-                print(f"    [WARN] Raster has no CRS; cannot reproject vector - assuming coordinates already match")
+                print(f"    [WARN] Raster has no CRS; cannot reproject - assuming coords already match")
             elif gdf.crs is None:
                 gdf = gdf.set_crs(crs, allow_override=True)
-                print(f"    [OK] Set CRS to match classification")
-            elif not CRS(gdf.crs).equals(CRS(crs)):
+                print(f"    [OK] Vector had no CRS; assigned raster CRS directly")
+            else:
                 _orig_bounds = gdf.total_bounds
-                print(f"    [CRS MISMATCH] Reprojecting shapefile to match raster CRS")
-                print(f"      From: {gdf.crs}")
-                print(f"      To:   {crs}")
+                _vec_epsg  = gdf.crs.to_epsg() if gdf.crs else None
+                _rast_epsg = CRS(crs).to_epsg() if crs else None
+                print(f"    [CRS] Vector EPSG:{_vec_epsg} -> Raster EPSG:{_rast_epsg} - reprojecting")
                 try:
                     gdf = gdf.to_crs(crs)
-                    print(f"    [OK] Reprojected CRS: {gdf.crs}")
-                    print(f"      Original bounds: {_orig_bounds}")
-                    print(f"      Reprojected bounds: {gdf.total_bounds}")
+                    print(f"    [OK] Reprojected. Bounds: {_orig_bounds} -> {gdf.total_bounds}")
                 except Exception as e:
                     print(f"    [ERROR] CRS reproject failed: {e}")
                     print(f"    [SKIP] Vector skipped due to CRS reproject failure")
                     continue
-            else:
-                print(f"    [OK] CRS already matches classification")
             
             validated_vectors.append((layer_path.name, gdf, layer.get("overrideColor")))
             print(f"    [OK] Validated")

@@ -8,3 +8,4 @@ scipy
 rasterio
 geopandas
 shapely
+aiofiles

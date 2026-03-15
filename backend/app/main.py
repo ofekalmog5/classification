@@ -845,4 +845,3 @@ def raster_as_png(file_path: str, max_dim: int = 1536):
         import traceback
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})
-
