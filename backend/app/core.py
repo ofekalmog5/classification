@@ -3227,11 +3227,34 @@ def rasterize_vectors_onto_classification(
                     print(f"      Reprojected bounds: {gdf.total_bounds}")
                 except Exception as e:
                     print(f"    [ERROR] CRS reproject failed: {e}")
-                    print(f"    [SKIP] Vector skipped due to CRS reproject failure")
-                    continue
+                    try:
+                        _epsg = CRS(crs).to_epsg()
+                        if _epsg:
+                            gdf = gdf.to_crs(f"EPSG:{_epsg}")
+                            print(f"    [OK] Reprojected via EPSG:{_epsg} fallback.")
+                        else:
+                            raise ValueError("No EPSG code available")
+                    except Exception as e2:
+                        print(f"    [ERROR] EPSG fallback also failed: {e2}")
+                        print(f"    [SKIP] Vector skipped due to CRS reproject failure")
+                        continue
             else:
                 print(f"    [OK] CRS already matches classification")
-            
+
+            # Bounds sanity-check: warn if reprojected vector doesn't overlap raster
+            if crs is not None:
+                _rminx = transform.c
+                _rmaxx = transform.c + width * transform.a
+                _rminy = transform.f + height * transform.e
+                _rmaxy = transform.f
+                _vb = gdf.total_bounds
+                _xok = not (_vb[2] < _rminx or _vb[0] > _rmaxx)
+                _yok = not (_vb[3] < _rminy or _vb[1] > _rmaxy)
+                if not (_xok and _yok):
+                    print(f"    [WARN] Vector bounds {list(np.round(_vb, 2))} do NOT overlap "
+                          f"raster bounds [{_rminx:.2f},{_rminy:.2f},{_rmaxx:.2f},{_rmaxy:.2f}]. "
+                          f"Rasterization may produce no pixels.")
+
             validated_vectors.append((layer_path.name, gdf, layer.get("overrideColor")))
             print(f"    [OK] Validated")
         except Exception as e:
@@ -3242,11 +3265,10 @@ def rasterize_vectors_onto_classification(
     _rv_stages.append(("Validate vectors", _time.perf_counter() - _t0))
     
     if not validated_vectors:
-        print(f"\n  No valid vectors to rasterize. Returning original classification.")
+        print(f"\n  No valid vectors to rasterize.")
         return {
-            "status": "ok",
-            "outputPath": str(classif_path),
-            "message": "No vectors to rasterize"
+            "status": "error",
+            "message": "No vector layers could be validated. Check that the shapefile paths exist and that the vector/raster CRS can be reconciled."
         }
 
     if tile_mode or classif_path.is_dir():
