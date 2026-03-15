@@ -1985,6 +1985,10 @@ def rasterize_vector_onto_raster(raster_path: str, gdf, burn_value: int, output_
     # Use the raster's own CRS (authoritative) as the target
     _target_crs = raster_crs
 
+    # Save a copy before any reprojection in this function so we can fall back
+    # to the caller-supplied coordinates if rasterization yields 0 pixels.
+    _gdf_original = gdf.copy()
+
     if _target_crs is None:
         print(f"    [WARN] Raster has no CRS; skipping reprojection")
     elif gdf.crs is None:
@@ -2007,7 +2011,7 @@ def rasterize_vector_onto_raster(raster_path: str, gdf, burn_value: int, output_
                 print(f"      [OK] Manual transformation successful")
             except Exception as e2:
                 raise RuntimeError(f"CRS transformation failed: {e2}")
-    
+
     print(f"    Vector CRS after processing: {gdf.crs}")
     
     # Create geometry-value pairs
@@ -2110,10 +2114,31 @@ def rasterize_vector_onto_raster(raster_path: str, gdf, burn_value: int, output_
         # POTENTIAL FIX: If bounds don't overlap, geometries might be in different CRS
         # Try to reproject geometries to match raster bounds more closely
         if not bounds_overlap:
-            print(f"      [ATTEMPTING FIX] Geometries appear to be outside raster bounds")
-            # Don't try to fix - just warn
-            print(f"      Consider checking if vector is in the same projection as raster")
-    
+            print(f"      [ATTEMPTING FIX] Bounds don't overlap — trying original (pre-reproject) coords...")
+            _fallback_shapes = [
+                (geom, burn_value)
+                for geom in _gdf_original.geometry
+                if geom is not None and not geom.is_empty
+            ]
+            if _fallback_shapes:
+                _fb_bounds = _gdf_original.total_bounds
+                _fb_xok = not (_fb_bounds[2] < raster_minx or _fb_bounds[0] > raster_maxx)
+                _fb_yok = not (_fb_bounds[3] < raster_miny or _fb_bounds[1] > raster_maxy)
+                if _fb_xok and _fb_yok:
+                    print(f"      [FALLBACK] Pre-reproject bounds overlap — using those coordinates")
+                    burned_mask = rasterize(
+                        shapes=_fallback_shapes,
+                        out_shape=(height, width),
+                        transform=transform,
+                        fill=0,
+                        all_touched=True,
+                    )
+                    pixels_burned = int(np.sum(burned_mask > 0))
+                    print(f"      [FALLBACK] Pixels burned after fallback: {pixels_burned}")
+                else:
+                    print(f"      [FALLBACK] Pre-reproject bounds also outside raster — "
+                          f"vector does not spatially overlap this raster.")
+
     # Merge with raster - write burned pixels with burn_value
     print(f"    Original raster dtype: {raster_array.dtype}, shape: {raster_array.shape}")
     print(f"    Burned mask stats: min={np.min(burned_mask)}, max={np.max(burned_mask)}, sum={np.sum(burned_mask > 0)}")
