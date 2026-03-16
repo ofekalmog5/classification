@@ -6,6 +6,9 @@ Bundles:
   - FastAPI backend (backend/app/main.py + core.py)
   - Built React frontend (web_app/dist -> web_app_dist inside exe)
   - All geospatial libraries (rasterio, fiona, pyproj, shapely, geopandas)
+  - faiss-cpu (always bundled — 3-8x faster KMeans than sklearn)
+  - faiss-gpu used automatically at runtime if NVIDIA CUDA is installed on the
+    host machine (NOT bundled — requires system CUDA + pip install faiss-gpu)
   - uvicorn + aiofiles for serving
 
 Build steps:
@@ -15,11 +18,20 @@ Build steps:
   4. Build exe:          pyinstaller WebApp.spec --noconfirm
 
 Output: dist/ClassificationWebApp.exe
+
+GPU note:
+  The EXE always ships faiss-cpu for fast CPU KMeans.
+  For GPU acceleration, the end-user installs CUDA + faiss-gpu separately:
+    pip install faiss-gpu
+  The app detects this automatically — no rebuild needed.
 """
+import os
+import sys
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 datas = []
 hiddenimports = []
+binaries = []
 
 # ── Geospatial library data files (GDAL drivers, PROJ data, etc.) ─────────
 for pkg in ['rasterio', 'fiona', 'pyproj', 'shapely', 'geopandas']:
@@ -34,6 +46,19 @@ hiddenimports += [
     'rasterio._shim',
     'fiona._shim',
 ]
+
+# ── faiss (CPU — always bundled) ───────────────────────────────────────────
+# faiss-cpu ships its native .pyd/.so alongside the Python package.
+# collect_data_files picks up the shared libraries; collect_submodules ensures
+# all submodules are importable inside the frozen exe.
+try:
+    hiddenimports += collect_submodules('faiss')
+    datas += collect_data_files('faiss')
+except Exception:
+    pass  # faiss not installed — app falls back to sklearn at runtime
+
+# ── pynvml (GPU detection, optional) ──────────────────────────────────────
+hiddenimports += ['pynvml']
 
 # ── uvicorn uses importlib to load its components dynamically ─────────────
 hiddenimports += [
@@ -65,7 +90,7 @@ datas += [('web_app/dist', 'web_app_dist')]
 a = Analysis(
     ['server_launcher.py'],
     pathex=['.'],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

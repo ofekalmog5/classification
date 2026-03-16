@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { useAppState, useAppDispatch } from "../../store";
-import { suggestTileSize, fetchGpuInfo } from "../../api/client";
+import { suggestTileSize } from "../../api/client";
 import type { TileSize } from "../../types";
 
 const TILE_SIZES: TileSize[] = ["Auto", "256", "512", "1024", "2048", "4096"];
@@ -9,15 +9,10 @@ export default function PerformanceSection() {
   const state = useAppState();
   const { performance } = state;
   const dispatch = useAppDispatch();
-  const [gpu, setGpu] = useState<{ available: boolean; info: string; engine: string } | null>(null);
+  const accel = state.accelInfo;
 
   const set = (partial: Partial<typeof performance>) =>
     dispatch({ type: "SET_PERFORMANCE", settings: partial });
-
-  // Fetch GPU info once on mount
-  useEffect(() => {
-    fetchGpuInfo().then(setGpu);
-  }, []);
 
   // Resolve first raster-input file path from map layers (or rasterPath fallback)
   const rasterPath =
@@ -45,14 +40,14 @@ export default function PerformanceSection() {
 
   return (
     <SidebarSection title="Performance">
-      {gpu && (
-        <div className={`flex items-center gap-1.5 py-0.5 text-xs ${gpu.engine === "faiss-gpu" || gpu.engine === "cuml" ? "text-emerald-400" : gpu.engine === "faiss-cpu" ? "text-yellow-400" : "text-surface-500"}`}>
-          <span>{gpu.engine === "sklearn" ? "○" : "⬡"}</span>
-          <span title={gpu.info}>
-            {gpu.engine === "faiss-gpu" && `GPU+faiss: ${gpu.info}`}
-            {gpu.engine === "faiss-cpu" && `faiss (CPU fast)`}
-            {gpu.engine === "cuml"      && `GPU+cuML: ${gpu.info}`}
-            {gpu.engine === "sklearn"   && "CPU (sklearn)"}
+      {accel && (
+        <div className={`flex items-center gap-1.5 py-0.5 text-xs ${accel.engine === "faiss-gpu" || accel.engine === "cuml" ? "text-emerald-400" : accel.engine === "faiss-cpu" ? "text-yellow-400" : "text-surface-500"}`}>
+          <span>{accel.engine === "sklearn" ? "○" : "⬡"}</span>
+          <span title={accel.info}>
+            {accel.engine === "faiss-gpu" && `GPU+faiss: ${accel.info}`}
+            {accel.engine === "faiss-cpu" && `faiss (CPU fast)`}
+            {accel.engine === "cuml"      && `GPU+cuML: ${accel.info}`}
+            {accel.engine === "sklearn"   && "CPU (sklearn)"}
           </span>
         </div>
       )}

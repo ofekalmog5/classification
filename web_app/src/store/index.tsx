@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useReducer, type Dispatch } from "react";
 import type {
   AppState,
+  AccelInfo,
   ClassItem,
   VectorLayer,
   MapLayer,
@@ -44,6 +45,7 @@ export const initialState: AppState = {
   running: "idle",
   progress: null,
   statusText: "Ready",
+  accelInfo: null,
 };
 
 /* ── Action types ────────────────────────────────────────────────── */
@@ -78,7 +80,8 @@ export type Action =
   // Run state
   | { type: "SET_RUNNING"; step: PipelineStep }
   | { type: "SET_PROGRESS"; progress: ProgressEvent | null }
-  | { type: "SET_STATUS"; text: string };
+  | { type: "SET_STATUS"; text: string }
+  | { type: "SET_ACCEL_INFO"; info: AccelInfo };
 
 /* ── Reducer ─────────────────────────────────────────────────────── */
 
@@ -266,6 +269,9 @@ function reducer(state: AppState, action: Action): AppState {
 
     case "SET_STATUS":
       return { ...state, statusText: action.text };
+
+    case "SET_ACCEL_INFO":
+      return { ...state, accelInfo: action.info };
 
     default:
       return state;

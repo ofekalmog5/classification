@@ -95,6 +95,12 @@ export type PipelineStep =
   | "full"
   | "mea";
 
+export interface AccelInfo {
+  engine: string;   // "faiss-gpu" | "faiss-cpu" | "cuml" | "sklearn"
+  gpu: boolean;
+  info: string;
+}
+
 export interface AppState {
   rasterPath: string;
   outputPath: string;
@@ -113,4 +119,6 @@ export interface AppState {
   running: PipelineStep;
   progress: ProgressEvent | null;
   statusText: string;
+  // Acceleration
+  accelInfo: AccelInfo | null;
 }
