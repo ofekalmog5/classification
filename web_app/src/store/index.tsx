@@ -77,6 +77,7 @@ export type Action =
   | { type: "REMOVE_FROM_GROUP"; layerId: string; groupId: string }
   | { type: "SET_ALL_LAYERS_VISIBLE"; visible: boolean }
   | { type: "SET_LAYERS_VISIBLE"; ids: string[]; visible: boolean }
+  | { type: "REMOVE_ALL_LAYERS" }
   // Run state
   | { type: "SET_RUNNING"; step: PipelineStep }
   | { type: "SET_PROGRESS"; progress: ProgressEvent | null }
@@ -155,8 +156,17 @@ function reducer(state: AppState, action: Action): AppState {
 
     /* ── Map layers ────────────────────────────────────────────────── */
 
-    case "ADD_MAP_LAYER":
+    case "ADD_MAP_LAYER": {
+      // Skip duplicate: same filePath already in the list
+      const alreadyExists = state.mapLayers.some(
+        (l) => l.filePath === action.layer.filePath
+      );
+      if (alreadyExists) return state;
       return { ...state, mapLayers: [...state.mapLayers, action.layer] };
+    }
+
+    case "REMOVE_ALL_LAYERS":
+      return { ...state, mapLayers: [], layerGroups: [] };
 
     case "REMOVE_MAP_LAYER":
       return {

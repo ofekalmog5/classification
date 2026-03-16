@@ -131,12 +131,6 @@ from sklearn.preprocessing import StandardScaler
 
 # ─── KMeans acceleration (faiss > cuML > sklearn fallback) ────────────────────
 
-# Persistent directory for GPU packages (shared with server_launcher.py).
-# If faiss-gpu was installed previously (by EXE or dev run), it lives here.
-_GPU_PKG_DIR = Path(os.environ.get('APPDATA', Path.home())) / 'ClassificationApp' / 'gpu_packages'
-_pkg_str = str(_GPU_PKG_DIR)
-if _GPU_PKG_DIR.exists() and _pkg_str not in sys.path:
-    sys.path.insert(0, _pkg_str)
 
 
 def _detect_gpu() -> tuple:
@@ -203,84 +197,22 @@ class _FaissKMeans:
         return self.predict(X)
 
 
-def _try_faiss_gpu_probe() -> bool:
-    """Return True if faiss-gpu is importable and can open GPU resources."""
-    try:
-        # Flush any stale faiss modules so a fresh import picks up new packages
-        for mod in list(sys.modules):
-            if 'faiss' in mod:
-                del sys.modules[mod]
-        import faiss
-        res = faiss.StandardGpuResources()
-        idx = faiss.GpuIndexFlatL2(res, 2)
-        idx.add(np.zeros((1, 2), dtype=np.float32))
-        del idx, res
-        return True
-    except Exception:
-        return False
-
-
-def _auto_install_faiss_gpu() -> bool:
-    """One-time auto-install of the correct faiss-gpu wheel into _GPU_PKG_DIR.
-    Returns True if faiss-gpu is working after installation."""
-    import subprocess as _sp, re as _re
-
-    # Detect CUDA major version from nvidia-smi
-    cuda_major = None
-    try:
-        r = _sp.run(['nvidia-smi'], capture_output=True, text=True, timeout=5)
-        m = _re.search(r'CUDA Version:\s*(\d+)', r.stdout)
-        if m:
-            cuda_major = int(m.group(1))
-    except Exception:
-        pass
-
-    candidates = []
-    if cuda_major and cuda_major >= 12:
-        candidates = ['faiss-gpu-cu12', 'faiss-gpu-cu11', 'faiss-gpu']
-    elif cuda_major:
-        candidates = ['faiss-gpu-cu11', 'faiss-gpu']
-    else:
-        candidates = ['faiss-gpu']
-
-    _GPU_PKG_DIR.mkdir(parents=True, exist_ok=True)
-    _pkg = str(_GPU_PKG_DIR)
-    if _pkg not in sys.path:
-        sys.path.insert(0, _pkg)
-
-    for pkg in candidates:
-        print(f"[GPU] Installing {pkg} -> {_GPU_PKG_DIR} ...")
-        try:
-            r = _sp.run(
-                [sys.executable, '-m', 'pip', 'install',
-                 '--target', str(_GPU_PKG_DIR),
-                 '--quiet', '--no-deps', '--disable-pip-version-check', pkg],
-                capture_output=True, text=True, timeout=300,
-            )
-            if r.returncode == 0 and _try_faiss_gpu_probe():
-                print(f"[GPU] {pkg} active ✓")
-                return True
-            if r.returncode != 0:
-                print(f"[GPU] {pkg} install failed (exit {r.returncode})")
-        except Exception as e:
-            print(f"[GPU] {pkg} install error: {e}")
-    return False
-
-
 def _probe_acceleration() -> tuple:
     """Return (engine, gpu_available, gpu_info) where engine is 'faiss-gpu',
-    'faiss-cpu', 'cuml', or 'sklearn'."""
-    # ── faiss: try GPU first, then CPU ────────────────────────────────────────
+    'faiss-cpu', 'cuml', or 'sklearn'.
+    faiss-gpu is bundled in the EXE (install faiss-gpu-cu12 in build env).
+    """
     try:
         import faiss
         if _GPU_AVAILABLE:
-            if _try_faiss_gpu_probe():
+            try:
+                res = faiss.StandardGpuResources()
+                idx = faiss.GpuIndexFlatL2(res, 2)
+                idx.add(np.zeros((1, 2), dtype=np.float32))
+                del idx, res
                 return "faiss-gpu", True, _GPU_INFO
-            # GPU present but faiss-gpu not available — try auto-install once
-            print("[GPU] NVIDIA GPU detected but faiss-gpu not available, attempting auto-install...")
-            if _auto_install_faiss_gpu():
-                return "faiss-gpu", True, _GPU_INFO
-            print("[GPU] Could not activate faiss-gpu — using faiss-cpu")
+            except Exception:
+                print("[GPU] faiss-gpu probe failed — using faiss-cpu")
         return "faiss-cpu", _GPU_AVAILABLE, _GPU_INFO
     except ImportError:
         pass
@@ -4681,6 +4613,15 @@ def _build_mea_cluster_mapping(
                     base += 40000.0   # was 50K
             elif material_names[j] in _WATER_NAMES:
                 base += WATER_BASE_BIAS
+                # Gray/achromatic clusters are road surfaces, not water.
+                # Add a large base penalty to prevent dark asphalt → water assignment.
+                if _is_gray_cluster:
+                    base += 30000.0
+                elif _neutrality >= 0.30:
+                    base += 18000.0
+                # Near-asphalt anchor = road, hard block.
+                if _near_asphalt_anchor:
+                    base += 40000.0
             elif material_names[j] in _METAL_NAMES:
                 base += METAL_BASE_BIAS
             # Gray cluster -> reward asphalt/concrete/paint_asphalt directly.
@@ -4795,6 +4736,34 @@ def _build_mea_cluster_mapping(
                         pen += 2.5
                     if water_conf < 0.12:
                         pen += 3.5
+                    # Achromatic (gray-neutral) pixels are asphalt/road, NOT water.
+                    # Dark asphalt is the #1 false positive for water — block it hard.
+                    if achro_frac >= 0.30:
+                        pen += 5.0   # strongly achromatic = road surface
+                    elif achro_frac >= 0.18:
+                        pen += 3.0
+                    elif achro_frac >= 0.10:
+                        pen += 1.5
+                    # Dark gray fraction: hallmark of asphalt, never water.
+                    if dark_gray_frac >= 0.30:
+                        pen += 4.0
+                    elif dark_gray_frac >= 0.18:
+                        pen += 2.5
+                    elif dark_gray_frac >= 0.10:
+                        pen += 1.2
+                    # Compound: achromatic + dark gray = asphalt certainty.
+                    if achro_frac >= 0.12 and dark_gray_frac >= 0.10:
+                        pen += 3.0
+                    # Gray fraction: road surface indicator.
+                    if gray_frac >= 0.40:
+                        pen += 2.5
+                    elif gray_frac >= 0.25:
+                        pen += 1.2
+                    # Asphalt score gate.
+                    if asphalt_score >= 0.35:
+                        pen += 3.0
+                    elif asphalt_score >= 0.20:
+                        pen += 1.5
                     # Blue-channel gate: water bodies have blue-dominant pixels.
                     # Low blue_dom + low confidence usually means shadow or dark-vegetated
                     # area rather than an actual water body.

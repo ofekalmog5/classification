@@ -126,6 +126,18 @@ export default function LayerPanel() {
                 </button>
               </>
             )}
+            <button
+              className="text-[9px] px-1.5 py-0.5 rounded bg-red-900/50 text-red-400 hover:bg-red-800/60 hover:text-red-300"
+              onClick={() => {
+                if (confirm("Remove all layers?")) {
+                  dispatch({ type: "REMOVE_ALL_LAYERS" });
+                  setSelectedIds(new Set());
+                }
+              }}
+              title="Remove all layers and groups"
+            >
+              ✕ All
+            </button>
           </div>
         )}
       </div>
