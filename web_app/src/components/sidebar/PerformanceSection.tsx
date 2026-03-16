@@ -9,7 +9,7 @@ export default function PerformanceSection() {
   const state = useAppState();
   const { performance } = state;
   const dispatch = useAppDispatch();
-  const [gpu, setGpu] = useState<{ available: boolean; info: string } | null>(null);
+  const [gpu, setGpu] = useState<{ available: boolean; info: string; engine: string } | null>(null);
 
   const set = (partial: Partial<typeof performance>) =>
     dispatch({ type: "SET_PERFORMANCE", settings: partial });
@@ -46,9 +46,14 @@ export default function PerformanceSection() {
   return (
     <SidebarSection title="Performance">
       {gpu && (
-        <div className={`flex items-center gap-1.5 py-0.5 text-xs ${gpu.available ? "text-emerald-400" : "text-surface-500"}`}>
-          <span>{gpu.available ? "⬡" : "○"}</span>
-          <span title={gpu.info}>{gpu.available ? `GPU: ${gpu.info}` : "CPU only"}</span>
+        <div className={`flex items-center gap-1.5 py-0.5 text-xs ${gpu.engine === "faiss-gpu" || gpu.engine === "cuml" ? "text-emerald-400" : gpu.engine === "faiss-cpu" ? "text-yellow-400" : "text-surface-500"}`}>
+          <span>{gpu.engine === "sklearn" ? "○" : "⬡"}</span>
+          <span title={gpu.info}>
+            {gpu.engine === "faiss-gpu" && `GPU+faiss: ${gpu.info}`}
+            {gpu.engine === "faiss-cpu" && `faiss (CPU fast)`}
+            {gpu.engine === "cuml"      && `GPU+cuML: ${gpu.info}`}
+            {gpu.engine === "sklearn"   && "CPU (sklearn)"}
+          </span>
         </div>
       )}
       <ToggleRow

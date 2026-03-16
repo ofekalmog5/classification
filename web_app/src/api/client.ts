@@ -168,7 +168,7 @@ export async function runFullPipeline(
 }
 
 /* ── GPU info ────────────────────────────────────────────────────── */
-export async function fetchGpuInfo(): Promise<{ available: boolean; info: string } | null> {
+export async function fetchGpuInfo(): Promise<{ available: boolean; info: string; engine: string } | null> {
   try {
     const r = await fetch(`${BASE}/gpu-info`);
     if (!r.ok) return null;

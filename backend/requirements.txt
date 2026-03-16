@@ -9,3 +9,5 @@ rasterio
 geopandas
 shapely
 aiofiles
+faiss-cpu        # KMeans acceleration (3-8x faster); swap for faiss-gpu if CUDA is available
+pynvml           # GPU detection (optional, gracefully skipped if missing)

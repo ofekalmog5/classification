@@ -128,11 +128,10 @@ from skimage.measure import label as sk_label
 from sklearn.cluster import KMeans, MiniBatchKMeans
 from sklearn.preprocessing import StandardScaler
 
-# ─── GPU acceleration (optional — requires RAPIDS cuML) ───────────────────────
+# ─── KMeans acceleration (faiss > cuML > sklearn fallback) ────────────────────
 
 def _detect_gpu() -> tuple:
     """Detect NVIDIA GPU via pynvml or nvidia-smi.  Returns (available, info_str)."""
-    # Method 1: pynvml (most reliable, gives VRAM info)
     try:
         import pynvml
         pynvml.nvmlInit()
@@ -146,7 +145,6 @@ def _detect_gpu() -> tuple:
             return True, f"{name} ({free_mb} MB free VRAM)"
     except Exception:
         pass
-    # Method 2: nvidia-smi subprocess
     try:
         import subprocess
         r = subprocess.run(
@@ -161,29 +159,97 @@ def _detect_gpu() -> tuple:
 
 
 _GPU_AVAILABLE, _GPU_INFO = _detect_gpu()
-print(f"[GPU] {'Available: ' + _GPU_INFO if _GPU_AVAILABLE else _GPU_INFO}")
+
+
+class _FaissKMeans:
+    """Sklearn-compatible wrapper around faiss.Kmeans (CPU or GPU)."""
+
+    def __init__(self, n_clusters: int, *, max_iter: int = 80, use_gpu: bool = False):
+        self.n_clusters      = n_clusters
+        self.max_iter        = max_iter
+        self.use_gpu         = use_gpu
+        self.cluster_centers_: np.ndarray | None = None
+        self.inertia_: float = 0.0
+        self._km             = None
+
+    def fit(self, X: np.ndarray):
+        import faiss
+        X = np.ascontiguousarray(X, dtype=np.float32)
+        km = faiss.Kmeans(X.shape[1], self.n_clusters,
+                          niter=self.max_iter, verbose=False,
+                          gpu=self.use_gpu)
+        km.train(X)
+        self._km = km
+        self.cluster_centers_ = km.centroids.copy()
+        self.inertia_ = float(km.obj[-1]) if len(km.obj) > 0 else 0.0
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        X = np.ascontiguousarray(X, dtype=np.float32)
+        _, I = self._km.index.search(X, 1)
+        return I.flatten()
+
+    def fit_predict(self, X: np.ndarray) -> np.ndarray:
+        self.fit(X)
+        return self.predict(X)
+
+
+def _probe_acceleration() -> tuple:
+    """Return (engine, gpu_available, gpu_info) where engine is 'faiss-gpu',
+    'faiss-cpu', 'cuml', or 'sklearn'."""
+    # ── faiss: try GPU first, then CPU ────────────────────────────────────────
+    try:
+        import faiss
+        if _GPU_AVAILABLE:
+            try:
+                # Quick probe: build a tiny GPU index to confirm CUDA works
+                import faiss
+                res = faiss.StandardGpuResources()
+                idx = faiss.GpuIndexFlatL2(res, 2)
+                idx.add(np.zeros((1, 2), dtype=np.float32))
+                return "faiss-gpu", True, _GPU_INFO
+            except Exception:
+                pass
+        return "faiss-cpu", _GPU_AVAILABLE, _GPU_INFO
+    except ImportError:
+        pass
+    # ── cuML (Linux/WSL2 only) ─────────────────────────────────────────────────
+    if _GPU_AVAILABLE:
+        try:
+            from cuml.cluster import MiniBatchKMeans as _  # noqa: F401
+            return "cuml", True, _GPU_INFO
+        except Exception:
+            pass
+    # ── sklearn CPU fallback ───────────────────────────────────────────────────
+    return "sklearn", _GPU_AVAILABLE, _GPU_INFO
+
+
+_ACCEL_ENGINE, _ACCEL_GPU, _ACCEL_GPU_INFO = _probe_acceleration()
+print(f"[KMeans] engine={_ACCEL_ENGINE}  gpu={_ACCEL_GPU}  {_ACCEL_GPU_INFO if _ACCEL_GPU else '(CPU only)'}")
 
 
 def _make_kmeans(n_clusters: int, *, mini_batch: bool = True):
-    """Return a KMeans instance — cuML (GPU) when available, sklearn otherwise."""
-    if _GPU_AVAILABLE:
+    """Return the fastest available KMeans: faiss-gpu > faiss-cpu > cuML > sklearn."""
+    if _ACCEL_ENGINE == "faiss-gpu":
+        return _FaissKMeans(n_clusters, max_iter=80 if mini_batch else 300, use_gpu=True)
+    if _ACCEL_ENGINE == "faiss-cpu":
+        return _FaissKMeans(n_clusters, max_iter=80 if mini_batch else 300, use_gpu=False)
+    if _ACCEL_ENGINE == "cuml":
         try:
             if mini_batch:
                 from cuml.cluster import MiniBatchKMeans as _CuMBK
                 return _CuMBK(n_clusters=n_clusters, random_state=42,
                                max_iter=80, batch_size=65536)
-            else:
-                from cuml.cluster import KMeans as _CuKM
-                return _CuKM(n_clusters=n_clusters, random_state=42,
-                              n_init=10, max_iter=300)
+            from cuml.cluster import KMeans as _CuKM
+            return _CuKM(n_clusters=n_clusters, random_state=42,
+                          n_init=10, max_iter=300)
         except Exception as _e:
-            print(f"[GPU] cuML import failed ({_e}), falling back to CPU")
-    # CPU fallback
+            print(f"[KMeans] cuML failed ({_e}), falling back to sklearn")
+    # sklearn CPU
     if mini_batch:
         return MiniBatchKMeans(n_clusters=n_clusters, random_state=42,
                                n_init=1, max_iter=80, batch_size=65536)
-    return KMeans(n_clusters=n_clusters, random_state=42,
-                  n_init=10, max_iter=300)
+    return KMeans(n_clusters=n_clusters, random_state=42, n_init=10, max_iter=300)
 
 # Max pixels sampled for KMeans training (quality is unchanged above ~50k)
 MAX_TRAIN_PIXELS = 100_000
