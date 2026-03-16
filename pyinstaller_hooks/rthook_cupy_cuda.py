@@ -1,19 +1,25 @@
 """
-Runtime hook: make bundled CUDA DLLs (nvidia/*/bin/*.dll) discoverable
-inside the frozen exe before CuPy's _softlink loads them.
+Runtime hook: pre-load bundled CUDA DLLs before CuPy imports them.
 
-Problem: cuda-pathfinder normally finds CUDA DLLs via importlib.metadata
-(looking up the nvidia-* packages).  In a PyInstaller single-file exe the
-dist-info metadata is stripped, so cuda-pathfinder always fails and CuPy
-falls back to faiss-cpu even when a GPU is present.
+WHY THIS IS NEEDED
+------------------
+cuda-pathfinder (which CuPy uses to locate CUDA DLLs) searches for them
+via importlib.metadata / package directories.  In a PyInstaller frozen
+exe those lookup paths don't exist, so every CUDA DLL load fails and
+CuPy silently falls back to faiss-cpu even on a machine with a GPU.
 
-Fix: before any cupy import happens (this hook runs first):
-  1. Add every nvidia/*/bin/ dir in _MEIPASS to os.add_dll_directory()
-     so the Windows DLL loader finds them when loading *.pyd extensions.
-  2. Prepend those dirs to PATH so ctypes.util.find_library("cublas64_12")
-     etc. resolve to the bundled DLLs.
-  3. Monkey-patch cuda-pathfinder's loader to search _MEIPASS first,
-     bypassing the broken importlib.metadata lookup entirely.
+HOW THIS FIX WORKS
+------------------
+1. Every nvidia/*/bin/ dir in _MEIPASS is added to os.add_dll_directory()
+   and to PATH so the Windows DLL loader can resolve transitive dependencies.
+
+2. All CUDA DLLs are pre-loaded using ctypes.CDLL(full_absolute_path).
+   After that, any later ctypes.CDLL("cublas64_12.dll") (name-only call
+   inside CuPy) finds the DLL already resident in the process and
+   returns immediately — no filesystem search required.
+
+Load order: cudart first (others depend on it), then nvrtc, cublas,
+curand, then everything else.
 """
 import os
 import sys
@@ -21,15 +27,15 @@ import glob
 import ctypes
 
 if sys.platform != "win32" or not getattr(sys, "frozen", False):
-    # Only needed in the frozen exe on Windows
-    pass
+    pass  # dev mode — no action needed, cuda-pathfinder works normally
 else:
-    _base = sys._MEIPASS
+    _base       = sys._MEIPASS
     _nvidia_root = os.path.join(_base, "nvidia")
 
-    # ── 1 & 2: add every nvidia/*/bin/ to DLL search paths ───────────────────
-    _dll_dirs = []
     if os.path.isdir(_nvidia_root):
+
+        # ── Step 1: add every nvidia/*/bin/ to DLL search paths ──────────────
+        _dll_dirs = []
         for _pkg in os.listdir(_nvidia_root):
             _bin = os.path.join(_nvidia_root, _pkg, "bin")
             if os.path.isdir(_bin):
@@ -39,41 +45,28 @@ else:
                 except Exception:
                     pass
 
-    if _dll_dirs:
-        os.environ["PATH"] = (
-            os.pathsep.join(_dll_dirs) + os.pathsep + os.environ.get("PATH", "")
+        if _dll_dirs:
+            os.environ["PATH"] = (
+                os.pathsep.join(_dll_dirs)
+                + os.pathsep
+                + os.environ.get("PATH", "")
+            )
+
+        # ── Step 2: pre-load DLLs by full path (cudart first) ─────────────────
+        _LOAD_ORDER = ["cudart", "nvrtc", "cublas", "curand"]
+
+        def _sort_key(p: str) -> int:
+            n = os.path.basename(p).lower()
+            for i, prefix in enumerate(_LOAD_ORDER):
+                if n.startswith(prefix):
+                    return i
+            return len(_LOAD_ORDER)
+
+        _all_dlls = glob.glob(
+            os.path.join(_nvidia_root, "**", "*.dll"), recursive=True
         )
-
-    # ── 3: patch cuda-pathfinder to look in _MEIPASS/nvidia/*/bin/ ────────────
-    # Build a fast name→path map of every DLL we bundled.
-    _dll_map: dict[str, str] = {}
-    for _dll in glob.glob(os.path.join(_nvidia_root, "**", "*.dll"), recursive=True):
-        _dll_map[os.path.basename(_dll).lower()] = _dll
-
-    def _meipass_load(libname: str):
-        """Try the bundled CUDA DLLs first, then fall back to the real loader."""
-        # libname may be e.g. "curand" or "curand*.dll" or "curand64_10"
-        _stem = libname.rstrip("*").lower()
-        # Exact match
-        if _stem in _dll_map:
-            return ctypes.CDLL(_dll_map[_stem])
-        # Prefix match (libname = "curand" → curand64_10.dll)
-        for _name, _path in _dll_map.items():
-            if _name.startswith(_stem):
-                return ctypes.CDLL(_path)
-        # Nothing found — let the original loader raise a proper error
-        raise OSError(f"[rthook] CUDA DLL not found in bundle: {libname!r}")
-
-    try:
-        from cuda.pathfinder._dynamic_libs import load_nvidia_dynamic_lib as _lndl_mod
-        _orig = _lndl_mod.load_nvidia_dynamic_lib
-
-        def _patched(libname: str):
+        for _dll_path in sorted(_all_dlls, key=_sort_key):
             try:
-                return _meipass_load(libname)
-            except OSError:
-                return _orig(libname)   # original as fallback
-
-        _lndl_mod.load_nvidia_dynamic_lib = _patched
-    except Exception:
-        pass  # cuda-pathfinder not present or API changed — PATH/add_dll_directory suffice
+                ctypes.CDLL(_dll_path)
+            except Exception:
+                pass  # skip optional libs (cuTENSOR etc.) gracefully
