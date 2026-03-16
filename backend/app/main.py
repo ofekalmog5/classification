@@ -38,15 +38,12 @@ _PROGRESS_QUEUES: Dict[str, Queue] = {}
 # Step 1 phases sum to ~100; other pipelines normalise by total weight.
 _PHASE_WEIGHTS: Dict[str, float] = {
     # Step 1 phases
-    "Loading raster": 3,
-    "Shadow balance": 2,
-    "Feature extraction": 30,   # increased: now includes VARI, Saturation, Entropy
-    "KMeans clustering": 18,
-    "Pixel assignment": 10,
-    "Classifying tiles": 30,
-    "Shadow detection": 2,
-    "Post-processing": 22,
-    "Saving output": 13,
+    "Loading raster": 5,
+    "Feature extraction": 35,
+    "KMeans clustering": 20,
+    "Pixel assignment": 15,
+    "Classifying tiles": 35,
+    "Saving output": 15,
     # Step 2 phases
     "Loading classified raster": 5,
     "Converting to label raster": 10,

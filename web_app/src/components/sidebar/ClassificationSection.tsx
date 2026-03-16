@@ -11,11 +11,6 @@ export default function ClassificationSection() {
   return (
     <SidebarSection title="Classification">
       <ToggleRow
-        label="Detect shadows"
-        checked={classification.detectShadows}
-        onChange={(v) => set({ detectShadows: v })}
-      />
-      <ToggleRow
         label="Share model (batch)"
         checked={classification.shareModel}
         onChange={(v) => set({ shareModel: v })}

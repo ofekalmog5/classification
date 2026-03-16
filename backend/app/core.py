@@ -131,6 +131,14 @@ from sklearn.preprocessing import StandardScaler
 
 # ─── KMeans acceleration (faiss > cuML > sklearn fallback) ────────────────────
 
+# Persistent directory for GPU packages (shared with server_launcher.py).
+# If faiss-gpu was installed previously (by EXE or dev run), it lives here.
+_GPU_PKG_DIR = Path(os.environ.get('APPDATA', Path.home())) / 'ClassificationApp' / 'gpu_packages'
+_pkg_str = str(_GPU_PKG_DIR)
+if _GPU_PKG_DIR.exists() and _pkg_str not in sys.path:
+    sys.path.insert(0, _pkg_str)
+
+
 def _detect_gpu() -> tuple:
     """Detect NVIDIA GPU via pynvml or nvidia-smi.  Returns (available, info_str)."""
     try:
@@ -195,6 +203,70 @@ class _FaissKMeans:
         return self.predict(X)
 
 
+def _try_faiss_gpu_probe() -> bool:
+    """Return True if faiss-gpu is importable and can open GPU resources."""
+    try:
+        # Flush any stale faiss modules so a fresh import picks up new packages
+        for mod in list(sys.modules):
+            if 'faiss' in mod:
+                del sys.modules[mod]
+        import faiss
+        res = faiss.StandardGpuResources()
+        idx = faiss.GpuIndexFlatL2(res, 2)
+        idx.add(np.zeros((1, 2), dtype=np.float32))
+        del idx, res
+        return True
+    except Exception:
+        return False
+
+
+def _auto_install_faiss_gpu() -> bool:
+    """One-time auto-install of the correct faiss-gpu wheel into _GPU_PKG_DIR.
+    Returns True if faiss-gpu is working after installation."""
+    import subprocess as _sp, re as _re
+
+    # Detect CUDA major version from nvidia-smi
+    cuda_major = None
+    try:
+        r = _sp.run(['nvidia-smi'], capture_output=True, text=True, timeout=5)
+        m = _re.search(r'CUDA Version:\s*(\d+)', r.stdout)
+        if m:
+            cuda_major = int(m.group(1))
+    except Exception:
+        pass
+
+    candidates = []
+    if cuda_major and cuda_major >= 12:
+        candidates = ['faiss-gpu-cu12', 'faiss-gpu-cu11', 'faiss-gpu']
+    elif cuda_major:
+        candidates = ['faiss-gpu-cu11', 'faiss-gpu']
+    else:
+        candidates = ['faiss-gpu']
+
+    _GPU_PKG_DIR.mkdir(parents=True, exist_ok=True)
+    _pkg = str(_GPU_PKG_DIR)
+    if _pkg not in sys.path:
+        sys.path.insert(0, _pkg)
+
+    for pkg in candidates:
+        print(f"[GPU] Installing {pkg} -> {_GPU_PKG_DIR} ...")
+        try:
+            r = _sp.run(
+                [sys.executable, '-m', 'pip', 'install',
+                 '--target', str(_GPU_PKG_DIR),
+                 '--quiet', '--no-deps', '--disable-pip-version-check', pkg],
+                capture_output=True, text=True, timeout=300,
+            )
+            if r.returncode == 0 and _try_faiss_gpu_probe():
+                print(f"[GPU] {pkg} active ✓")
+                return True
+            if r.returncode != 0:
+                print(f"[GPU] {pkg} install failed (exit {r.returncode})")
+        except Exception as e:
+            print(f"[GPU] {pkg} install error: {e}")
+    return False
+
+
 def _probe_acceleration() -> tuple:
     """Return (engine, gpu_available, gpu_info) where engine is 'faiss-gpu',
     'faiss-cpu', 'cuml', or 'sklearn'."""
@@ -202,15 +274,13 @@ def _probe_acceleration() -> tuple:
     try:
         import faiss
         if _GPU_AVAILABLE:
-            try:
-                # Quick probe: build a tiny GPU index to confirm CUDA works
-                import faiss
-                res = faiss.StandardGpuResources()
-                idx = faiss.GpuIndexFlatL2(res, 2)
-                idx.add(np.zeros((1, 2), dtype=np.float32))
+            if _try_faiss_gpu_probe():
                 return "faiss-gpu", True, _GPU_INFO
-            except Exception:
-                pass
+            # GPU present but faiss-gpu not available — try auto-install once
+            print("[GPU] NVIDIA GPU detected but faiss-gpu not available, attempting auto-install...")
+            if _auto_install_faiss_gpu():
+                return "faiss-gpu", True, _GPU_INFO
+            print("[GPU] Could not activate faiss-gpu — using faiss-cpu")
         return "faiss-cpu", _GPU_AVAILABLE, _GPU_INFO
     except ImportError:
         pass
@@ -1948,10 +2018,6 @@ def _classify_tile_worker(args: tuple) -> str:
         tile_transform = window_transform(orig_window, src.transform)
         tile_crs       = _normalize_pseudo_mercator_crs(src.crs)
 
-    # Shadow pre-processing on tile data (balance dark shadows before classification)
-    if bool(extra.get("detect_shadows", False)):
-        tile_data = _preprocess_shadow_balance(tile_data, local_window=31)
-
     # Profile always reflects the *original* (non-padded) tile dimensions.
     profile.update(
         height=height,
@@ -1995,15 +2061,6 @@ def _classify_tile_worker(args: tuple) -> str:
     tile_data_crop   = tile_data[:, off_row:off_row + height, off_col:off_col + width]
     del tile_data                           # full (padded) tile no longer needed
     gc.collect()
-
-    # Post-processing – same steps as the non-tiled path for coherent output.
-    classes_list = extra.get("classes", None)
-    _tile_px_m = float(max(abs(getattr(tile_transform, 'a', 0.5)),
-                            abs(getattr(tile_transform, 'e', 0.5))))
-    if classes_list:
-        predicted_raster = _absorb_isolated_small_patches(predicted_raster, classes=classes_list)
-        predicted_raster = _cap_contextual_features(predicted_raster, tile_data_crop, classes=classes_list)
-        # Asphalt enclosure capping is a separate post-processing step, not run per-tile.
 
     rgb = _apply_color_table(predicted_raster, color_table, verbose=False)
 
@@ -2586,16 +2643,6 @@ def classify_and_export(
     _cb("Loading raster", 1, 1)
     _ce_stages.append(("Load raster", _time.perf_counter() - _t0))
 
-    # === Shadow pre-processing: balance dark shadow regions ===
-    _t0 = _time.perf_counter()
-    if detect_shadows and raster_data is not None:
-        _cb("Shadow balance", 0, 1)
-        print(f"\n[1.5/5] Shadow pre-processing (balance/brighten)...")
-        raster_data = _preprocess_shadow_balance(raster_data)
-        print(f"  [OK] Shadow balance applied")
-        _cb("Shadow balance", 1, 1)
-    _ce_stages.append(("Shadow pre-processing", _time.perf_counter() - _t0))
-
     # === Extract features ===
     _t0 = _time.perf_counter()
     _cb("Feature extraction", 0, 1)
@@ -2820,7 +2867,11 @@ def classify_and_export(
     print(f"  [OK] Classes: {unique_classes}")
     _ce_stages.append(("Pixel assignment (NN)", _time.perf_counter() - _t0))
     _cb("Pixel assignment", 1, 1)
-    
+
+    # Free large feature arrays — no longer needed after pixel assignment.
+    del pixel_features, features_normalized, pixel_labels
+    gc.collect()
+
     # === Smoothing ===
     _t0 = _time.perf_counter()
     print(f"\n[5/5] Smoothing...")
@@ -2832,36 +2883,9 @@ def classify_and_export(
             print(f"  [OK] Smoothing applied")
         except Exception as e:
             print(f"  Smoothing error: {e}, skipping")
-    
+
     print(f"  Classes after smoothing: {np.unique(predicted_raster)}")
     _ce_stages.append(("Smoothing", _time.perf_counter() - _t0))
-
-    # === Shadow detection and inference ===
-    _t0 = _time.perf_counter()
-    _cb("Shadow detection", 0, 1)
-    if detect_shadows:
-        print(f"\n[shadow] Detecting and inferring shadows...")
-        predicted_raster = _detect_shadows_and_infer(predicted_raster, raster_data, classes=classes)
-        print(f"  [OK] Shadow detection complete")
-    _cb("Shadow detection", 1, 1)
-
-    # === Post-processing: absorb patches, contextual cap, asphalt cap ===
-    _t_pp = _time.perf_counter()
-    _cb("Post-processing", 0, 2)
-    # === Absorb small isolated patches (paint stripes, windows, cars) into surrounding class ===
-    _t_sub = _time.perf_counter()
-    print(f"\n[patch] Absorbing small isolated patches...")
-    predicted_raster = _absorb_isolated_small_patches(predicted_raster, classes=classes)
-    print(f"  [OK] Small-patch absorption complete ({_time.perf_counter()-_t_sub:.1f}s)")
-    _cb("Post-processing", 1, 2)
-
-    # === Context-aware feature capping (windows, road stripes, facades) ===
-    _t_sub = _time.perf_counter()
-    print(f"\n[cap] Capping contextual features (windows / road stripes / facades)...")
-    predicted_raster = _cap_contextual_features(predicted_raster, raster_data, classes=classes)
-    print(f"  [OK] Contextual feature capping complete ({_time.perf_counter()-_t_sub:.1f}s)")
-    _cb("Post-processing", 2, 2)
-    _ce_stages.append(("Post-processing", _time.perf_counter() - _t0))
 
     step_num = 6
     _t0 = _time.perf_counter()
@@ -2921,7 +2945,11 @@ def classify_and_export(
     
     # Apply colors
     rgb = _apply_color_table(predicted_raster, color_table)
-    
+
+    # Free large arrays before writing — only rgb is needed from here.
+    del predicted_raster, raster_data
+    gc.collect()
+
     # Write RGB output
     rgb_profile = profile.copy()
     driver = _driver_for_path(output_color_path)
