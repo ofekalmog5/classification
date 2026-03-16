@@ -9,6 +9,8 @@ without a Vite proxy.
 """
 import sys
 import os
+import re
+import subprocess
 import threading
 import webbrowser
 import time
@@ -24,6 +26,118 @@ if hasattr(sys.stderr, 'reconfigure'):
 HOST = "127.0.0.1"
 PORT = 8000
 
+# Persistent directory for GPU packages (survives between EXE runs)
+_GPU_PKG_DIR = Path(os.environ.get('APPDATA', Path.home())) / 'ClassificationApp' / 'gpu_packages'
+
+
+# ─── GPU / faiss-gpu auto-setup ───────────────────────────────────────────────
+
+def _get_cuda_major() -> int | None:
+    """Return host CUDA major version (e.g. 12) from nvidia-smi, or None."""
+    try:
+        r = subprocess.run(['nvidia-smi'], capture_output=True, text=True, timeout=5)
+        m = re.search(r'CUDA Version:\s*(\d+)', r.stdout)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def _has_nvidia_gpu() -> bool:
+    """Return True if at least one NVIDIA GPU is present."""
+    try:
+        r = subprocess.run(['nvidia-smi', '-L'], capture_output=True, text=True, timeout=5)
+        return r.returncode == 0 and 'GPU' in r.stdout
+    except Exception:
+        return False
+
+
+def _faiss_gpu_works() -> bool:
+    """Return True if faiss-gpu is importable and can open GPU resources."""
+    try:
+        import faiss
+        res = faiss.StandardGpuResources()
+        del res
+        return True
+    except Exception:
+        return False
+
+
+def _install_faiss_gpu(pkg_name: str) -> bool:
+    """Install pkg_name to _GPU_PKG_DIR using pip's Python API. Returns success."""
+    try:
+        from pip._internal.cli.main import main as pip_main
+        code = pip_main([
+            'install',
+            '--target', str(_GPU_PKG_DIR),
+            '--quiet',
+            '--no-deps',        # faiss-gpu has no Python deps — much faster
+            '--disable-pip-version-check',
+            pkg_name,
+        ])
+        return code == 0
+    except Exception as e:
+        print(f"  [GPU setup] pip error: {e}")
+        return False
+
+
+def _ensure_faiss_gpu():
+    """
+    Auto-install the right faiss-gpu wheel when an NVIDIA GPU is present.
+
+    Priority:
+      faiss-gpu-cu12  (CUDA 12.x)
+      faiss-gpu-cu11  (CUDA 11.x)
+      faiss-gpu       (legacy fallback, CUDA 11.4 wheels)
+
+    Packages are installed once to %APPDATA%\\ClassificationApp\\gpu_packages
+    and reused on every subsequent launch (no internet needed after first run).
+    """
+    # Always prepend persistent pkg dir so previously installed faiss-gpu is found
+    pkg_str = str(_GPU_PKG_DIR)
+    if pkg_str not in sys.path:
+        sys.path.insert(0, pkg_str)
+
+    # Already working? Nothing to do.
+    if _faiss_gpu_works():
+        print("[GPU] faiss-gpu already installed and active")
+        return
+
+    # No NVIDIA GPU? Skip.
+    if not _has_nvidia_gpu():
+        print("[GPU] No NVIDIA GPU detected — using faiss-cpu")
+        return
+
+    cuda = _get_cuda_major()
+    print(f"[GPU] NVIDIA GPU detected (CUDA {cuda}.x)" if cuda else "[GPU] NVIDIA GPU detected (CUDA version unknown)")
+
+    # Pick candidate packages in priority order
+    if cuda and cuda >= 12:
+        candidates = ['faiss-gpu-cu12', 'faiss-gpu-cu11', 'faiss-gpu']
+    else:
+        candidates = ['faiss-gpu-cu11', 'faiss-gpu']
+
+    _GPU_PKG_DIR.mkdir(parents=True, exist_ok=True)
+
+    for pkg in candidates:
+        print(f"[GPU] Installing {pkg} → {_GPU_PKG_DIR} ...")
+        if _install_faiss_gpu(pkg):
+            # Flush any stale faiss imports so the new install is found
+            for mod in list(sys.modules):
+                if 'faiss' in mod:
+                    del sys.modules[mod]
+            if _faiss_gpu_works():
+                print(f"[GPU] {pkg} active ✓")
+                return
+            print(f"[GPU] {pkg} installed but GPU probe failed — trying next")
+        else:
+            print(f"[GPU] {pkg} install failed — trying next")
+
+    print("[GPU] Could not activate faiss-gpu — falling back to faiss-cpu")
+
+
+# ─── App creation ──────────────────────────────────────────────────────────────
 
 def get_dist_path() -> Path:
     """Return path to built React frontend.
@@ -67,7 +181,11 @@ if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
 
-    print(f"Starting Classification Web App on http://{HOST}:{PORT}")
+    # ── GPU setup runs before the backend imports core.py ─────────────────────
+    # This ensures _probe_acceleration() in core.py sees faiss-gpu if available.
+    _ensure_faiss_gpu()
+
+    print(f"\nStarting Classification Web App on http://{HOST}:{PORT}")
     print("Press Ctrl+C to stop.\n")
 
     threading.Thread(target=_open_browser, daemon=True).start()

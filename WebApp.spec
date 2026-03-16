@@ -60,6 +60,26 @@ except Exception:
 # ── pynvml (GPU detection, optional) ──────────────────────────────────────
 hiddenimports += ['pynvml']
 
+# ── pip (needed by server_launcher to auto-install faiss-gpu at runtime) ──
+# pip._internal is loaded dynamically; list the key submodules explicitly.
+hiddenimports += [
+    'pip',
+    'pip._internal',
+    'pip._internal.cli',
+    'pip._internal.cli.main',
+    'pip._internal.commands',
+    'pip._internal.commands.install',
+    'pip._internal.operations',
+    'pip._internal.operations.install',
+    'pip._internal.network',
+    'pip._internal.network.session',
+    'pip._internal.utils',
+    'pip._internal.utils.misc',
+    'pip._vendor',
+    'pip._vendor.requests',
+    'pip._vendor.urllib3',
+]
+
 # ── uvicorn uses importlib to load its components dynamically ─────────────
 hiddenimports += [
     'uvicorn.logging',
