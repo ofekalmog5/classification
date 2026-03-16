@@ -311,30 +311,28 @@ class _CupyKMeans:
 
 def _probe_acceleration() -> tuple:
     """Return (engine, gpu_available, gpu_info) where engine is one of:
-    'faiss-gpu' | 'faiss-cpu' | 'cupy' | 'cuml' | 'sklearn'.
+    'faiss-gpu' | 'cupy' | 'faiss-cpu' | 'cuml' | 'sklearn'.
 
-    Priority chain:
-      faiss-gpu  (conda only — fastest, not on pip)
-      faiss-cpu  (pip install faiss-cpu — fast CPU KMeans, 3-8x sklearn)
-      cupy       (pip install cupy-cuda12x — real GPU KMeans, Windows-compatible)
-      cuml       (conda/WSL2 only)
-      sklearn    (always available, pure CPU fallback)
+    Priority chain (GPU always beats CPU when available):
+      faiss-gpu  — conda install faiss-gpu (fastest; not on pip)
+      cupy       — pip install cupy-cuda12x (GPU, Windows-compatible, no conda)
+      faiss-cpu  — pip install faiss-cpu (fast CPU, 3-8x sklearn)
+      cuml       — conda/WSL2 only
+      sklearn    — always available, pure CPU fallback
     """
-    try:
-        import faiss
-        if _GPU_AVAILABLE:
-            try:
-                res = faiss.StandardGpuResources()
-                idx = faiss.GpuIndexFlatL2(res, 2)
-                idx.add(np.zeros((1, 2), dtype=np.float32))
-                del idx, res
-                return "faiss-gpu", True, _GPU_INFO
-            except Exception:
-                print("[GPU] faiss-gpu probe failed — using faiss-cpu")
-        return "faiss-cpu", _GPU_AVAILABLE, _GPU_INFO
-    except ImportError:
-        pass
-    # ── CuPy GPU KMeans (pip install cupy-cuda12x, works on Windows) ──────────
+    # ── 1. faiss-gpu (conda only, fastest) ────────────────────────────────────
+    if _GPU_AVAILABLE:
+        try:
+            import faiss
+            res = faiss.StandardGpuResources()
+            idx = faiss.GpuIndexFlatL2(res, 2)
+            idx.add(np.zeros((1, 2), dtype=np.float32))
+            del idx, res
+            return "faiss-gpu", True, _GPU_INFO
+        except Exception:
+            pass  # faiss-gpu not available, try next
+
+    # ── 2. CuPy GPU KMeans (pip install cupy-cuda12x, works on Windows) ───────
     if _GPU_AVAILABLE:
         try:
             import warnings as _w
@@ -347,15 +345,24 @@ def _probe_acceleration() -> tuple:
                 cp.get_default_memory_pool().free_all_blocks()
             return "cupy", True, _GPU_INFO
         except Exception as _e:
-            print(f"[GPU] CuPy probe failed ({_e}) — skipping")
-    # ── cuML (Linux/WSL2 only) ─────────────────────────────────────────────────
+            print(f"[GPU] CuPy probe failed ({_e}) — falling back to CPU")
+
+    # ── 3. faiss-cpu (fast CPU KMeans, no GPU needed) ─────────────────────────
+    try:
+        import faiss  # noqa: F401
+        return "faiss-cpu", _GPU_AVAILABLE, _GPU_INFO
+    except ImportError:
+        pass
+
+    # ── 4. cuML (Linux/WSL2 only) ─────────────────────────────────────────────
     if _GPU_AVAILABLE:
         try:
             from cuml.cluster import MiniBatchKMeans as _  # noqa: F401
             return "cuml", True, _GPU_INFO
         except Exception:
             pass
-    # ── sklearn CPU fallback ───────────────────────────────────────────────────
+
+    # ── 5. sklearn CPU fallback ───────────────────────────────────────────────
     return "sklearn", _GPU_AVAILABLE, _GPU_INFO
 
 
