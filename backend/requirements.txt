@@ -9,5 +9,17 @@ rasterio
 geopandas
 shapely
 aiofiles
-faiss-cpu        # KMeans acceleration (3-8x faster than sklearn). For GPU: conda install -c pytorch faiss-gpu cudatoolkit=11.8
+faiss-cpu        # Fast CPU KMeans (3-8x sklearn). For faiss-gpu: conda install -c pytorch faiss-gpu cudatoolkit=11.8
+
+# ── GPU KMeans via CuPy (no conda, no CUDA Toolkit install needed) ──────────
+# Install all five lines below to enable GPU KMeans on Windows:
+#   cupy-cuda12x          ← CuPy GPU arrays (CUDA 12.x/13.x drivers, RTX 30xx/40xx)
+#   cupy-cuda11x          ← use this instead for CUDA 11.x drivers
+#   nvidia-cuda-runtime-cu12
+#   nvidia-cublas-cu12
+#   nvidia-cuda-nvrtc-cu12
+#   nvidia-curand-cu12
+# The nvidia-* packages supply the CUDA runtime DLLs via pip (no system CUDA Toolkit).
+# If not installed, the app automatically falls back to faiss-cpu.
+
 pynvml           # GPU detection (optional, gracefully skipped if missing)

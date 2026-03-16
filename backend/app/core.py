@@ -197,10 +197,128 @@ class _FaissKMeans:
         return self.predict(X)
 
 
+class _CupyKMeans:
+    """Sklearn-compatible KMeans on GPU via CuPy.
+
+    Install: pip install cupy-cuda12x   (CUDA 12.x drivers, works on Windows)
+             pip install cupy-cuda11x   (CUDA 11.x drivers)
+
+    Uses batched pairwise-distance assignment to stay within VRAM limits and
+    a vectorised scatter-add for center updates.
+    """
+
+    def __init__(self, n_clusters: int, *, n_init: int = 1, max_iter: int = 300,
+                 tol: float = 1e-4, random_state: int | None = 42):
+        self.n_clusters       = n_clusters
+        self.n_init           = n_init
+        self.max_iter         = max_iter
+        self.tol              = tol
+        self.random_state     = random_state
+        self.cluster_centers_: np.ndarray | None = None
+        self.labels_:          np.ndarray | None = None
+        self.inertia_: float  = 0.0
+
+    # ── public sklearn-compatible API ─────────────────────────────────────────
+
+    def fit(self, X: np.ndarray):
+        self.fit_predict(X)
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        import cupy as cp
+        centers = cp.asarray(self.cluster_centers_)
+        return self._assign(cp.asarray(np.ascontiguousarray(X, dtype=np.float32)),
+                            centers).get()
+
+    def fit_predict(self, X: np.ndarray) -> np.ndarray:
+        import warnings as _w
+        _w.filterwarnings("ignore", message="CUDA path could not be detected")
+        import cupy as cp
+        X   = np.ascontiguousarray(X, dtype=np.float32)
+        n, d = X.shape
+        rng = np.random.default_rng(self.random_state)
+
+        best_inertia    = np.inf
+        best_centers_np = None
+        best_labels_np  = None
+
+        for _attempt in range(max(1, self.n_init)):
+            # Random initialisation (one pass, fast)
+            init_idx = rng.choice(n, self.n_clusters, replace=False)
+            centers  = cp.asarray(X[init_idx], dtype=cp.float32)   # (k, d)
+            X_gpu    = cp.asarray(X)                                # (n, d)
+
+            for _it in range(self.max_iter):
+                labels  = self._assign(X_gpu, centers)
+                new_c   = self._update(X_gpu, labels, centers, self.n_clusters, d)
+                shift   = float(cp.linalg.norm(new_c - centers))
+                centers = new_c
+                if shift < self.tol:
+                    break
+
+            labels   = self._assign(X_gpu, centers)
+            inertia  = float(cp.sum(self._sq_dists_assigned(X_gpu, centers, labels)))
+
+            if inertia < best_inertia:
+                best_inertia    = inertia
+                best_centers_np = centers.get()
+                best_labels_np  = labels.get().astype(np.int32)
+
+            del X_gpu, centers, labels
+            cp.get_default_memory_pool().free_all_blocks()
+
+        self.cluster_centers_ = best_centers_np
+        self.labels_           = best_labels_np
+        self.inertia_          = best_inertia
+        return best_labels_np
+
+    # ── internals ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _assign(X_gpu, centers, batch: int = 65_536):
+        """Nearest-center assignment, chunked so VRAM usage stays bounded."""
+        import cupy as cp
+        n      = X_gpu.shape[0]
+        labels = cp.empty(n, dtype=cp.int32)
+        sq_c   = cp.sum(centers ** 2, axis=1)                     # (k,)
+        for start in range(0, n, batch):
+            Xb   = X_gpu[start:start + batch]                     # (b, d)
+            sq_x = cp.sum(Xb ** 2, axis=1)                        # (b,)
+            # ||x - c||^2 = ||x||^2 - 2 x·cT + ||c||^2
+            dists = sq_x[:, None] - 2.0 * (Xb @ centers.T) + sq_c[None, :]
+            labels[start:start + batch] = cp.argmin(dists, axis=1)
+        return labels
+
+    @staticmethod
+    def _update(X_gpu, labels, old_centers, k: int, d: int):
+        """Vectorised center update; keeps old center for any empty cluster."""
+        import cupy as cp
+        sums   = cp.zeros((k, d), dtype=cp.float32)
+        counts = cp.zeros(k,      dtype=cp.float32)
+        cp.add.at(sums,   labels, X_gpu)
+        cp.add.at(counts, labels, cp.float32(1.0))
+        new_c         = old_centers.copy()
+        valid         = counts > 0
+        new_c[valid]  = sums[valid] / counts[valid, None]
+        return new_c
+
+    @staticmethod
+    def _sq_dists_assigned(X_gpu, centers, labels):
+        """Per-point squared distance to its assigned center (for inertia)."""
+        diff = X_gpu - centers[labels]
+        return (diff * diff).sum(axis=1)
+
+
 def _probe_acceleration() -> tuple:
-    """Return (engine, gpu_available, gpu_info) where engine is 'faiss-gpu',
-    'faiss-cpu', 'cuml', or 'sklearn'.
-    faiss-gpu is bundled in the EXE (install faiss-gpu-cu12 in build env).
+    """Return (engine, gpu_available, gpu_info) where engine is one of:
+    'faiss-gpu' | 'faiss-cpu' | 'cupy' | 'cuml' | 'sklearn'.
+
+    Priority chain:
+      faiss-gpu  (conda only — fastest, not on pip)
+      faiss-cpu  (pip install faiss-cpu — fast CPU KMeans, 3-8x sklearn)
+      cupy       (pip install cupy-cuda12x — real GPU KMeans, Windows-compatible)
+      cuml       (conda/WSL2 only)
+      sklearn    (always available, pure CPU fallback)
     """
     try:
         import faiss
@@ -216,6 +334,20 @@ def _probe_acceleration() -> tuple:
         return "faiss-cpu", _GPU_AVAILABLE, _GPU_INFO
     except ImportError:
         pass
+    # ── CuPy GPU KMeans (pip install cupy-cuda12x, works on Windows) ──────────
+    if _GPU_AVAILABLE:
+        try:
+            import warnings as _w
+            with _w.catch_warnings():
+                _w.filterwarnings("ignore", message="CUDA path could not be detected")
+                import cupy as cp
+                a = cp.array([1.0, 2.0], dtype=cp.float32)
+                _ = float(a @ a)
+                del a
+                cp.get_default_memory_pool().free_all_blocks()
+            return "cupy", True, _GPU_INFO
+        except Exception as _e:
+            print(f"[GPU] CuPy probe failed ({_e}) — skipping")
     # ── cuML (Linux/WSL2 only) ─────────────────────────────────────────────────
     if _GPU_AVAILABLE:
         try:
@@ -232,11 +364,14 @@ print(f"[KMeans] engine={_ACCEL_ENGINE}  gpu={_ACCEL_GPU}  {_ACCEL_GPU_INFO if _
 
 
 def _make_kmeans(n_clusters: int, *, mini_batch: bool = True):
-    """Return the fastest available KMeans: faiss-gpu > faiss-cpu > cuML > sklearn."""
+    """Return the fastest available KMeans: faiss-gpu > faiss-cpu > cupy > cuML > sklearn."""
     if _ACCEL_ENGINE == "faiss-gpu":
         return _FaissKMeans(n_clusters, max_iter=80 if mini_batch else 300, use_gpu=True)
     if _ACCEL_ENGINE == "faiss-cpu":
         return _FaissKMeans(n_clusters, max_iter=80 if mini_batch else 300, use_gpu=False)
+    if _ACCEL_ENGINE == "cupy":
+        return _CupyKMeans(n_clusters, n_init=1,
+                           max_iter=80 if mini_batch else 300)
     if _ACCEL_ENGINE == "cuml":
         try:
             if mini_batch:

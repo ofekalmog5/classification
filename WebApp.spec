@@ -54,6 +54,25 @@ try:
 except Exception:
     pass  # faiss not installed — app falls back to sklearn at runtime
 
+# ── CuPy GPU KMeans (bundled if installed: pip install cupy-cuda12x) ───────
+# Provides real GPU KMeans on Windows without conda.
+# If not installed the app uses faiss-cpu automatically.
+try:
+    from PyInstaller.utils.hooks import collect_dynamic_libs
+    hiddenimports += collect_submodules('cupy')
+    datas         += collect_data_files('cupy')
+    binaries      += collect_dynamic_libs('cupy')
+    hiddenimports += [
+        'cupy._core',
+        'cupy.cuda',
+        'cupy.cuda.memory',
+        'cupy.random',
+        'cupy.linalg',
+    ]
+    print("[spec] CuPy found — bundling GPU KMeans support")
+except Exception as _e:
+    print(f"[spec] CuPy not installed ({_e}) — GPU KMeans via CuPy skipped")
+
 # ── pynvml (GPU detection) ─────────────────────────────────────────────────
 hiddenimports += ['pynvml']
 
