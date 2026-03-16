@@ -32,6 +32,9 @@ type AppState = {
   smoothing: "superpixels" | "median";
   featureFlags: FeatureFlags;
   bandMap: BandMap;
+  tileMode: boolean;
+  tileSize: "auto" | "256" | "512" | "1024" | "2048" | "4096";
+  suggestedTileSide: number | null;
 };
 
 const state: AppState = {
@@ -48,7 +51,10 @@ const state: AppState = {
   bandMap: {
     redBand: 3,
     nirBand: 4
-  }
+  },
+  tileMode: false,
+  tileSize: "auto",
+  suggestedTileSide: null
 };
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -94,6 +100,21 @@ app.innerHTML = `
             <input id="band-nir" type="number" min="1" value="${state.bandMap.nirBand}" />
           </div>
           <p class="hint">Red band, NIR band for NDVI</p>
+        </div>
+        <div class="field">
+          <label>
+            <input id="tile-mode" type="checkbox" />
+            Tile processing
+          </label>
+          <select id="tile-size">
+            <option value="auto">Auto</option>
+            <option value="256">256 × 256</option>
+            <option value="512">512 × 512</option>
+            <option value="1024">1024 × 1024</option>
+            <option value="2048">2048 × 2048</option>
+            <option value="4096">4096 × 4096</option>
+          </select>
+          <p class="hint" id="tile-hint"></p>
         </div>
       </div>
     </header>
@@ -153,6 +174,9 @@ const featTexture = document.querySelector<HTMLInputElement>("#feat-texture");
 const featIndices = document.querySelector<HTMLInputElement>("#feat-indices");
 const bandRedInput = document.querySelector<HTMLInputElement>("#band-red");
 const bandNirInput = document.querySelector<HTMLInputElement>("#band-nir");
+const tileModeInput = document.querySelector<HTMLInputElement>("#tile-mode");
+const tileSizeSelect = document.querySelector<HTMLSelectElement>("#tile-size");
+const tileHint = document.querySelector<HTMLParagraphElement>("#tile-hint");
 
 if (!backendUrlInput || !rasterInput || !rasterName || !smoothingSelect || !classNameInput) {
   throw new Error("UI elements missing");
@@ -167,6 +191,9 @@ if (!featSpectral || !featTexture || !featIndices) {
   throw new Error("UI elements missing");
 }
 if (!bandRedInput || !bandNirInput) {
+  throw new Error("UI elements missing");
+}
+if (!tileModeInput || !tileSizeSelect || !tileHint) {
   throw new Error("UI elements missing");
 }
 
@@ -221,6 +248,7 @@ rasterInput.addEventListener("change", () => {
   const path = (file as unknown as { path?: string })?.path ?? file?.name ?? "";
   state.rasterPath = path;
   rasterName.textContent = path ? `Selected: ${path}` : "No raster selected";
+  fetchSuggestedTileSize(path);
 });
 
 smoothingSelect.addEventListener("change", () => {
@@ -246,6 +274,82 @@ bandNirInput.addEventListener("input", () => {
   const value = Number.parseInt(bandNirInput.value, 10);
   state.bandMap.nirBand = Number.isFinite(value) && value > 0 ? value : 1;
 });
+
+async function fetchSuggestedTileSize(rasterPath: string): Promise<void> {
+  if (!rasterPath) {
+    state.suggestedTileSide = null;
+    updateTileSizeOptions();
+    return;
+  }
+  try {
+    const res = await fetch(`${state.backendUrl}/suggest-tile-size`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rasterPath, workers: 4 })
+    });
+    if (res.ok) {
+      const data = await res.json();
+      state.suggestedTileSide = typeof data.side === "number" ? data.side : null;
+    } else {
+      state.suggestedTileSide = null;
+    }
+  } catch {
+    state.suggestedTileSide = null;
+  }
+  updateTileSizeOptions();
+}
+
+function updateTileSizeOptions(): void {
+  const allSizes: Array<"256" | "512" | "1024" | "2048" | "4096"> = ["256", "512", "1024", "2048", "4096"];
+  const safe = state.suggestedTileSide;
+
+  // Update the Auto option label to show the suggested resolution.
+  const autoOption = tileSizeSelect.querySelector<HTMLOptionElement>('option[value="auto"]');
+  if (autoOption) {
+    autoOption.textContent = safe ? `Auto (${safe}×${safe})` : "Auto";
+  }
+
+  // Hide size options that exceed available memory.
+  allSizes.forEach((sz) => {
+    const opt = tileSizeSelect.querySelector<HTMLOptionElement>(`option[value="${sz}"]`);
+    if (opt) {
+      const hidden = safe !== null && Number(sz) > safe;
+      opt.hidden = hidden;
+      opt.disabled = hidden;
+    }
+  });
+
+  // If the currently selected size is now hidden, reset to auto.
+  const cur = tileSizeSelect.value as typeof state.tileSize;
+  if (cur !== "auto" && safe !== null && Number(cur) > safe) {
+    tileSizeSelect.value = "auto";
+    state.tileSize = "auto";
+  }
+
+  // Show a hint when auto is selected.
+  updateTileHint();
+}
+
+function updateTileHint(): void {
+  if (state.tileSize === "auto" && state.suggestedTileSide) {
+    tileHint.textContent = `Suggested: ${state.suggestedTileSide}×${state.suggestedTileSide} px (based on available RAM)`;
+  } else {
+    tileHint.textContent = "";
+  }
+}
+
+tileModeInput.addEventListener("change", () => {
+  state.tileMode = tileModeInput.checked;
+  tileSizeSelect.disabled = !state.tileMode;
+});
+
+tileSizeSelect.addEventListener("change", () => {
+  state.tileSize = tileSizeSelect.value as typeof state.tileSize;
+  updateTileHint();
+});
+
+// Disable tile size select until tile mode is enabled.
+tileSizeSelect.disabled = true;
 
 addClassButton.addEventListener("click", () => {
   const name = classNameInput.value.trim();
@@ -277,13 +381,28 @@ addVectorButton.addEventListener("click", () => {
 
 runButton.addEventListener("click", async () => {
   outputBox.textContent = "Running...";
+
+  // Resolve tile max pixels: use the specific size, or the backend-suggested size for auto.
+  let tileMaxPixels: number | null = null;
+  if (state.tileMode) {
+    if (state.tileSize === "auto") {
+      const side = state.suggestedTileSide ?? 1024;
+      tileMaxPixels = side * side;
+    } else {
+      const side = Number(state.tileSize);
+      tileMaxPixels = side * side;
+    }
+  }
+
   const payload = {
     rasterPath: state.rasterPath,
     classes: state.classes,
     vectorLayers: state.vectorLayers,
     smoothing: state.smoothing,
     featureFlags: state.featureFlags,
-    bandMap: state.bandMap
+    bandMap: state.bandMap,
+    tileMode: state.tileMode,
+    tileMaxPixels
   };
 
   try {

@@ -1,59 +1,4 @@
 from pathlib import Path
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Test vector overlay color resolution.")
-    parser.add_argument("--test-vector-color", action="store_true", help="Test vector overlay color resolution")
-    parser.add_argument("--input-folder", type=str, help="Input folder (classification raster)")
-    parser.add_argument("--vector", type=str, help="Vector file path (shp)")
-    parser.add_argument("--class-id", type=str, help="Class ID to assign to vector")
-    parser.add_argument("--class-color", type=str, help="Class color hex (e.g. #1C6BA0)")
-    args = parser.parse_args()
-
-    if args.test_vector_color:
-        # Simulate classes and vector_layers as in API
-        classes = [
-            {"id": args.class_id, "name": "BM_WATER", "color": args.class_color}
-        ]
-        vector_layers = [
-            {"id": "v1", "name": Path(args.vector).name, "filePath": args.vector, "classId": args.class_id}
-        ]
-        print("[CLI TEST] classes:", classes)
-        print("[CLI TEST] vector_layers:", vector_layers)
-
-        # Color resolution logic (copied from rasterize_vectors_onto_classification)
-        _class_color_map = {}
-        for cls in classes:
-            _cid = cls.get("id", "")
-            _hex = cls.get("color", "")
-            if _cid and _hex.startswith("#") and len(_hex) == 7:
-                try:
-                    _class_color_map[_cid] = (
-                        int(_hex[1:3], 16), int(_hex[3:5], 16), int(_hex[5:7], 16)
-                    )
-                except ValueError:
-                    pass
-        print(f"[COLOR DEBUG] class_color_map: {_class_color_map}")
-
-        for layer in vector_layers:
-            if not layer.get("overrideColor"):
-                _cid = layer.get("classId", "")
-                if _cid in _class_color_map:
-                    layer["overrideColor"] = list(_class_color_map[_cid])
-                    print(f"[COLOR DEBUG] Resolved classId={_cid!r} -> overrideColor={layer['overrideColor']}")
-
-        validated_vectors = [(Path(layer["filePath"]).name, None, layer.get("overrideColor")) for layer in vector_layers]
-        _auto_colors = [(255,255,0)]
-        overlay_colors = [
-            tuple(int(x) for x in oc) if isinstance(oc, (list, tuple)) and len(oc) == 3
-            else _auto_colors[i]
-            for i, (_, _, oc) in enumerate(validated_vectors)
-        ]
-        print(f"[COLOR DEBUG] overlay_colors: {overlay_colors}")
-        if overlay_colors[0] == (28, 107, 160):
-            print("[RESULT] PASS: Overlay color is correct blue (28, 107, 160)")
-        else:
-            print(f"[RESULT] FAIL: Overlay color is {overlay_colors[0]}, expected (28, 107, 160)")
-from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import tempfile
 import os
@@ -275,7 +220,7 @@ def _pca_adaptive_n_train(
 
 _MEA_ROAD_MATERIALS = {"BM_ASPHALT", "BM_CONCRETE", "BM_PAINT_ASPHALT", "BM_ROCK"}
 _MEA_VEG_MATERIALS = {"BM_LAND_GRASS", "BM_LAND_DRY_GRASS", "BM_VEGETATION", "BM_FOLIAGE"}
-_MEA_SOIL_MATERIALS = {"BM_SOIL", "BM_EARTHEN", "BM_SAND"}
+_MEA_SOIL_MATERIALS = {"BM_SOIL", "BM_SAND"}
 _MEA_METAL_MATERIALS = {"BM_METAL", "BM_METAL_STEEL"}
 
 
@@ -290,8 +235,6 @@ def _mea_material_type(name: str) -> str:
         return "METAL"
     if name == "BM_WATER":
         return "WATER"
-    if name == "BM_SHINGLE":
-        return "ROOFING"
     return "OTHER"
 
 
@@ -314,29 +257,90 @@ def _write_mea_palette_reference(output_dir: Path) -> str:
 MEA_CLASSES = [
     {"id": "class-1",  "name": "BM_ASPHALT",        "color": "#2D2D30"},
     {"id": "class-2",  "name": "BM_CONCRETE",       "color": "#B4B4B4"},
-    {"id": "class-3",  "name": "BM_EARTHEN",        "color": "#8B5A2B"},
-    {"id": "class-4",  "name": "BM_FOLIAGE",        "color": "#006400"},
-    {"id": "class-5",  "name": "BM_LAND_DRY_GRASS", "color": "#BDB76B"},
-    {"id": "class-6",  "name": "BM_LAND_GRASS",     "color": "#7CFC00"},
-    {"id": "class-7",  "name": "BM_METAL",          "color": "#A9ABB0"},
-    {"id": "class-8",  "name": "BM_METAL_STEEL",    "color": "#708090"},
-    {"id": "class-9",  "name": "BM_PAINT_ASPHALT",  "color": "#3C3F41"},
-    {"id": "class-10", "name": "BM_ROCK",           "color": "#827B73"},
-    {"id": "class-11", "name": "BM_SAND",           "color": "#EDC9AF"},
-    {"id": "class-12", "name": "BM_SHINGLE",        "color": "#696969"},
-    {"id": "class-13", "name": "BM_SOIL",           "color": "#654321"},
-    {"id": "class-14", "name": "BM_VEGETATION",     "color": "#228B22"},
-    {"id": "class-15", "name": "BM_WATER",          "color": "#1C6BA0"},
+    {"id": "class-3",  "name": "BM_FOLIAGE",        "color": "#006400"},
+    {"id": "class-4",  "name": "BM_LAND_DRY_GRASS", "color": "#BDB76B"},
+    {"id": "class-5",  "name": "BM_LAND_GRASS",     "color": "#7CFC00"},
+    {"id": "class-6",  "name": "BM_METAL",          "color": "#A9ABB0"},
+    {"id": "class-7",  "name": "BM_METAL_STEEL",    "color": "#708090"},
+    {"id": "class-8",  "name": "BM_PAINT_ASPHALT",  "color": "#3C3F41"},
+    {"id": "class-9",  "name": "BM_ROCK",           "color": "#827B73"},
+    {"id": "class-10", "name": "BM_SAND",           "color": "#EDC9AF"},
+    {"id": "class-11", "name": "BM_SOIL",           "color": "#654321"},
+    {"id": "class-12", "name": "BM_VEGETATION",     "color": "#228B22"},
+    {"id": "class-13", "name": "BM_WATER",          "color": "#1C6BA0"},
 ]
+
+# Maps each MEA material's BM_ name to its Composite_Material display name used in XML exports.
+_MEA_COMPOSITE_NAMES: Dict[str, str] = {
+    "BM_ASPHALT":        "ASPHALT",
+    "BM_CONCRETE":       "CONCRETE",
+    "BM_FOLIAGE":        "FOLIAGE",
+    "BM_LAND_DRY_GRASS": "DRY_GRASS",
+    "BM_LAND_GRASS":     "LAND_GRASS",
+    "BM_METAL":          "METAL",
+    "BM_METAL_STEEL":    "METAL_STEEL",
+    "BM_PAINT_ASPHALT":  "PAINT_ASPHALT",
+    "BM_ROCK":           "ROCK",
+    "BM_SAND":           "SAND",
+    "BM_SOIL":           "SOIL",
+    "BM_VEGETATION":     "GENVEGETATION",
+    "BM_WATER":          "WATER",
+}
+
+
+def _write_composite_material_xml(
+    output_path,
+    classes: List[Dict[str, str]],
+) -> Optional[str]:
+    """Write a Composite_Material_Table XML alongside a classification output file.
+
+    The XML is placed next to ``output_path`` with the same stem and a ``.xml``
+    extension.  Each MEA class produces one ``<Composite_Material>`` entry whose
+    color is the ARGB hex of the class colour (fully-opaque, lower-case).
+    """
+    import xml.etree.ElementTree as ET
+
+    xml_path = Path(output_path).with_suffix(".xml")
+
+    root = ET.Element("Composite_Material_Table")
+
+    for idx, cls in enumerate(classes, start=1):
+        bm_name   = cls.get("name", "")
+        color_hex = cls.get("color", "#000000")
+        composite_name = _MEA_COMPOSITE_NAMES.get(bm_name, bm_name.replace("BM_", ""))
+
+        # Build ARGB colour: #ff + RRGGBB (lower-case, no alpha adjustment).
+        if color_hex.startswith("#") and len(color_hex) == 7:
+            argb_color = f"#ff{color_hex[1:].lower()}"
+        else:
+            argb_color = "#ff000000"
+
+        cm = ET.SubElement(root, "Composite_Material", index=str(idx))
+        ET.SubElement(cm, "Name").text = composite_name
+        ET.SubElement(cm, "Color").text = argb_color
+        ps  = ET.SubElement(cm, "Primary_Substrate")
+        ET.SubElement(ps, "Thickness").text = "1"
+        mat = ET.SubElement(ps, "Material")
+        ET.SubElement(mat, "Name").text = bm_name
+        ET.SubElement(mat, "Weight").text = "100"
+
+    ET.indent(root, space="  ")
+    tree = ET.ElementTree(root)
+    try:
+        tree.write(str(xml_path), encoding="unicode", xml_declaration=False)
+        print(f"  [XML] Composite material table written: {xml_path}")
+        return str(xml_path)
+    except Exception as exc:
+        print(f"  [XML] Warning: could not write material XML: {exc}")
+        return None
+
 
 # Relative expected prevalence in urban aerial scenes (higher = usually more common).
 MEA_MATERIAL_FREQUENCY_PRIOR_URBAN: Dict[str, float] = {
     "BM_CONCRETE": 0.18,
     "BM_ASPHALT": 0.16,
-    "BM_SOIL": 0.12,
-    "BM_EARTHEN": 0.09,
+    "BM_SOIL": 0.15,
     "BM_ROCK": 0.08,
-    "BM_SHINGLE": 0.06,
     "BM_PAINT_ASPHALT": 0.04,
     "BM_SAND": 0.04,
     "BM_WATER": 0.04,
@@ -350,8 +354,7 @@ MEA_MATERIAL_FREQUENCY_PRIOR_URBAN: Dict[str, float] = {
 
 # Relative expected prevalence in open/rural scenes.
 MEA_MATERIAL_FREQUENCY_PRIOR_OPEN: Dict[str, float] = {
-    "BM_SOIL": 0.18,
-    "BM_EARTHEN": 0.15,
+    "BM_SOIL": 0.25,
     "BM_LAND_GRASS": 0.13,
     "BM_VEGETATION": 0.12,
     "BM_LAND_DRY_GRASS": 0.11,
@@ -361,7 +364,6 @@ MEA_MATERIAL_FREQUENCY_PRIOR_OPEN: Dict[str, float] = {
     "BM_CONCRETE": 0.05,
     "BM_ASPHALT": 0.04,
     "BM_FOLIAGE": 0.03,
-    "BM_SHINGLE": 0.02,
     "BM_PAINT_ASPHALT": 0.003,
     "BM_METAL": 0.008,   # very rare in aerial open-land
     "BM_METAL_STEEL": 0.003,
@@ -1059,7 +1061,7 @@ def _detect_shadows_and_infer(
     # preserves the original cluster label so that _cap_contextual_features can
     # handle them more accurately with full context.
     if classes and np.any(shadow_candidates):
-        _bld_names = {"BM_CONCRETE", "BM_METAL", "BM_METAL_STEEL", "BM_SHINGLE", "BM_ROCK"}
+        _bld_names = {"BM_CONCRETE", "BM_METAL", "BM_METAL_STEEL", "BM_ROCK"}
         _road_names = {"BM_ASPHALT", "BM_CONCRETE", "BM_PAINT_ASPHALT"}
         _bld_ids = {idx + 1 for idx, c in enumerate(classes) if c.get("name", "") in _bld_names}
         _road_ids = {idx + 1 for idx, c in enumerate(classes) if c.get("name", "") in _road_names}
@@ -1320,7 +1322,7 @@ def _cap_contextual_features(
         return output
 
     # --- class-ID sets ---
-    building_names = {"BM_CONCRETE", "BM_METAL", "BM_METAL_STEEL", "BM_SHINGLE", "BM_ROCK"}
+    building_names = {"BM_CONCRETE", "BM_METAL", "BM_METAL_STEEL", "BM_ROCK"}
     road_names = {"BM_ASPHALT", "BM_CONCRETE", "BM_PAINT_ASPHALT"}
     protected_kw = ("GRASS", "VEGETATION", "FOLIAGE", "WATER")
 
@@ -1982,6 +1984,10 @@ def rasterize_vector_onto_raster(raster_path: str, gdf, burn_value: int, output_
     print(f"    Vector CRS: {gdf.crs}")
     print(f"    Raster CRS: {raster_crs}")
 
+    # Keep the original gdf (before any reprojection) so we can fall back to it
+    # if the reprojected coordinates end up outside the raster extent.
+    _gdf_original = gdf.copy()
+
     # Use the raster's own CRS (authoritative) as the target
     _target_crs = raster_crs
 
@@ -2107,13 +2113,34 @@ def rasterize_vector_onto_raster(raster_path: str, gdf, burn_value: int, output_
             print(f"      - First geometry bounds: {first_geom.bounds}")
             print(f"      - First geometry is_valid: {first_geom.is_valid}")
         
-        # POTENTIAL FIX: If bounds don't overlap, geometries might be in different CRS
-        # Try to reproject geometries to match raster bounds more closely
+        # FALLBACK: if bounds don't overlap, try using the original (un-reprojected)
+        # geometry coords directly. This handles a common case where the vector was
+        # already drawn in the raster's coordinate space but carries a different CRS
+        # label (e.g. QGIS project CRS differs from layer CRS).
         if not bounds_overlap:
-            print(f"      [ATTEMPTING FIX] Geometries appear to be outside raster bounds")
-            # Don't try to fix - just warn
-            print(f"      Consider checking if vector is in the same projection as raster")
-    
+            print(f"      [FALLBACK] Trying original (un-reprojected) geometry coordinates...")
+            _orig_shapes = [(geom, burn_value) for geom in _gdf_original.geometry
+                            if geom is not None and not geom.is_empty]
+            if _orig_shapes:
+                _orig_gdf_bounds = _gdf_original.total_bounds
+                _x_ok = not (_orig_gdf_bounds[2] < raster_minx or _orig_gdf_bounds[0] > raster_maxx)
+                _y_ok = not (_orig_gdf_bounds[3] < raster_miny or _orig_gdf_bounds[1] > raster_maxy)
+                if _x_ok and _y_ok:
+                    print(f"      [FALLBACK] Original bounds DO overlap — using un-reprojected coords")
+                    burned_mask = rasterize(
+                        shapes=_orig_shapes,
+                        out_shape=(height, width),
+                        transform=transform,
+                        fill=0,
+                        all_touched=True
+                    )
+                    pixels_burned = int(np.sum(burned_mask > 0))
+                    print(f"      [FALLBACK] Pixels burned with original coords: {pixels_burned}")
+                else:
+                    print(f"      [FALLBACK] Original bounds also outside raster — vector does not "
+                          f"spatially overlap this raster. Check that the shapefile covers the "
+                          f"same area as the image.")
+
     # Merge with raster - write burned pixels with burn_value
     print(f"    Original raster dtype: {raster_array.dtype}, shape: {raster_array.shape}")
     print(f"    Burned mask stats: min={np.min(burned_mask)}, max={np.max(burned_mask)}, sum={np.sum(burned_mask > 0)}")
@@ -2613,6 +2640,11 @@ def classify_and_export(
         print(_ce_table)
         print("="*70)
 
+        # Write companion XML alongside the first tile (same dir as all tiles).
+        _tile_xml: Optional[str] = None
+        if _is_mea_classes(classes) and tile_outputs:
+            _tile_xml = _write_composite_material_xml(tile_outputs[0], classes)
+
         return {
             "status": "ok",
             "outputPath": str(output_dir),
@@ -2621,6 +2653,7 @@ def classify_and_export(
             "meaMapping": mea_mapping,
             "stats": _ce_stages,
             "statsTable": _ce_table,
+            "xmlPath": _tile_xml,
         }
 
     # === NN assignment ===
@@ -2664,34 +2697,20 @@ def classify_and_export(
 
     # === Post-processing: absorb patches, contextual cap, asphalt cap ===
     _t_pp = _time.perf_counter()
-    _cb("Post-processing", 0, 3)
+    _cb("Post-processing", 0, 2)
     # === Absorb small isolated patches (paint stripes, windows, cars) into surrounding class ===
     _t_sub = _time.perf_counter()
     print(f"\n[patch] Absorbing small isolated patches...")
     predicted_raster = _absorb_isolated_small_patches(predicted_raster, classes=classes)
     print(f"  [OK] Small-patch absorption complete ({_time.perf_counter()-_t_sub:.1f}s)")
-    _cb("Post-processing", 1, 3)
+    _cb("Post-processing", 1, 2)
 
     # === Context-aware feature capping (windows, road stripes, facades) ===
     _t_sub = _time.perf_counter()
     print(f"\n[cap] Capping contextual features (windows / road stripes / facades)...")
     predicted_raster = _cap_contextual_features(predicted_raster, raster_data, classes=classes)
     print(f"  [OK] Contextual feature capping complete ({_time.perf_counter()-_t_sub:.1f}s)")
-    _cb("Post-processing", 2, 4)
-
-    # === Morphological road cleanup: opening removes thin spurious road pixels ===
-    _t_sub = _time.perf_counter()
-    if _is_mea_classes(classes) and feature_flags.get("morphCleanup", True):
-        print(f"\n[morph] Morphological road cleanup...")
-        predicted_raster = _morphological_road_cleanup(predicted_raster, classes)
-        print(f"  [OK] Road cleanup complete ({_time.perf_counter()-_t_sub:.1f}s)")
-    elif _is_mea_classes(classes):
-        print(f"\n[morph] Morphological road cleanup: SKIPPED (disabled)")
-    _cb("Post-processing", 3, 4)
-
-    # (Asphalt enclosure capping is now a standalone post-processing step
-    # via apply_road_object_removal - not run during initial classification.)
-    _cb("Post-processing", 4, 4)
+    _cb("Post-processing", 2, 2)
     _ce_stages.append(("Post-processing", _time.perf_counter() - _t0))
 
     step_num = 6
@@ -2780,17 +2799,22 @@ def classify_and_export(
     
     with rasterio.open(output_color_path, 'w', **rgb_profile) as dst:
         dst.write(rgb)
-    
+
     print(f"  [OK] Classification saved to {output_color_path}")
     _cb("Saving output", 1, 1)
     _ce_stages.append(("Save output", _time.perf_counter() - _t0))
     _ce_total = _time.perf_counter() - _t_ce_start
     _ce_table = _build_stats_table(_ce_stages, _ce_total)
-    
+
     print("\n" + "="*70)
     print("[OK] STEP 1 COMPLETE: Classification & Export")
     print(_ce_table)
     print("="*70)
+
+    # Write companion Composite_Material_Table XML for MEA classifications.
+    xml_out: Optional[str] = None
+    if _is_mea_classes(classes):
+        xml_out = _write_composite_material_xml(output_color_path, classes)
 
     return {
         "status": "ok",
@@ -2799,6 +2823,7 @@ def classify_and_export(
         "meaMapping": mea_mapping,
         "stats": _ce_stages,
         "statsTable": _ce_table,
+        "xmlPath": xml_out,
     }
 
 
@@ -3264,9 +3289,34 @@ def rasterize_vectors_onto_classification(
                     print(f"    [OK] Reprojected. Bounds: {_orig_bounds} -> {gdf.total_bounds}")
                 except Exception as e:
                     print(f"    [ERROR] CRS reproject failed: {e}")
-                    print(f"    [SKIP] Vector skipped due to CRS reproject failure")
-                    continue
-            
+                    # Try EPSG code fallback in case the CRS object is non-serialisable
+                    try:
+                        _epsg = CRS(crs).to_epsg()
+                        if _epsg:
+                            gdf = gdf.to_crs(f"EPSG:{_epsg}")
+                            print(f"    [OK] Reprojected via EPSG:{_epsg} fallback. Bounds: {_orig_bounds} -> {gdf.total_bounds}")
+                        else:
+                            raise ValueError("No EPSG code available")
+                    except Exception as e2:
+                        print(f"    [ERROR] EPSG fallback also failed: {e2}")
+                        print(f"    [SKIP] Vector skipped due to CRS reproject failure")
+                        continue
+
+            # Bounds sanity-check: warn if vector doesn't appear to overlap raster.
+            # The rasterize step has its own fallback, but log it here for visibility.
+            if crs is not None:
+                _rminx = transform.c
+                _rmaxx = transform.c + width * transform.a
+                _rminy = transform.f + height * transform.e
+                _rmaxy = transform.f
+                _vb = gdf.total_bounds  # [minx, miny, maxx, maxy]
+                _xok = not (_vb[2] < _rminx or _vb[0] > _rmaxx)
+                _yok = not (_vb[3] < _rminy or _vb[1] > _rmaxy)
+                if not (_xok and _yok):
+                    print(f"    [WARN] Reprojected vector bounds {list(_vb)} do NOT overlap "
+                          f"raster bounds [{_rminx:.2f},{_rminy:.2f},{_rmaxx:.2f},{_rmaxy:.2f}]. "
+                          f"The rasterize step will attempt a coordinate fallback automatically.")
+
             validated_vectors.append((layer_path.name, gdf, layer.get("overrideColor")))
             print(f"    [OK] Validated")
         except Exception as e:
@@ -4353,7 +4403,7 @@ def _build_mea_cluster_mapping(
     _VEG_NAMES = {"BM_LAND_GRASS", "BM_LAND_DRY_GRASS", "BM_VEGETATION", "BM_FOLIAGE"}
     _WATER_NAMES = {"BM_WATER"}
     _METAL_NAMES = {"BM_METAL", "BM_METAL_STEEL"}
-    _SOIL_NAMES = {"BM_SOIL", "BM_EARTHEN", "BM_SAND"}
+    _SOIL_NAMES = {"BM_SOIL", "BM_SAND"}
     _ROAD_NAMES = {"BM_ASPHALT", "BM_CONCRETE", "BM_PAINT_ASPHALT"}
     _ROADLIKE_NAMES = {"BM_ASPHALT", "BM_CONCRETE", "BM_PAINT_ASPHALT", "BM_ROCK"}
     _ASPHALT_ANCHORS = [
@@ -4515,7 +4565,7 @@ def _build_mea_cluster_mapping(
         asphalt_materials = {"BM_ASPHALT", "BM_PAINT_ASPHALT"}
         paint_materials = {"BM_PAINT_ASPHALT"}
         water_materials = {"BM_WATER"}
-        soil_materials = {"BM_SOIL", "BM_EARTHEN"}
+        soil_materials = {"BM_SOIL"}
 
         sem_penalty = np.zeros_like(cost, dtype=np.float64)
         for i, sem in enumerate(cluster_semantics):
@@ -4819,8 +4869,8 @@ def _build_mea_cluster_mapping(
                         pen += 3.0
                     elif gray_frac >= 0.20 and warm_frac < 0.20:
                         pen += 1.5
-                    # Dark gray directly confirms asphalt/concrete, NEVER soil/earthen.
-                    # BM_EARTHEN (RGB 139,90,43) and BM_SOIL (RGB 101,67,33) are warm-brown;
+                    # Dark gray directly confirms asphalt/concrete, NEVER soil.
+                    # BM_SOIL (RGB 101,67,33) is warm-brown;
                     # a dark-gray cluster (e.g. worn asphalt) has none of those warm tones.
                     if dark_gray_frac >= 0.35:
                         pen += 5.0
@@ -4983,7 +5033,7 @@ def _build_mea_cluster_mapping(
     if cluster_semantics is not None and len(cluster_semantics) == len(cluster_rgbs):
         vegetation_materials = {"BM_LAND_GRASS", "BM_LAND_DRY_GRASS", "BM_VEGETATION", "BM_FOLIAGE"}
         lush_vegetation_materials = {"BM_LAND_GRASS", "BM_VEGETATION", "BM_FOLIAGE"}
-        soil_materials = {"BM_SOIL", "BM_EARTHEN"}
+        soil_materials = {"BM_SOIL"}
         water_idx = next((idx for idx, n in enumerate(material_names) if n == "BM_WATER"), None)
         road_candidate_idxs = [
             idx for idx, n in enumerate(material_names)
@@ -4991,7 +5041,7 @@ def _build_mea_cluster_mapping(
         ]
         dry_ground_candidate_idxs = [
             idx for idx, n in enumerate(material_names)
-            if n in {"BM_LAND_DRY_GRASS", "BM_SOIL", "BM_EARTHEN", "BM_ROCK"}
+            if n in {"BM_LAND_DRY_GRASS", "BM_SOIL", "BM_ROCK"}
         ]
 
         for i, sem in enumerate(cluster_semantics):
@@ -5115,7 +5165,7 @@ def _build_mea_cluster_mapping(
                     # Prefer asphalt/road/soil families for uncertain water.
                     preferred = [
                         idx for idx, n in enumerate(material_names)
-                        if n in {"BM_ASPHALT", "BM_CONCRETE", "BM_PAINT_ASPHALT", "BM_SOIL", "BM_EARTHEN", "BM_ROCK"}
+                        if n in {"BM_ASPHALT", "BM_CONCRETE", "BM_PAINT_ASPHALT", "BM_SOIL", "BM_ROCK"}
                     ]
                     candidate_idxs = preferred if preferred else non_water_idxs
                     best_idx = min(
@@ -5325,3 +5375,59 @@ def _apply_color_table(
             print(f"    [Color Apply] Expected class range: 1 to {n_colors}")
 
     return rgb
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Test vector overlay color resolution.")
+    parser.add_argument("--test-vector-color", action="store_true", help="Test vector overlay color resolution")
+    parser.add_argument("--input-folder", type=str, help="Input folder (classification raster)")
+    parser.add_argument("--vector", type=str, help="Vector file path (shp)")
+    parser.add_argument("--class-id", type=str, help="Class ID to assign to vector")
+    parser.add_argument("--class-color", type=str, help="Class color hex (e.g. #1C6BA0)")
+    args = parser.parse_args()
+
+    if args.test_vector_color:
+        # Simulate classes and vector_layers as in API
+        classes = [
+            {"id": args.class_id, "name": "BM_WATER", "color": args.class_color}
+        ]
+        vector_layers = [
+            {"id": "v1", "name": Path(args.vector).name, "filePath": args.vector, "classId": args.class_id}
+        ]
+        print("[CLI TEST] classes:", classes)
+        print("[CLI TEST] vector_layers:", vector_layers)
+
+        # Color resolution logic (copied from rasterize_vectors_onto_classification)
+        _class_color_map = {}
+        for cls in classes:
+            _cid = cls.get("id", "")
+            _hex = cls.get("color", "")
+            if _cid and _hex.startswith("#") and len(_hex) == 7:
+                try:
+                    _class_color_map[_cid] = (
+                        int(_hex[1:3], 16), int(_hex[3:5], 16), int(_hex[5:7], 16)
+                    )
+                except ValueError:
+                    pass
+        print(f"[COLOR DEBUG] class_color_map: {_class_color_map}")
+
+        for layer in vector_layers:
+            if not layer.get("overrideColor"):
+                _cid = layer.get("classId", "")
+                if _cid in _class_color_map:
+                    layer["overrideColor"] = list(_class_color_map[_cid])
+                    print(f"[COLOR DEBUG] Resolved classId={_cid!r} -> overrideColor={layer['overrideColor']}")
+
+        validated_vectors = [(Path(layer["filePath"]).name, None, layer.get("overrideColor")) for layer in vector_layers]
+        _auto_colors = [(255,255,0)]
+        overlay_colors = [
+            tuple(int(x) for x in oc) if isinstance(oc, (list, tuple)) and len(oc) == 3
+            else _auto_colors[i]
+            for i, (_, _, oc) in enumerate(validated_vectors)
+        ]
+        print(f"[COLOR DEBUG] overlay_colors: {overlay_colors}")
+        if overlay_colors[0] == (28, 107, 160):
+            print("[RESULT] PASS: Overlay color is correct blue (28, 107, 160)")
+        else:
+            print(f"[RESULT] FAIL: Overlay color is {overlay_colors[0]}, expected (28, 107, 160)")
