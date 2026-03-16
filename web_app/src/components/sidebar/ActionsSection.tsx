@@ -4,7 +4,6 @@ import {
   runStep1,
   runStep2,
   runFullPipeline,
-  runStep3,
   runBatchClassify,
   generateTaskId,
   startProgressStream,
@@ -38,7 +37,7 @@ export default function ActionsSection() {
       outputPath: state.outputPath || undefined,
       exportFormat: state.classification.exportFormat,
       tileMode: state.performance.useTiling,
-      tileMaxPixels: tileSizeToPixels(state.performance.tileSize),
+      tileMaxPixels: tileSizeToPixels(state.performance.tileSize, state.performance.suggestedTileSide),
       tileWorkers: state.performance.tileWorkers,
       detectShadows: state.classification.detectShadows,
       maxThreads,
@@ -203,7 +202,7 @@ export default function ActionsSection() {
         outputPath: state.outputPath || undefined,
         taskId,
         tileMode: state.performance.useTiling,
-        tileMaxPixels: tileSizeToPixels(state.performance.tileSize),
+        tileMaxPixels: tileSizeToPixels(state.performance.tileSize, state.performance.suggestedTileSide),
         tileWorkers: state.performance.tileWorkers,
         maxThreads: state.performance.useMaxThreads
           ? navigator.hardwareConcurrency ?? null
@@ -212,31 +211,6 @@ export default function ActionsSection() {
       handleSingleResult(result, "Step 2");
     } catch (e: any) {
       dispatch({ type: "SET_STATUS", text: `Step 2 error: ${e.message}` });
-    } finally {
-      stopProgress();
-      dispatch({ type: "SET_PROGRESS", progress: null });
-      dispatch({ type: "SET_RUNNING", step: "idle" });
-    }
-  };
-
-  const handleStep3 = async () => {
-    if (!state.lastResultPath) return alert("Run Step 1/2 first to produce a classification file.");
-    runStartRef.current = Date.now();
-    dispatch({ type: "SET_RUNNING", step: "step3" });
-    dispatch({ type: "SET_STATUS", text: "Running Step 3: Remove road objects…" });
-    dispatch({ type: "SET_PROGRESS", progress: null });
-    const taskId = generateTaskId();
-    const stopProgress = startProgressStream(taskId, (evt) => {
-      dispatch({ type: "SET_PROGRESS", progress: evt });
-    });
-    try {
-      const result = await runStep3({
-        classificationPath: state.lastResultPath,
-        taskId,
-      });
-      handleSingleResult(result, "Step 3");
-    } catch (e: any) {
-      dispatch({ type: "SET_STATUS", text: `Step 3 error: ${e.message}` });
     } finally {
       stopProgress();
       dispatch({ type: "SET_PROGRESS", progress: null });
@@ -340,7 +314,7 @@ export default function ActionsSection() {
           outputPath: state.outputPath || undefined,
           exportFormat: "img",
           tileMode: state.performance.useTiling,
-          tileMaxPixels: tileSizeToPixels(state.performance.tileSize),
+          tileMaxPixels: tileSizeToPixels(state.performance.tileSize, state.performance.suggestedTileSide),
           tileWorkers: state.performance.tileWorkers,
           detectShadows: state.classification.detectShadows,
           maxThreads,
@@ -371,7 +345,7 @@ export default function ActionsSection() {
           exportFormat: "img" as const,
           taskId,
           tileMode: state.performance.useTiling,
-          tileMaxPixels: tileSizeToPixels(state.performance.tileSize),
+          tileMaxPixels: tileSizeToPixels(state.performance.tileSize, state.performance.suggestedTileSide),
           tileWorkers: state.performance.tileWorkers,
           detectShadows: state.classification.detectShadows,
           maxThreads: state.performance.useMaxThreads
@@ -436,12 +410,6 @@ export default function ActionsSection() {
           color="blue"
         />
         <ActionBtn
-          label="Step 3: Road Clean"
-          onClick={handleStep3}
-          disabled={isRunning}
-          color="blue"
-        />
-        <ActionBtn
           label="Full Pipeline"
           onClick={handleFull}
           disabled={isRunning}
@@ -490,8 +458,11 @@ function ActionBtn({
   );
 }
 
-function tileSizeToPixels(size: string): number {
-  if (size === "Auto") return 2048 * 2048;
+function tileSizeToPixels(size: string, suggestedSide?: number | null): number {
+  if (size === "Auto") {
+    const side = suggestedSide ?? 1024;
+    return side * side;
+  }
   const s = parseInt(size) || 1024;
   return s * s;
 }

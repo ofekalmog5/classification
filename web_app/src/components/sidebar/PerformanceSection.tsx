@@ -1,14 +1,41 @@
+import { useEffect } from "react";
 import { useAppState, useAppDispatch } from "../../store";
+import { suggestTileSize } from "../../api/client";
 import type { TileSize } from "../../types";
 
 const TILE_SIZES: TileSize[] = ["Auto", "256", "512", "1024", "2048", "4096"];
 
 export default function PerformanceSection() {
-  const { performance } = useAppState();
+  const state = useAppState();
+  const { performance } = state;
   const dispatch = useAppDispatch();
 
   const set = (partial: Partial<typeof performance>) =>
     dispatch({ type: "SET_PERFORMANCE", settings: partial });
+
+  // Resolve first raster-input file path from map layers (or rasterPath fallback)
+  const rasterPath =
+    state.mapLayers.find((l) => l.type === "raster-input")?.filePath ||
+    state.rasterPath ||
+    "";
+
+  // Fetch suggested tile side from backend whenever the raster changes
+  useEffect(() => {
+    if (!rasterPath) {
+      set({ suggestedTileSide: null });
+      return;
+    }
+    let cancelled = false;
+    suggestTileSize(rasterPath).then((side) => {
+      if (!cancelled) set({ suggestedTileSide: side });
+    });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rasterPath]);
+
+  const autoLabel = performance.suggestedTileSide
+    ? `Auto (${performance.suggestedTileSide}×${performance.suggestedTileSide})`
+    : "Auto";
 
   return (
     <SidebarSection title="Performance">
@@ -25,11 +52,19 @@ export default function PerformanceSection() {
           value={performance.tileSize}
           onChange={(e) => set({ tileSize: e.target.value as TileSize })}
         >
-          {TILE_SIZES.map((s) => (
-            <option key={s} value={s}>
-              {s}
-            </option>
-          ))}
+          {TILE_SIZES.map((s) => {
+            // Hide sizes larger than the suggested safe size
+            const safe = performance.suggestedTileSide;
+            if (safe && s !== "Auto") {
+              const side = parseInt(s);
+              if (side > safe) return null;
+            }
+            return (
+              <option key={s} value={s}>
+                {s === "Auto" ? autoLabel : s}
+              </option>
+            );
+          })}
         </select>
       </div>
 

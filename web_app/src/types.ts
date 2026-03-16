@@ -33,6 +33,7 @@ export interface PerformanceSettings {
   tileWorkers: number;
   imageWorkers: number;
   useMaxThreads: boolean;
+  suggestedTileSide: number | null;
 }
 
 export interface ClassificationSettings {
@@ -92,7 +93,6 @@ export type PipelineStep =
   | "idle"
   | "step1"
   | "step2"
-  | "step3"
   | "full"
   | "mea";
 

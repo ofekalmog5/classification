@@ -167,22 +167,20 @@ export async function runFullPipeline(
   return parseApiResponse<ClassifyResult>(r);
 }
 
-/* ── Remove road objects (Step 3) ────────────────────────────────── */
-export interface Step3Params {
-  classificationPath: string;
-  taskId?: string;
-}
-
-export async function runStep3(params: Step3Params): Promise<ClassifyResult> {
-  const r = await fetch(`${BASE}/remove-road-objects`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      classificationPath: params.classificationPath,
-      taskId: params.taskId ?? null,
-    }),
-  });
-  return parseApiResponse<ClassifyResult>(r);
+/* ── Suggest tile size ────────────────────────────────────────────── */
+export async function suggestTileSize(rasterPath: string): Promise<number | null> {
+  try {
+    const r = await fetch(`${BASE}/suggest-tile-size`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rasterPath, workers: navigator.hardwareConcurrency ?? 4 }),
+    });
+    if (!r.ok) return null;
+    const data = await r.json();
+    return typeof data.side === "number" ? data.side : null;
+  } catch {
+    return null;
+  }
 }
 
 /* ── Batch classify (shared model) ───────────────────────────────── */

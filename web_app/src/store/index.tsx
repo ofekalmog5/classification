@@ -32,6 +32,7 @@ export const initialState: AppState = {
     tileWorkers: cpuCount,
     imageWorkers: Math.min(4, cpuCount),
     useMaxThreads: false,
+    suggestedTileSide: null,
   },
   classification: {
     detectShadows: false,
