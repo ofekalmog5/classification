@@ -30,8 +30,9 @@ export default function ActionsSection() {
   // Short engine label shown in the status bar when a run starts
   const engineLabel = state.accelInfo
     ? ` · ${
-        state.accelInfo.engine === "faiss-gpu" ? "GPU"
-        : state.accelInfo.engine === "cuml"    ? "GPU (cuML)"
+        state.accelInfo.engine === "faiss-gpu"  ? "GPU"
+        : state.accelInfo.engine === "cupy"     ? "GPU (cupy)"
+        : state.accelInfo.engine === "cuml"     ? "GPU (cuML)"
         : state.accelInfo.engine === "faiss-cpu" ? "faiss-cpu"
         : "CPU"
       }`
