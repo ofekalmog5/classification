@@ -22,7 +22,7 @@ export const initialState: AppState = {
   outputPath: "",
   lastResultPath: "",
   imageryMode: "regular",
-  featureFlags: { spectral: true, texture: true, indices: false, colorIndices: true, entropy: false, morphCleanup: true },
+  featureFlags: { spectral: true, texture: true, indices: false, colorIndices: true, entropy: false },
   classes: [],
   classCount: 3,
   vectorLayers: [],

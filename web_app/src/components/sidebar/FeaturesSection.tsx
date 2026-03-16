@@ -12,7 +12,6 @@ const FEATURE_DEFS: Array<{
   { key: "indices",      label: "NDVI",           tip: "Needs NIR band", requiresMulti: true },
   { key: "colorIndices", label: "VARI / HSV",     tip: "Visible color indices" },
   { key: "entropy",      label: "Entropy",        tip: "Local entropy (slow)" },
-  { key: "morphCleanup", label: "Road cleanup",   tip: "Morphological post-process" },
 ];
 
 export default function FeaturesSection() {

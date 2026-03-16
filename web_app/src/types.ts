@@ -20,7 +20,6 @@ export interface FeatureFlags {
   indices: boolean;
   colorIndices: boolean;
   entropy: boolean;
-  morphCleanup: boolean;
 }
 
 export type ImageryMode = "regular" | "multispectral";
