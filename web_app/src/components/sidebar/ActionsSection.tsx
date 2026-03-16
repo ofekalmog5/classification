@@ -27,6 +27,16 @@ export default function ActionsSection() {
   const isRunning = state.running !== "idle";
   const runStartRef = useRef<number>(0);
 
+  // Short engine label shown in the status bar when a run starts
+  const engineLabel = state.accelInfo
+    ? ` · ${
+        state.accelInfo.engine === "faiss-gpu" ? "GPU"
+        : state.accelInfo.engine === "cuml"    ? "GPU (cuML)"
+        : state.accelInfo.engine === "faiss-cpu" ? "faiss-cpu"
+        : "CPU"
+      }`
+    : "";
+
   const commonParams = useCallback(() => {
     const maxThreads = state.performance.useMaxThreads
       ? navigator.hardwareConcurrency ?? null
@@ -142,7 +152,7 @@ export default function ActionsSection() {
 
     // Use batch endpoint (shared model) when multiple files
     if (rasterFiles.length > 1) {
-      dispatch({ type: "SET_STATUS", text: `Step 1: Training shared model on ${rasterFiles.length} files…` });
+      dispatch({ type: "SET_STATUS", text: `Step 1: Training shared model on ${rasterFiles.length} files…${engineLabel}` });
       const taskId = generateTaskId();
       const stopProgress = startProgressStream(taskId, (evt) => {
         dispatch({ type: "SET_PROGRESS", progress: evt });
@@ -165,7 +175,7 @@ export default function ActionsSection() {
       // Single file — use original endpoint
       const file = rasterFiles[0];
       const fileName = file.split(/[\\/]/).pop() || file;
-      dispatch({ type: "SET_STATUS", text: `Step 1: Classifying ${fileName}…` });
+      dispatch({ type: "SET_STATUS", text: `Step 1: Classifying ${fileName}…${engineLabel}` });
       const taskId = generateTaskId();
       const stopProgress = startProgressStream(taskId, (evt) => {
         dispatch({ type: "SET_PROGRESS", progress: evt });
@@ -235,7 +245,7 @@ export default function ActionsSection() {
     const params = commonParams();
 
     if (rasterFiles.length > 1) {
-      dispatch({ type: "SET_STATUS", text: `Full Pipeline: Training shared model on ${rasterFiles.length} files…` });
+      dispatch({ type: "SET_STATUS", text: `Full Pipeline: Training shared model on ${rasterFiles.length} files…${engineLabel}` });
       const taskId = generateTaskId();
       const stopProgress = startProgressStream(taskId, (evt) => {
         dispatch({ type: "SET_PROGRESS", progress: evt });
@@ -257,7 +267,7 @@ export default function ActionsSection() {
     } else {
       const file = rasterFiles[0];
       const fileName = file.split(/[\\/]/).pop() || file;
-      dispatch({ type: "SET_STATUS", text: `Full Pipeline: ${fileName}…` });
+      dispatch({ type: "SET_STATUS", text: `Full Pipeline: ${fileName}…${engineLabel}` });
       const taskId = generateTaskId();
       const stopProgress = startProgressStream(taskId, (evt) => {
         dispatch({ type: "SET_PROGRESS", progress: evt });
@@ -297,7 +307,7 @@ export default function ActionsSection() {
     dispatch({ type: "SET_PROGRESS", progress: null });
 
     if (rasterFiles.length > 1) {
-      dispatch({ type: "SET_STATUS", text: `MEA: Training shared model on ${rasterFiles.length} files…` });
+      dispatch({ type: "SET_STATUS", text: `MEA: Training shared model on ${rasterFiles.length} files…${engineLabel}` });
       const taskId = generateTaskId();
       const stopProgress = startProgressStream(taskId, (evt) => {
         dispatch({ type: "SET_PROGRESS", progress: evt });
@@ -330,7 +340,7 @@ export default function ActionsSection() {
     } else {
       const file = rasterFiles[0];
       const fileName = file.split(/[\\/]/).pop() || file;
-      dispatch({ type: "SET_STATUS", text: `MEA: ${fileName}…` });
+      dispatch({ type: "SET_STATUS", text: `MEA: ${fileName}…${engineLabel}` });
       const taskId = generateTaskId();
       const stopProgress = startProgressStream(taskId, (evt) => {
         dispatch({ type: "SET_PROGRESS", progress: evt });

@@ -2556,6 +2556,14 @@ def classify_and_export(
     print("STEP 1: CLASSIFICATION & EXPORT (No Vectors)")
     print("="*70)
 
+    # Emit acceleration engine as the very first progress event so the UI
+    # shows which engine (GPU / CPU) is active from the moment the run starts.
+    _accel_label = (
+        f"GPU ({_ACCEL_ENGINE})" if _ACCEL_GPU
+        else f"CPU ({_ACCEL_ENGINE})"
+    )
+    _cb(f"Engine: {_accel_label}", 0, 1)
+
     # === Load raster ===
     _t0 = _time.perf_counter()
     _cb("Loading raster", 0, 1)
