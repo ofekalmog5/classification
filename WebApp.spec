@@ -60,20 +60,48 @@ except Exception:
 # Provides real GPU KMeans on Windows without conda.
 # If not installed the app uses faiss-cpu automatically.
 try:
-    from PyInstaller.utils.hooks import collect_dynamic_libs
+    import glob as _glob
+    from PyInstaller.utils.hooks import collect_dynamic_libs, get_package_paths
+
+    # 1. Python modules + data files
     hiddenimports += collect_submodules('cupy')
+    hiddenimports += collect_submodules('cupy_backends')   # catches _softlink etc.
     datas         += collect_data_files('cupy')
-    binaries      += collect_dynamic_libs('cupy')
+    datas         += collect_data_files('cupy_backends')
+
+    # 2. _softlink extension (CuPy's DLL-loading shim) — not auto-detected
     hiddenimports += [
+        'cupy_backends.cuda._softlink',
+        'cupy_backends.cuda.api.driver',
+        'cupy_backends.cuda.api.runtime',
+        'cupy_backends.cuda.libs.cublas',
+        'cupy_backends.cuda.libs.curand',
+        'cupy_backends.cuda.libs.nvrtc',
         'cupy._core',
         'cupy.cuda',
         'cupy.cuda.memory',
         'cupy.random',
         'cupy.linalg',
     ]
+
+    # 3. CUDA DLLs from nvidia-* packages — preserve nvidia/<pkg>/bin/ layout
+    #    so cuda-pathfinder can locate them inside the frozen exe.
+    _sp = get_package_paths('cupy')[0]          # site-packages root
+    _nvidia_root = os.path.join(_sp, 'nvidia')
+    if os.path.isdir(_nvidia_root):
+        for _dll in _glob.glob(os.path.join(_nvidia_root, '**', '*.dll'), recursive=True):
+            _dest = os.path.dirname(os.path.relpath(_dll, _sp))  # e.g. nvidia/cublas/bin
+            binaries.append((_dll, _dest))
+            print(f"[spec]   + {os.path.basename(_dll)}")
+
+    # 4. cupyx.cutensor needs cuTENSOR.dll which is rarely installed.
+    #    Exclude it to prevent a load error; we don't use cuTENSOR for KMeans.
+    excludes_extra = ['cupyx.cutensor', 'cupy_backends.cuda.libs.cutensor']
+
     print("[spec] CuPy found — bundling GPU KMeans support")
 except Exception as _e:
     print(f"[spec] CuPy not installed ({_e}) — GPU KMeans via CuPy skipped")
+    excludes_extra = []
 
 # ── pynvml (GPU detection) ─────────────────────────────────────────────────
 hiddenimports += ['pynvml']
@@ -114,7 +142,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=excludes_extra,
     noarchive=False,
     optimize=0,
 )
