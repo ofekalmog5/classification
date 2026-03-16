@@ -3,6 +3,7 @@ from typing import Dict, List, Tuple, Optional
 import tempfile
 import os
 import sys
+import gc
 import site
 import time as _time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -1963,10 +1964,22 @@ def _classify_tile_worker(args: tuple) -> str:
     )
 
     # Feature extraction + nearest-center assignment on the expanded area.
-    features           = _extract_pixel_features(tile_data, feature_flags, verbose=False)
-    scale              = np.where(scaler_scale == 0, 1.0, scaler_scale).astype(np.float32)
-    features_norm      = ((features - scaler_mean) / scale).astype(np.float32)
-    labels             = _nearest_center_chunked(features_norm, centers.astype(np.float32)) + 1
+    try:
+        features = _extract_pixel_features(tile_data, feature_flags, verbose=False)
+        scale    = np.where(scaler_scale == 0, 1.0, scaler_scale).astype(np.float32)
+        features_norm = ((features - scaler_mean) / scale).astype(np.float32)
+        del features                        # free ~20×H×W×4 bytes immediately
+        gc.collect()
+        labels = _nearest_center_chunked(features_norm, centers.astype(np.float32)) + 1
+        del features_norm
+        gc.collect()
+    except MemoryError:
+        bands, h, w = tile_data.shape
+        mb = bands * h * w / (1024 * 1024)
+        raise MemoryError(
+            f"Out of memory processing tile {tile_name} ({h}×{w}, {bands} bands, ~{mb:.0f} MB). "
+            f"Reduce tile size in Performance settings."
+        )
     predicted_raster   = labels.reshape(h_exp, w_exp)
 
     # Smoothing on the expanded area -> boundary pixels get full context.
@@ -1980,6 +1993,8 @@ def _classify_tile_worker(args: tuple) -> str:
     # Crop back to original tile dimensions.
     predicted_raster = predicted_raster[off_row:off_row + height, off_col:off_col + width]
     tile_data_crop   = tile_data[:, off_row:off_row + height, off_col:off_col + width]
+    del tile_data                           # full (padded) tile no longer needed
+    gc.collect()
 
     # Post-processing – same steps as the non-tiled path for coherent output.
     classes_list = extra.get("classes", None)
@@ -2002,6 +2017,8 @@ def _classify_tile_worker(args: tuple) -> str:
         write_profile.update(count=3, dtype="uint8")
     with rasterio.open(output_path_obj, 'w', **write_profile) as dst:
         dst.write(rgb)
+    del rgb, tile_data_crop, predicted_raster
+    gc.collect()
 
     return str(output_path_obj)
 
@@ -2627,7 +2644,9 @@ def classify_and_export(
         train_norm = scaler.transform(train_px)
         kmeans = _make_kmeans(n_clusters)
         kmeans.fit(train_norm)
-        print(f"  [OK] {'GPU' if _GPU_AVAILABLE else 'CPU'} KMeans fitted on {len(train_px):,} pixels")
+        del train_norm, train_px
+        gc.collect()
+        print(f"  [OK] KMeans fitted [{_ACCEL_ENGINE}] on {len(pixel_features):,} pixels")
 
     mea_mapping: List[Dict[str, object]] | None = None
     scene_mea_prior: Dict[str, float] | None = None
