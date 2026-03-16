@@ -6,28 +6,28 @@ Bundles:
   - FastAPI backend (backend/app/main.py + core.py)
   - Built React frontend (web_app/dist -> web_app_dist inside exe)
   - All geospatial libraries (rasterio, fiona, pyproj, shapely, geopandas)
-  - faiss with GPU support bundled directly — NO runtime pip install needed.
-    Works offline.  On GPU machines uses faiss-gpu; falls back to CPU automatically.
+  - faiss-cpu (always bundled — 5-8x faster KMeans than sklearn, fully offline)
   - uvicorn + aiofiles for serving
 
 Build steps:
-  1. Activate venv:         .venv\\Scripts\\Activate.ps1
-  2. Install faiss-gpu:     pip uninstall faiss-cpu -y
-                            pip install faiss-gpu-cu12   (or faiss-gpu-cu11 for CUDA 11)
-  3. Install other deps:    pip install -r backend/requirements.txt aiofiles pyinstaller pynvml
-  4. Build frontend:        cd web_app && npm run build && cd ..
-  5. Build exe:             pyinstaller WebApp.spec --noconfirm
+  1. Activate venv:      .venv\\Scripts\\Activate.ps1
+  2. Install deps:       pip install -r backend/requirements.txt aiofiles pyinstaller pynvml
+                         pip install faiss-cpu
+  3. Build frontend:     cd web_app && npm run build && cd ..
+  4. Build exe:          pyinstaller WebApp.spec --noconfirm
 
 Output: dist/ClassificationWebApp.exe
 
 GPU note:
-  faiss-gpu-cu12 bundles its own CUDA runtime DLLs so the EXE works on any
-  machine — no separate CUDA toolkit installation required.
-  On CPU-only machines the app automatically uses faiss in CPU mode (same package).
+  faiss-gpu is NOT available via pip for modern CUDA versions.
+  It can be installed via conda for dev use:
+    conda install -c pytorch faiss-gpu cudatoolkit=11.8
+  The EXE ships faiss-cpu which gives fast KMeans on all machines.
+  If faiss-gpu is importable at runtime (conda env), it is used automatically.
 """
 import os
 import sys
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules, collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 datas = []
 hiddenimports = []
@@ -47,14 +47,10 @@ hiddenimports += [
     'fiona._shim',
 ]
 
-# ── faiss (GPU + CPU — fully bundled, no runtime install needed) ───────────
-# Install faiss-gpu-cu12 (or faiss-gpu-cu11) in .venv before building.
-# faiss-gpu includes both GPU and CPU support in one package.
-# collect_dynamic_libs picks up CUDA DLLs vendored inside the wheel.
+# ── faiss-cpu (always bundled — fast CPU KMeans, fully offline) ────────────
 try:
     hiddenimports += collect_submodules('faiss')
     datas         += collect_data_files('faiss')
-    binaries      += collect_dynamic_libs('faiss')
 except Exception:
     pass  # faiss not installed — app falls back to sklearn at runtime
 

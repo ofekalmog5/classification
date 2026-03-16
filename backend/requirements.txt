@@ -9,5 +9,5 @@ rasterio
 geopandas
 shapely
 aiofiles
-faiss-cpu        # KMeans acceleration (3-8x faster); swap for faiss-gpu if CUDA is available
+faiss-cpu        # KMeans acceleration (3-8x faster than sklearn). For GPU: conda install -c pytorch faiss-gpu cudatoolkit=11.8
 pynvml           # GPU detection (optional, gracefully skipped if missing)
