@@ -6,24 +6,26 @@ Bundles:
   - FastAPI backend (backend/app/main.py + core.py)
   - Built React frontend (web_app/dist -> web_app_dist inside exe)
   - All geospatial libraries (rasterio, fiona, pyproj, shapely, geopandas)
-  - faiss-cpu (always bundled — 5-8x faster KMeans than sklearn, fully offline)
+  - faiss-cpu (always bundled — 3-8x faster KMeans than sklearn, fully offline)
+  - CuPy GPU KMeans (bundled automatically if cupy-cuda12x is installed in venv)
   - uvicorn + aiofiles for serving
 
 Build steps:
-  1. Activate venv:      .venv\\Scripts\\Activate.ps1
-  2. Install deps:       pip install -r backend/requirements.txt aiofiles pyinstaller pynvml
-                         pip install faiss-cpu
-  3. Build frontend:     cd web_app && npm run build && cd ..
-  4. Build exe:          pyinstaller WebApp.spec --noconfirm
+  1. Activate venv:       .venv\\Scripts\\Activate.ps1
+  2. Install base deps:   pip install -r backend/requirements.txt aiofiles pyinstaller pynvml
+  3. GPU support          pip install -r backend/requirements-gpu.txt
+     (RTX A4000/30xx/40xx — no CUDA Toolkit needed, ~700 MB nvidia-* DLL packages)
+  4. Build frontend:      cd web_app && npm run build && cd ..
+  5. Build exe:           pyinstaller WebApp.spec --noconfirm
 
 Output: dist/ClassificationWebApp.exe
 
 GPU note:
-  faiss-gpu is NOT available via pip for modern CUDA versions.
-  It can be installed via conda for dev use:
+  CuPy (cupy-cuda12x + nvidia-*-cu12) gives GPU KMeans on Windows without conda.
+  Works on RTX A4000, RTX 30xx/40xx (Ampere/Ada, compute cap >= 8.6, driver >= 520).
+  The EXE auto-bundles CuPy if installed; falls back to faiss-cpu on CPU-only machines.
+  For faiss-gpu (even faster, conda only):
     conda install -c pytorch faiss-gpu cudatoolkit=11.8
-  The EXE ships faiss-cpu which gives fast KMeans on all machines.
-  If faiss-gpu is importable at runtime (conda env), it is used automatically.
 """
 import os
 import sys

@@ -1,0 +1,22 @@
+# GPU acceleration for KMeans — no conda, no CUDA Toolkit install needed.
+#
+# Tested on: NVIDIA RTX A4000 / RTX 3060 (Ampere, compute cap 8.6, CUDA 12.x/13.x drivers)
+# Also works on: RTX 20xx/30xx/40xx, Quadro RTX, A-series workstation GPUs with driver >= 520
+#
+# Install:
+#   pip install -r backend/requirements-gpu.txt
+#
+# After install, restart the backend — the progress bar will show "Engine: GPU (cupy)".
+#
+# ── CuPy GPU arrays ──────────────────────────────────────────────────────────
+# cupy-cuda12x covers CUDA 12.x AND 13.x drivers (RTX A4000, RTX 3060, RTX 40xx etc.)
+# Switch to cupy-cuda11x only if your driver reports "CUDA Version: 11.x" in nvidia-smi.
+cupy-cuda12x
+
+# ── CUDA runtime DLLs (replaces full CUDA Toolkit — only what CuPy needs) ───
+# These are official NVIDIA packages from PyPI (~700 MB total).
+# They supply cublas64_12.dll, nvrtc64_120_0.dll, curand64_10.dll, cudart64_12.dll.
+nvidia-cuda-runtime-cu12
+nvidia-cublas-cu12
+nvidia-cuda-nvrtc-cu12
+nvidia-curand-cu12
