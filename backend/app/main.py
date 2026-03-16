@@ -27,8 +27,7 @@ from queue import Queue, Empty
 from .core import classify as run_classify
 from .core import classify_and_export as run_classify_and_export
 from .core import rasterize_vectors_onto_classification as run_rasterize_vectors
-from .core import apply_road_object_removal as run_road_object_removal
-from .core import train_kmeans_model, build_shared_color_table
+from .core import train_kmeans_model, build_shared_color_table, suggest_tile_size
 
 # ─── SSE progress streaming infrastructure ───────────────────────────────
 
@@ -45,12 +44,11 @@ _PHASE_WEIGHTS: Dict[str, float] = {
     "Pixel assignment": 10,
     "Classifying tiles": 30,
     "Shadow detection": 2,
-    "Post-processing": 22,      # includes morphological road cleanup
+    "Post-processing": 22,
     "Saving output": 13,
-    # Step 2 / Step 3 phases
+    # Step 2 phases
     "Loading classified raster": 5,
     "Converting to label raster": 10,
-    "Removing road objects": 50,
     "Saving result": 15,
     # Batch phases
     "Training shared model": 15,
@@ -63,7 +61,6 @@ _PIPELINE_TOTALS: Dict[str, float] = {
     "full": 180,   # step1 + step2
     "mea": 180,
     "step2": 80,
-    "step3": 80,
 }
 
 
@@ -335,6 +332,11 @@ def classify_batch(request: BatchClassifyRequest) -> dict:
     vectors_raw = [layer.model_dump() for layer in request.vectorLayers]
     ff = request.featureFlags.model_dump()
     has_vectors = len(vectors_raw) > 0
+    print(f"  has_vectors={has_vectors}, vectors_raw count={len(vectors_raw)}")
+    if vectors_raw:
+        for _dv in vectors_raw:
+            print(f"  vector: id={_dv.get('id')}, classId={_dv.get('classId')}, filePath={_dv.get('filePath')}")
+    import sys; sys.stdout.flush()
 
     try:
         # ── Phase 1: Train shared model ──
@@ -421,20 +423,32 @@ def classify_batch(request: BatchClassifyRequest) -> dict:
 
         # ── Phase 3: Rasterize vectors onto ALL classified outputs ──
         if has_vectors and classified_outputs:
+            import copy, sys
             n_vec = len(classified_outputs)
             print(f"\n[Batch] Phase 3: Rasterizing vectors onto {n_vec} classified image(s)")
+            print(f"  vectors_raw count={len(vectors_raw)}, classes_raw count={len(classes_raw)}")
+            for _dv in vectors_raw:
+                print(f"  vector: filePath={_dv.get('filePath')}, classId={_dv.get('classId')}, exists={Path(_dv.get('filePath','')).exists()}")
+            sys.stdout.flush()
             for vi, (rpath, classif_output) in enumerate(classified_outputs):
                 fname = Path(rpath).name
                 if tracker:
                     tracker(f"Rasterizing vectors {fname}", vi, n_vec)
                 print(f"\n[Batch][Vec] ({vi+1}/{n_vec}) {fname}")
+                print(f"  classif_output={classif_output}")
+                print(f"  classif_output exists={Path(classif_output).exists()}")
+                sys.stdout.flush()
                 try:
                     _classif_path = Path(classif_output)
                     _vec_dir = _classif_path.parent / "with_vectors"
                     _vec_dir.mkdir(parents=True, exist_ok=True)
+                    print(f"  _vec_dir={_vec_dir}, exists={_vec_dir.exists()}")
+                    # Deep copy vectors_raw so mutations from one iteration
+                    # don't affect the next.
+                    _vectors_copy = copy.deepcopy(vectors_raw)
                     vec_result = run_rasterize_vectors(
                         classification_path=classif_output,
-                        vector_layers=vectors_raw,
+                        vector_layers=_vectors_copy,
                         classes=classes_raw,
                         output_path=str(_vec_dir),
                         raster_stem_hint=Path(rpath).stem,
@@ -446,10 +460,15 @@ def classify_batch(request: BatchClassifyRequest) -> dict:
                         max_threads=request.maxThreads,
                         progress_callback=tracker,
                     )
+                    print(f"  vec_result={vec_result}")
+                    sys.stdout.flush()
                     if vec_result.get("status") == "ok":
                         vec_op = vec_result.get("outputPath", "")
                         if vec_op:
                             all_output_paths.append(str(vec_op))
+                            # Verify the file was actually written
+                            if not Path(vec_op).exists():
+                                print(f"  [WARN] outputPath={vec_op} does NOT exist on disk!")
                         vec_tiles = vec_result.get("tileOutputs")
                         if vec_tiles:
                             all_tile_outputs.extend(vec_tiles)
@@ -459,10 +478,25 @@ def classify_batch(request: BatchClassifyRequest) -> dict:
                         print(f"  [WARN] Vector rasterize failed: {vec_result.get('message')}")
                         errors.append((rpath, f"vector rasterize: {vec_result.get('message', 'unknown')}"))
                 except Exception as e:
+                    import traceback as _tb
                     print(f"  [ERROR] Vector rasterize: {e}")
+                    _tb.print_exc()
                     errors.append((rpath, f"vector rasterize: {e}"))
+                sys.stdout.flush()
             if tracker:
                 tracker(f"Rasterizing vectors", n_vec, n_vec)
+            # List all with_vectors directories for debugging
+            for _rp, _co in classified_outputs:
+                _vd = Path(_co).parent / "with_vectors"
+                if _vd.exists():
+                    _files = list(_vd.iterdir())
+                    print(f"  [DEBUG] {_vd} contains {len(_files)} files: {[f.name for f in _files]}")
+                else:
+                    print(f"  [DEBUG] {_vd} does NOT exist")
+            sys.stdout.flush()
+        elif has_vectors and not classified_outputs:
+            print(f"\n[Batch] Phase 3 SKIPPED: has_vectors={has_vectors} but classified_outputs is EMPTY")
+            sys.stdout.flush()
 
         ok_count = sum(1 for r in all_results if r.get("status") == "ok")
         return {
@@ -522,29 +556,22 @@ def classify_step2(request: ClassifyStep2Request) -> dict:
             tracker.finish()
 
 
-# ─── Step 3: Remove road objects ─────────────────────────────────────────
+# ─── Suggest tile size ───────────────────────────────────────────────────
 
 
-class RemoveRoadObjectsRequest(BaseModel):
-    classificationPath: str
-    taskId: str | None = None
+class SuggestTileSizeRequest(BaseModel):
+    rasterPath: str
+    workers: int = 4
 
 
-@app.post("/remove-road-objects")
-def remove_road_objects(request: RemoveRoadObjectsRequest) -> dict:
-    """Step 3: Remove small objects enclosed by asphalt."""
-    tracker = _ProgressTracker(request.taskId, "step3") if request.taskId else None
+@app.post("/suggest-tile-size")
+def suggest_tile_size_endpoint(request: SuggestTileSizeRequest) -> dict:
+    """Return the memory-safe suggested tile side length for a raster."""
     try:
-        out_path = run_road_object_removal(
-            request.classificationPath,
-            progress_callback=tracker,
-        )
-        return {"status": "ok", "outputPath": out_path}
+        side = suggest_tile_size(request.rasterPath, workers=max(1, request.workers))
+        return {"side": side, "label": f"{side}×{side}"}
     except Exception as e:
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-    finally:
-        if tracker:
-            tracker.finish()
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 # ─── File/folder browser (for web UI) ────────────────────────────────────

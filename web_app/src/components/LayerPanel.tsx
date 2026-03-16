@@ -126,6 +126,16 @@ export default function LayerPanel() {
                 </button>
               </>
             )}
+            <button
+              className="text-[9px] px-1.5 py-0.5 rounded bg-red-900/60 text-red-300 hover:bg-red-800/70"
+              onClick={() => {
+                setSelectedIds(new Set());
+                dispatch({ type: "REMOVE_ALL_MAP_LAYERS" });
+              }}
+              title="Close all layers"
+            >
+              ✕ All
+            </button>
           </div>
         )}
       </div>

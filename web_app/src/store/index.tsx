@@ -74,6 +74,7 @@ export type Action =
   | { type: "REMOVE_FROM_GROUP"; layerId: string; groupId: string }
   | { type: "SET_ALL_LAYERS_VISIBLE"; visible: boolean }
   | { type: "SET_LAYERS_VISIBLE"; ids: string[]; visible: boolean }
+  | { type: "REMOVE_ALL_MAP_LAYERS" }
   // Run state
   | { type: "SET_RUNNING"; step: PipelineStep }
   | { type: "SET_PROGRESS"; progress: ProgressEvent | null }
@@ -229,6 +230,13 @@ function reducer(state: AppState, action: Action): AppState {
         }),
       };
     }
+
+    case "REMOVE_ALL_MAP_LAYERS":
+      return {
+        ...state,
+        mapLayers: [],
+        layerGroups: state.layerGroups.map((g) => ({ ...g, layerIds: [] })),
+      };
 
     case "SET_ALL_LAYERS_VISIBLE":
       return {
