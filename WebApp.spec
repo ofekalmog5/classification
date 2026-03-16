@@ -16,41 +16,14 @@ Build steps:
 
 Output: dist/ClassificationWebApp.exe
 """
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules, collect_all
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 datas = []
-binaries = []
 hiddenimports = []
 
-# ── pydantic v2 / pydantic_core (has a native .pyd extension) ─────────────
-_d, _b, _h = collect_all('pydantic_core')
-datas     += _d
-binaries  += _b
-hiddenimports += _h
-hiddenimports += collect_submodules('pydantic')
-hiddenimports += collect_submodules('pydantic_core')
-
 # ── Geospatial library data files (GDAL drivers, PROJ data, etc.) ─────────
-for pkg in ['rasterio', 'pyproj', 'shapely', 'geopandas']:
+for pkg in ['rasterio', 'fiona', 'pyproj', 'shapely', 'geopandas']:
     datas += collect_data_files(pkg)
-
-# ── pyogrio: geopandas file-I/O engine (replaces fiona) ──────────────────
-# collect_all grabs GDAL/PROJ data files and submodules
-_d, _b, _h = collect_all('pyogrio')
-datas         += _d
-binaries      += _b
-hiddenimports += _h
-
-# pyogrio.libs/ contains GDAL, PROJ, GEOS and other native DLLs that
-# collect_all does NOT pick up automatically.  Bundle them into the
-# top-level of the exe so they are on the DLL search path at runtime.
-import os as _os, glob as _glob
-_pyogrio_libs = _os.path.join(
-    _os.path.dirname(__import__('pyogrio').__file__), '..', 'pyogrio.libs')
-_pyogrio_libs = _os.path.normpath(_pyogrio_libs)
-if _os.path.isdir(_pyogrio_libs):
-    for _dll in _glob.glob(_os.path.join(_pyogrio_libs, '*.dll')):
-        binaries.append((_dll, '.'))
 
 # ── Hidden imports for geo + ML packages (dynamic loaders) ────────────────
 hiddenimports += collect_submodules('rasterio')
@@ -59,6 +32,7 @@ hiddenimports += collect_submodules('sklearn')
 hiddenimports += [
     'rasterio.sample',
     'rasterio._shim',
+    'fiona._shim',
 ]
 
 # ── uvicorn uses importlib to load its components dynamically ─────────────
@@ -91,12 +65,12 @@ datas += [('web_app/dist', 'web_app_dist')]
 a = Analysis(
     ['server_launcher.py'],
     pathex=['.'],
-    binaries=binaries,
+    binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=['runtime_hook_pyogrio.py'],
+    runtime_hooks=[],
     excludes=[],
     noarchive=False,
     optimize=0,

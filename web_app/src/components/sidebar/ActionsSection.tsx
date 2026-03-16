@@ -125,52 +125,6 @@ export default function ActionsSection() {
     [dispatch, addResultsToGroup],
   );
 
-  /** After classification, rasterize attached vectors onto the _classified output */
-  const rasterizeVectorsOnResult = async (
-    classifiedPath: string,
-    label: string,
-  ): Promise<string | null> => {
-    if (!state.vectorLayers.length) return null;
-    dispatch({ type: "SET_STATUS", text: `${label}: Rasterizing vectors…` });
-    const taskId = generateTaskId();
-    const stopProgress = startProgressStream(taskId, (evt) => {
-      dispatch({ type: "SET_PROGRESS", progress: evt });
-    });
-    try {
-      const result = await runStep2({
-        classificationPath: classifiedPath,
-        vectorLayers: state.vectorLayers,
-        classes: state.classes,
-        outputPath: state.outputPath || undefined,
-        taskId,
-        tileMode: state.performance.useTiling,
-        tileMaxPixels: tileSizeToPixels(state.performance.tileSize),
-        tileWorkers: state.performance.tileWorkers,
-        maxThreads: state.performance.useMaxThreads
-          ? navigator.hardwareConcurrency ?? null
-          : null,
-      });
-      if (result.status === "ok") {
-        const outPath = result.outputPath || "";
-        if (outPath) {
-          dispatch({ type: "SET_LAST_RESULT_PATH", path: outPath });
-          const outputPaths = result.tileOutputs?.length
-            ? result.tileOutputs
-            : [outPath];
-          addResultsToGroup(`${label} (vectors)`, outputPaths);
-        }
-        return outPath || null;
-      }
-      return null;
-    } catch (e: any) {
-      dispatch({ type: "SET_STATUS", text: `${label} vector rasterize error: ${e.message}` });
-      return null;
-    } finally {
-      stopProgress();
-      dispatch({ type: "SET_PROGRESS", progress: null });
-    }
-  };
-
   const handleStep1 = async () => {
     const rasterFiles = getRasterFiles();
     if (rasterFiles.length === 0) {
@@ -186,7 +140,6 @@ export default function ActionsSection() {
     dispatch({ type: "SET_PROGRESS", progress: null });
 
     const params = commonParams();
-    const hasVectors = state.vectorLayers.length > 0;
 
     // Use batch endpoint (shared model) when multiple files
     if (rasterFiles.length > 1) {
@@ -196,10 +149,9 @@ export default function ActionsSection() {
         dispatch({ type: "SET_PROGRESS", progress: evt });
       });
       try {
-        // When vectors are attached, pass them to batch so it rasterizes onto each classified output
         const result = await runBatchClassify({
           rasterPaths: rasterFiles,
-          vectorLayers: hasVectors ? state.vectorLayers : [],
+          vectorLayers: [],
           taskId,
           ...params,
         });
@@ -222,14 +174,6 @@ export default function ActionsSection() {
       try {
         const result = await runStep1({ rasterPath: file, taskId, ...params });
         handleSingleResult(result, "Step 1");
-
-        // After Step 1 classification, rasterize attached vectors onto the _classified output
-        if (hasVectors && result.status === "ok") {
-          const classifiedPath = result.outputPath || result.saved?.[0] || "";
-          if (classifiedPath) {
-            await rasterizeVectorsOnResult(classifiedPath, "Step 1");
-          }
-        }
       } catch (e: any) {
         dispatch({ type: "SET_STATUS", text: `Step 1 error: ${e.message}` });
       } finally {
@@ -237,8 +181,6 @@ export default function ActionsSection() {
         dispatch({ type: "SET_PROGRESS", progress: null });
       }
     }
-    const elapsed = formatElapsed(Date.now() - runStartRef.current);
-    dispatch({ type: "SET_STATUS", text: `Step 1 complete ✓ (${elapsed})` });
     dispatch({ type: "SET_RUNNING", step: "idle" });
   };
 
@@ -293,14 +235,6 @@ export default function ActionsSection() {
         taskId,
       });
       handleSingleResult(result, "Step 3");
-
-      // After road object removal, rasterize attached vectors onto the cleaned output
-      if (state.vectorLayers.length > 0 && result.status === "ok") {
-        const cleanedPath = result.outputPath || "";
-        if (cleanedPath) {
-          await rasterizeVectorsOnResult(cleanedPath, "Step 3");
-        }
-      }
     } catch (e: any) {
       dispatch({ type: "SET_STATUS", text: `Step 3 error: ${e.message}` });
     } finally {
@@ -325,7 +259,6 @@ export default function ActionsSection() {
     dispatch({ type: "SET_PROGRESS", progress: null });
 
     const params = commonParams();
-    const hasVectors = state.vectorLayers.length > 0;
 
     if (rasterFiles.length > 1) {
       dispatch({ type: "SET_STATUS", text: `Full Pipeline: Training shared model on ${rasterFiles.length} files…` });
@@ -334,10 +267,9 @@ export default function ActionsSection() {
         dispatch({ type: "SET_PROGRESS", progress: evt });
       });
       try {
-        // Always classify first, then rasterize vectors explicitly
         const result = await runBatchClassify({
           rasterPaths: rasterFiles,
-          vectorLayers: hasVectors ? state.vectorLayers : [],
+          vectorLayers: state.vectorLayers,
           taskId,
           ...params,
         });
@@ -351,23 +283,19 @@ export default function ActionsSection() {
     } else {
       const file = rasterFiles[0];
       const fileName = file.split(/[\\/]/).pop() || file;
-      dispatch({ type: "SET_STATUS", text: `Full Pipeline: Classifying ${fileName}…` });
+      dispatch({ type: "SET_STATUS", text: `Full Pipeline: ${fileName}…` });
       const taskId = generateTaskId();
       const stopProgress = startProgressStream(taskId, (evt) => {
         dispatch({ type: "SET_PROGRESS", progress: evt });
       });
       try {
-        // Step 1: Classify only
-        const result = await runStep1({ rasterPath: file, taskId, ...params });
+        const result = await runFullPipeline({
+          rasterPath: file,
+          vectorLayers: state.vectorLayers,
+          taskId,
+          ...params,
+        });
         handleSingleResult(result, "Full Pipeline");
-
-        // Step 2: Rasterize vectors onto the classified output
-        if (hasVectors && result.status === "ok") {
-          const classifiedPath = result.outputPath || result.saved?.[0] || "";
-          if (classifiedPath) {
-            await rasterizeVectorsOnResult(classifiedPath, "Full Pipeline");
-          }
-        }
       } catch (e: any) {
         dispatch({ type: "SET_STATUS", text: `Full pipeline error: ${e.message}` });
       } finally {
@@ -375,8 +303,6 @@ export default function ActionsSection() {
         dispatch({ type: "SET_PROGRESS", progress: null });
       }
     }
-    const elapsed = formatElapsed(Date.now() - runStartRef.current);
-    dispatch({ type: "SET_STATUS", text: `Full Pipeline complete ✓ (${elapsed})` });
     dispatch({ type: "SET_RUNNING", step: "idle" });
   };
 
@@ -389,24 +315,12 @@ export default function ActionsSection() {
       }
       rasterFiles.push(state.rasterPath);
     }
-    // Capture vectors BEFORE overwriting classes with MEA preset
-    const vectorLayers = [...state.vectorLayers];
-    const hasVectors = vectorLayers.length > 0;
-    console.log(`[MEA] vectorLayers count: ${vectorLayers.length}, hasVectors: ${hasVectors}`);
-    if (hasVectors) {
-      vectorLayers.forEach((v, i) => console.log(`[MEA] vector[${i}]: classId=${v.classId}, filePath=${v.filePath}`));
-    }
-
     dispatch({ type: "SET_CLASSES", classes: MEA_CLASSES });
     dispatch({ type: "SET_CLASS_COUNT", count: MEA_CLASSES.length });
     dispatch({ type: "SET_CLASSIFICATION", settings: { exportFormat: "img" } });
     runStartRef.current = Date.now();
     dispatch({ type: "SET_RUNNING", step: "mea" });
     dispatch({ type: "SET_PROGRESS", progress: null });
-
-    const maxThreads = state.performance.useMaxThreads
-      ? navigator.hardwareConcurrency ?? null
-      : null;
 
     if (rasterFiles.length > 1) {
       dispatch({ type: "SET_STATUS", text: `MEA: Training shared model on ${rasterFiles.length} files…` });
@@ -415,11 +329,13 @@ export default function ActionsSection() {
         dispatch({ type: "SET_PROGRESS", progress: evt });
       });
       try {
-        console.log(`[MEA batch] Sending ${hasVectors ? vectorLayers.length : 0} vectors to batch endpoint`);
+        const maxThreads = state.performance.useMaxThreads
+          ? navigator.hardwareConcurrency ?? null
+          : null;
         const result = await runBatchClassify({
           rasterPaths: rasterFiles,
           classes: MEA_CLASSES,
-          vectorLayers: hasVectors ? vectorLayers : [],
+          vectorLayers: state.vectorLayers,
           featureFlags: state.featureFlags,
           outputPath: state.outputPath || undefined,
           exportFormat: "img",
@@ -440,68 +356,32 @@ export default function ActionsSection() {
     } else {
       const file = rasterFiles[0];
       const fileName = file.split(/[\\/]/).pop() || file;
-      dispatch({ type: "SET_STATUS", text: `MEA: Classifying ${fileName}…` });
+      dispatch({ type: "SET_STATUS", text: `MEA: ${fileName}…` });
       const taskId = generateTaskId();
       const stopProgress = startProgressStream(taskId, (evt) => {
         dispatch({ type: "SET_PROGRESS", progress: evt });
       });
       try {
-        // Always run Step 1 (classify only), then rasterize vectors explicitly
-        const result = await runStep1({
+        const params = {
           rasterPath: file,
           classes: MEA_CLASSES,
+          vectorLayers: state.vectorLayers,
           featureFlags: state.featureFlags,
           outputPath: state.outputPath || undefined,
-          exportFormat: "img",
+          exportFormat: "img" as const,
           taskId,
           tileMode: state.performance.useTiling,
           tileMaxPixels: tileSizeToPixels(state.performance.tileSize),
           tileWorkers: state.performance.tileWorkers,
           detectShadows: state.classification.detectShadows,
-          maxThreads,
-        });
+          maxThreads: state.performance.useMaxThreads
+            ? navigator.hardwareConcurrency ?? null
+            : null,
+        };
+        const result = state.vectorLayers.length
+          ? await runFullPipeline(params)
+          : await runStep1(params);
         handleSingleResult(result, "MEA");
-
-        // After MEA classification, rasterize attached vectors onto the _classified output
-        if (hasVectors && result.status === "ok") {
-          const classifiedPath = result.outputPath || result.saved?.[0] || "";
-          if (classifiedPath) {
-            // Use MEA_CLASSES for color resolution (not state.classes which may be stale)
-            dispatch({ type: "SET_STATUS", text: "MEA: Rasterizing vectors…" });
-            const vecTaskId = generateTaskId();
-            const stopVecProgress = startProgressStream(vecTaskId, (evt) => {
-              dispatch({ type: "SET_PROGRESS", progress: evt });
-            });
-            try {
-              const vecResult = await runStep2({
-                classificationPath: classifiedPath,
-                vectorLayers: vectorLayers,
-                classes: MEA_CLASSES,
-                outputPath: state.outputPath || undefined,
-                taskId: vecTaskId,
-                tileMode: state.performance.useTiling,
-                tileMaxPixels: tileSizeToPixels(state.performance.tileSize),
-                tileWorkers: state.performance.tileWorkers,
-                maxThreads,
-              });
-              if (vecResult.status === "ok") {
-                const outPath = vecResult.outputPath || "";
-                if (outPath) {
-                  dispatch({ type: "SET_LAST_RESULT_PATH", path: outPath });
-                  const outputPaths = vecResult.tileOutputs?.length
-                    ? vecResult.tileOutputs
-                    : [outPath];
-                  addResultsToGroup("MEA (vectors)", outputPaths);
-                }
-              }
-            } catch (e: any) {
-              dispatch({ type: "SET_STATUS", text: `MEA vector rasterize error: ${e.message}` });
-            } finally {
-              stopVecProgress();
-              dispatch({ type: "SET_PROGRESS", progress: null });
-            }
-          }
-        }
       } catch (e: any) {
         dispatch({ type: "SET_STATUS", text: `MEA error: ${e.message}` });
       } finally {
@@ -509,8 +389,6 @@ export default function ActionsSection() {
         dispatch({ type: "SET_PROGRESS", progress: null });
       }
     }
-    const elapsed = formatElapsed(Date.now() - runStartRef.current);
-    dispatch({ type: "SET_STATUS", text: `MEA complete ✓ (${elapsed})` });
     dispatch({ type: "SET_RUNNING", step: "idle" });
   };
 
