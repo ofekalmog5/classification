@@ -53,19 +53,21 @@ export default function PerformanceSection() {
       )}
       <ToggleRow
         label="Tile processing"
+        id="perf-tiling"
         checked={performance.useTiling}
         onChange={(v) => set({ useTiling: v })}
       />
 
       <div className="flex items-center gap-2 mt-1">
-        <label className="text-xs text-surface-400 w-20">Tile size</label>
+        <label htmlFor="perf-tile-size" className="text-xs text-surface-400 w-20">Tile size</label>
         <select
+          id="perf-tile-size"
+          name="perf-tile-size"
           className="input flex-1 text-xs"
           value={performance.tileSize}
           onChange={(e) => set({ tileSize: e.target.value as TileSize })}
         >
           {TILE_SIZES.map((s) => {
-            // Hide sizes larger than the suggested safe size
             const safe = performance.suggestedTileSide;
             if (safe && s !== "Auto") {
               const side = parseInt(s);
@@ -81,6 +83,7 @@ export default function PerformanceSection() {
       </div>
 
       <NumberRow
+        id="perf-tile-workers"
         label="Tile workers"
         value={performance.tileWorkers}
         min={1}
@@ -89,6 +92,7 @@ export default function PerformanceSection() {
       />
 
       <NumberRow
+        id="perf-image-workers"
         label="Image workers"
         value={performance.imageWorkers}
         min={1}
@@ -97,6 +101,7 @@ export default function PerformanceSection() {
       />
 
       <ToggleRow
+        id="perf-max-threads"
         label="Max threads"
         checked={performance.useMaxThreads}
         onChange={(v) => set({ useMaxThreads: v })}
@@ -108,18 +113,22 @@ export default function PerformanceSection() {
 /* ── Reusable mini-components ────────────────────────────────────── */
 
 function ToggleRow({
+  id,
   label,
   checked,
   onChange,
 }: {
+  id: string;
   label: string;
   checked: boolean;
   onChange: (v: boolean) => void;
 }) {
   return (
     <div className="flex items-center justify-between py-0.5">
-      <span className="text-xs text-surface-400">{label}</span>
+      <label htmlFor={id} className="text-xs text-surface-400 cursor-pointer">{label}</label>
       <button
+        id={id}
+        name={id}
         className={`toggle-switch ${checked ? "active" : "inactive"}`}
         onClick={() => onChange(!checked)}
       >
@@ -130,12 +139,14 @@ function ToggleRow({
 }
 
 function NumberRow({
+  id,
   label,
   value,
   min,
   max,
   onChange,
 }: {
+  id: string;
   label: string;
   value: number;
   min: number;
@@ -144,8 +155,10 @@ function NumberRow({
 }) {
   return (
     <div className="flex items-center gap-2 mt-0.5">
-      <label className="text-xs text-surface-400 w-20">{label}</label>
+      <label htmlFor={id} className="text-xs text-surface-400 w-20">{label}</label>
       <input
+        id={id}
+        name={id}
         type="number"
         className="input flex-1 text-xs text-center"
         min={min}
