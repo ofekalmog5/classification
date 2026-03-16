@@ -128,6 +128,63 @@ from skimage.measure import label as sk_label
 from sklearn.cluster import KMeans, MiniBatchKMeans
 from sklearn.preprocessing import StandardScaler
 
+# ─── GPU acceleration (optional — requires RAPIDS cuML) ───────────────────────
+
+def _detect_gpu() -> tuple:
+    """Detect NVIDIA GPU via pynvml or nvidia-smi.  Returns (available, info_str)."""
+    # Method 1: pynvml (most reliable, gives VRAM info)
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        count = pynvml.nvmlDeviceGetCount()
+        if count > 0:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            raw = pynvml.nvmlDeviceGetName(handle)
+            name = raw.decode() if isinstance(raw, bytes) else raw
+            mem  = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            free_mb = mem.free // (1024 * 1024)
+            return True, f"{name} ({free_mb} MB free VRAM)"
+    except Exception:
+        pass
+    # Method 2: nvidia-smi subprocess
+    try:
+        import subprocess
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.free", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return True, r.stdout.strip().split("\n")[0].strip()
+    except Exception:
+        pass
+    return False, "No NVIDIA GPU detected"
+
+
+_GPU_AVAILABLE, _GPU_INFO = _detect_gpu()
+print(f"[GPU] {'Available: ' + _GPU_INFO if _GPU_AVAILABLE else _GPU_INFO}")
+
+
+def _make_kmeans(n_clusters: int, *, mini_batch: bool = True):
+    """Return a KMeans instance — cuML (GPU) when available, sklearn otherwise."""
+    if _GPU_AVAILABLE:
+        try:
+            if mini_batch:
+                from cuml.cluster import MiniBatchKMeans as _CuMBK
+                return _CuMBK(n_clusters=n_clusters, random_state=42,
+                               max_iter=80, batch_size=65536)
+            else:
+                from cuml.cluster import KMeans as _CuKM
+                return _CuKM(n_clusters=n_clusters, random_state=42,
+                              n_init=10, max_iter=300)
+        except Exception as _e:
+            print(f"[GPU] cuML import failed ({_e}), falling back to CPU")
+    # CPU fallback
+    if mini_batch:
+        return MiniBatchKMeans(n_clusters=n_clusters, random_state=42,
+                               n_init=1, max_iter=80, batch_size=65536)
+    return KMeans(n_clusters=n_clusters, random_state=42,
+                  n_init=10, max_iter=300)
+
 # Max pixels sampled for KMeans training (quality is unchanged above ~50k)
 MAX_TRAIN_PIXELS = 100_000
 # Adaptive sampling bounds: PCA-based estimate will clamp to this range.
@@ -2502,9 +2559,9 @@ def classify_and_export(
         else:
             features_normalized = None
         train_norm = scaler.transform(train_px)
-        kmeans = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, n_init=1, max_iter=80, batch_size=65536)
+        kmeans = _make_kmeans(n_clusters)
         kmeans.fit(train_norm)
-        print(f"  [OK] MiniBatchKMeans fitted on {len(train_px):,} pixels")
+        print(f"  [OK] {'GPU' if _GPU_AVAILABLE else 'CPU'} KMeans fitted on {len(train_px):,} pixels")
 
     mea_mapping: List[Dict[str, object]] | None = None
     scene_mea_prior: Dict[str, float] | None = None
@@ -2993,8 +3050,7 @@ def train_kmeans_model(
 
     scaler     = StandardScaler()
     train_norm = scaler.fit_transform(combined)
-    kmeans     = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, n_init=1,
-                                  max_iter=100, batch_size=16384)
+    kmeans     = _make_kmeans(n_clusters)
     kmeans.fit(train_norm)
     print(f"[Training] Shared model ready  -  "
           f"{len(combined):,} px from {len(raster_paths)} raster(s), "
@@ -3585,7 +3641,7 @@ def recommend_cluster_count(
 
     for n in range(lower, upper + 1):
         try:
-            kmeans = KMeans(n_clusters=n, random_state=42, n_init=10, max_iter=300)
+            kmeans = _make_kmeans(n, mini_batch=False)
             labels = kmeans.fit_predict(features_normalized)
 
             sil_sample_size = min(8000, len(features_normalized))

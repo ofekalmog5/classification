@@ -28,6 +28,7 @@ from .core import classify as run_classify
 from .core import classify_and_export as run_classify_and_export
 from .core import rasterize_vectors_onto_classification as run_rasterize_vectors
 from .core import train_kmeans_model, build_shared_color_table, suggest_tile_size
+from .core import _GPU_AVAILABLE, _GPU_INFO
 
 # ─── SSE progress streaming infrastructure ───────────────────────────────
 
@@ -197,6 +198,11 @@ app.add_middleware(
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/gpu-info")
+def gpu_info() -> dict:
+    return {"available": _GPU_AVAILABLE, "info": _GPU_INFO}
 
 
 # ─── SSE progress streaming endpoint ─────────────────────────────────────

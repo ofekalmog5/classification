@@ -1,6 +1,6 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useAppState, useAppDispatch } from "../../store";
-import { suggestTileSize } from "../../api/client";
+import { suggestTileSize, fetchGpuInfo } from "../../api/client";
 import type { TileSize } from "../../types";
 
 const TILE_SIZES: TileSize[] = ["Auto", "256", "512", "1024", "2048", "4096"];
@@ -9,9 +9,15 @@ export default function PerformanceSection() {
   const state = useAppState();
   const { performance } = state;
   const dispatch = useAppDispatch();
+  const [gpu, setGpu] = useState<{ available: boolean; info: string } | null>(null);
 
   const set = (partial: Partial<typeof performance>) =>
     dispatch({ type: "SET_PERFORMANCE", settings: partial });
+
+  // Fetch GPU info once on mount
+  useEffect(() => {
+    fetchGpuInfo().then(setGpu);
+  }, []);
 
   // Resolve first raster-input file path from map layers (or rasterPath fallback)
   const rasterPath =
@@ -39,6 +45,12 @@ export default function PerformanceSection() {
 
   return (
     <SidebarSection title="Performance">
+      {gpu && (
+        <div className={`flex items-center gap-1.5 py-0.5 text-xs ${gpu.available ? "text-emerald-400" : "text-surface-500"}`}>
+          <span>{gpu.available ? "⬡" : "○"}</span>
+          <span title={gpu.info}>{gpu.available ? `GPU: ${gpu.info}` : "CPU only"}</span>
+        </div>
+      )}
       <ToggleRow
         label="Tile processing"
         checked={performance.useTiling}

@@ -167,6 +167,17 @@ export async function runFullPipeline(
   return parseApiResponse<ClassifyResult>(r);
 }
 
+/* ── GPU info ────────────────────────────────────────────────────── */
+export async function fetchGpuInfo(): Promise<{ available: boolean; info: string } | null> {
+  try {
+    const r = await fetch(`${BASE}/gpu-info`);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
 /* ── Suggest tile size ────────────────────────────────────────────── */
 export async function suggestTileSize(rasterPath: string): Promise<number | null> {
   try {
