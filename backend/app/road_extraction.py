@@ -42,11 +42,30 @@ def _load_sam3(device: str = "auto"):
     if _sam_model is not None:
         return _sam_model
 
-    if device == "auto":
+    try:
         import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        raise ImportError(
+            "PyTorch is required for road extraction but is not installed.\n"
+            "Install it with one of the following commands:\n\n"
+            "  GPU (CUDA 12.x, RTX 30xx/40xx):\n"
+            "    pip install torch --index-url https://download.pytorch.org/whl/cu121\n\n"
+            "  CPU only:\n"
+            "    pip install torch --index-url https://download.pytorch.org/whl/cpu\n\n"
+            "After installing torch, also run:\n"
+            "    pip install segment-geospatial"
+        ) from None
 
-    from samgeo import SamGeo3
+    try:
+        from samgeo import SamGeo3
+    except ImportError:
+        raise ImportError(
+            "segment-geospatial is not installed.\n"
+            "Run: pip install segment-geospatial"
+        ) from None
+
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
     _sam_model = SamGeo3(device=device)
     return _sam_model

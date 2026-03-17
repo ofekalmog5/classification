@@ -25,5 +25,10 @@ faiss-cpu        # Fast CPU KMeans (3-8x sklearn). For faiss-gpu: conda install 
 pynvml           # GPU detection (optional, gracefully skipped if missing)
 
 # ── Road extraction via SAM 3 (Segment Anything Model 3) ─────────────────
+# PyTorch must be installed MANUALLY before segment-geospatial (too large for auto-install):
+#   GPU (CUDA 12.x, RTX 30xx/40xx):
+#     pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   CPU only:
+#     pip install torch --index-url https://download.pytorch.org/whl/cpu
 segment-geospatial   # samgeo: SAM 3 text-prompted geospatial segmentation
-opencv-python-headless  # cv2 for morphological post-processing
+opencv-python-headless  # cv2 for morphological post-processing (optional, falls back to scipy)
