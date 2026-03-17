@@ -250,6 +250,15 @@ export function generateTaskId(): string {
   return crypto.randomUUID();
 }
 
+/* ── Cancel a running task ───────────────────────────────────────── */
+export async function cancelTask(taskId: string): Promise<void> {
+  try {
+    await fetch(`${BASE}/cancel/${taskId}`, { method: "POST" });
+  } catch {
+    /* ignore — backend may already have stopped */
+  }
+}
+
 /* ── SSE progress stream ─────────────────────────────────────────── */
 export function startProgressStream(
   taskId: string,

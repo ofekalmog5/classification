@@ -33,6 +33,11 @@ from .core import _ACCEL_ENGINE, _ACCEL_GPU, _ACCEL_GPU_INFO
 # ─── SSE progress streaming infrastructure ───────────────────────────────
 
 _PROGRESS_QUEUES: Dict[str, Queue] = {}
+_CANCEL_FLAGS: Dict[str, bool] = {}
+
+
+class TaskCancelledError(Exception):
+    """Raised when the user cancels a running task."""
 
 # Per-phase weights reflecting typical relative durations.
 # Step 1 phases sum to ~100; other pipelines normalise by total weight.
@@ -76,6 +81,11 @@ class _ProgressTracker:
         _PROGRESS_QUEUES[task_id] = self.queue
 
     def __call__(self, phase: str, done: int, total: int):
+        # Check for user-requested cancellation at every progress update.
+        if _CANCEL_FLAGS.get(self.task_id):
+            _CANCEL_FLAGS.pop(self.task_id, None)
+            raise TaskCancelledError("Task cancelled by user")
+
         if phase != self.current_phase:
             # Entering a new phase -> mark previous as fully complete.
             if self.current_phase is not None:
@@ -100,6 +110,7 @@ class _ProgressTracker:
             import time
             time.sleep(3)
             _PROGRESS_QUEUES.pop(self.task_id, None)
+            _CANCEL_FLAGS.pop(self.task_id, None)
         threading.Thread(target=_cleanup, daemon=True).start()
 
 
@@ -243,6 +254,20 @@ async def progress_sse(task_id: str):
     )
 
 
+# ─── Cancel endpoint ─────────────────────────────────────────────────────
+
+@app.post("/cancel/{task_id}")
+async def cancel_task(task_id: str):
+    """Signal a running task to stop at its next progress checkpoint."""
+    if task_id in _PROGRESS_QUEUES:
+        _CANCEL_FLAGS[task_id] = True
+        return {"status": "ok", "message": "Cancel signal sent"}
+    return JSONResponse(
+        status_code=404,
+        content={"status": "error", "message": "Task not found or already finished"},
+    )
+
+
 # ─── Classify endpoints ──────────────────────────────────────────────────
 
 @app.post("/classify")
@@ -269,6 +294,8 @@ def classify(request: ClassifyRequest) -> dict:
             progress_callback=tracker,
         )
         return result
+    except TaskCancelledError:
+        return JSONResponse(status_code=499, content={"status": "cancelled", "message": "Task cancelled by user"})
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
     finally:
@@ -299,6 +326,8 @@ def classify_step1(request: ClassifyStep1Request) -> dict:
             progress_callback=tracker,
         )
         return result
+    except TaskCancelledError:
+        return JSONResponse(status_code=499, content={"status": "cancelled", "message": "Task cancelled by user"})
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
     finally:
@@ -515,6 +544,8 @@ def classify_batch(request: BatchClassifyRequest) -> dict:
             "errors": errors if errors else None,
             "meaMapping": mea_mapping,
         }
+    except TaskCancelledError:
+        return JSONResponse(status_code=499, content={"status": "cancelled", "message": "Task cancelled by user"})
     except Exception as e:
         import traceback
         # Write full traceback to file (stdout/stderr may fail with charmap on Windows)
@@ -556,6 +587,8 @@ def classify_step2(request: ClassifyStep2Request) -> dict:
             progress_callback=tracker,
         )
         return result
+    except TaskCancelledError:
+        return JSONResponse(status_code=499, content={"status": "cancelled", "message": "Task cancelled by user"})
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
     finally:

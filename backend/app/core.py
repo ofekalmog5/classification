@@ -226,9 +226,18 @@ class _CupyKMeans:
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         import cupy as cp
-        centers = cp.asarray(self.cluster_centers_)
-        return self._assign(cp.asarray(np.ascontiguousarray(X, dtype=np.float32)),
-                            centers).get()
+        try:
+            centers = cp.asarray(self.cluster_centers_)
+            return self._assign(cp.asarray(np.ascontiguousarray(X, dtype=np.float32)),
+                                centers).get()
+        except (cp.cuda.memory.OutOfMemoryError, MemoryError):
+            # GPU VRAM exhausted — fall back to CPU nearest-center.
+            print("  [gpu] predict OOM, falling back to CPU")
+            cp.get_default_memory_pool().free_all_blocks()
+            return _nearest_center_chunked(
+                np.ascontiguousarray(X, dtype=np.float32),
+                self.cluster_centers_.astype(np.float32),
+            )
 
     def fit_predict(self, X: np.ndarray) -> np.ndarray:
         import warnings as _w
@@ -242,30 +251,61 @@ class _CupyKMeans:
         best_centers_np = None
         best_labels_np  = None
 
-        for _attempt in range(max(1, self.n_init)):
-            # Random initialisation (one pass, fast)
-            init_idx = rng.choice(n, self.n_clusters, replace=False)
-            centers  = cp.asarray(X[init_idx], dtype=cp.float32)   # (k, d)
-            X_gpu    = cp.asarray(X)                                # (n, d)
+        try:
+            for _attempt in range(max(1, self.n_init)):
+                # Random initialisation (one pass, fast)
+                init_idx = rng.choice(n, self.n_clusters, replace=False)
+                centers  = cp.asarray(X[init_idx], dtype=cp.float32)   # (k, d)
+                X_gpu    = cp.asarray(X)                                # (n, d)
 
-            for _it in range(self.max_iter):
-                labels  = self._assign(X_gpu, centers)
-                new_c   = self._update(X_gpu, labels, centers, self.n_clusters, d)
-                shift   = float(cp.linalg.norm(new_c - centers))
-                centers = new_c
-                if shift < self.tol:
-                    break
+                for _it in range(self.max_iter):
+                    labels  = self._assign(X_gpu, centers)
+                    new_c   = self._update(X_gpu, labels, centers, self.n_clusters, d)
+                    shift   = float(cp.linalg.norm(new_c - centers))
+                    centers = new_c
+                    if shift < self.tol:
+                        break
 
-            labels   = self._assign(X_gpu, centers)
-            inertia  = float(cp.sum(self._sq_dists_assigned(X_gpu, centers, labels)))
+                labels   = self._assign(X_gpu, centers)
+                inertia  = float(cp.sum(self._sq_dists_assigned(X_gpu, centers, labels)))
 
-            if inertia < best_inertia:
-                best_inertia    = inertia
-                best_centers_np = centers.get()
-                best_labels_np  = labels.get().astype(np.int32)
+                if inertia < best_inertia:
+                    best_inertia    = inertia
+                    best_centers_np = centers.get()
+                    best_labels_np  = labels.get().astype(np.int32)
 
-            del X_gpu, centers, labels
+                del X_gpu, centers, labels
+                cp.get_default_memory_pool().free_all_blocks()
+
+        except (cp.cuda.memory.OutOfMemoryError, MemoryError, Exception) as gpu_err:
+            # GPU ran out of VRAM — fall back to faiss-cpu (fast) or sklearn.
+            print(f"  [gpu] CuPy OOM ({gpu_err}), falling back to CPU…")
+            try:
+                del X_gpu, centers, labels
+            except Exception:
+                pass
             cp.get_default_memory_pool().free_all_blocks()
+            gc.collect()
+            try:
+                # Prefer faiss-cpu: 3-8x faster than sklearn
+                _cpu_km = _FaissKMeans(self.n_clusters, max_iter=self.max_iter, use_gpu=False)
+                best_labels_np  = _cpu_km.fit_predict(X).astype(np.int32)
+                best_centers_np = _cpu_km.cluster_centers_
+                best_inertia    = 0.0
+                print(f"  [gpu] faiss-cpu fallback complete.")
+            except Exception:
+                # Last resort: sklearn MiniBatchKMeans
+                from sklearn.cluster import MiniBatchKMeans as _MBKM
+                _cpu_km = _MBKM(
+                    n_clusters=self.n_clusters,
+                    max_iter=self.max_iter,
+                    random_state=self.random_state or 42,
+                    batch_size=min(4096, n),
+                )
+                best_labels_np  = _cpu_km.fit_predict(X).astype(np.int32)
+                best_centers_np = _cpu_km.cluster_centers_
+                best_inertia    = float(_cpu_km.inertia_)
+                print(f"  [gpu] sklearn fallback complete.")
 
         self.cluster_centers_ = best_centers_np
         self.labels_           = best_labels_np
@@ -554,6 +594,123 @@ _MEA_COMPOSITE_NAMES: Dict[str, str] = {
     "BM_VEGETATION":     "GENVEGETATION",
     "BM_WATER":          "WATER",
 }
+
+
+def _bounds_wgs84(
+    transform,
+    crs,
+    width: int,
+    height: int,
+) -> Tuple[float, float, float, float]:
+    """Return (left, bottom, right, top) in WGS-84 / EPSG:4326.
+
+    If the raster is already in EPSG:4326, or if reprojection fails for any
+    reason, the native bounds are returned unchanged.
+    """
+    import rasterio.warp as _warp
+
+    left   = transform.c
+    top    = transform.f
+    right  = left + width  * transform.a
+    bottom = top  + height * transform.e   # e is negative → bottom < top
+
+    if crs is None:
+        return left, bottom, right, top
+    try:
+        if crs.to_epsg() == 4326:
+            return left, bottom, right, top
+        west, south, east, north = _warp.transform_bounds(
+            crs, "EPSG:4326", left, bottom, right, top
+        )
+        return west, south, east, north
+    except Exception:
+        return left, bottom, right, top
+
+
+def _write_txr_file(
+    output_path,
+    transform,
+    crs,
+    width: int,
+    height: int,
+) -> None:
+    """Write a .txr sidecar file next to *output_path*.
+
+    The .txr contains the WGS-84 bounding box in the format expected by the
+    GIS toolchain (csm / EndMapTokens format).
+    """
+    try:
+        left, bottom, right, top = _bounds_wgs84(transform, crs, width, height)
+        txr_path = Path(output_path).with_suffix(".txr")
+        content = (
+            f"csm=Geographic datumId=4326 dcType=NONE dcSelectorId=0 EndMapTokens "
+            f"Top: {top:.12f} Bottom: {bottom:.12f} "
+            f"Left: {left:.12f} Right: {right:.12f}"
+        )
+        txr_path.write_text(content, encoding="utf-8")
+    except Exception as exc:
+        print(f"  [TXR] Warning: could not write .txr sidecar for {output_path}: {exc}")
+
+
+def _write_txs_file(
+    txs_path,
+    image_infos: List[Tuple],
+) -> None:
+    """Write the all_imgs.txs batch-load script.
+
+    *image_infos* is a list of 7-tuples:
+        (image_path, left_wgs84, bottom_wgs84, right_wgs84, top_wgs84, width_px, height_px)
+    """
+    try:
+        lib = "Source Data Library;Geospecific Imagery;Year-Round"
+        lines: List[str] = []
+        for img_path, left, bottom, right, top, img_w, img_h in image_infos:
+            p = str(img_path)
+            p_bak = f"{p} (backup)"
+            lines += [
+                f'Delete "{lib};{p_bak}"',
+                f'Rename "{lib};{p}" "{p_bak}"',
+                f'Create "GeoSpecific" "{lib}" "{p}"',
+                f'SetEnv thisRecord "{lib};{p}"',
+                f'Set $thisRecord "Zero Y" ""',
+                f'Set $thisRecord "Zero X" ""',
+                f'Set $thisRecord "Use 4th Channel as Alpha" "no"',
+                f'Set $thisRecord "Transparency" ""',
+                f'Set $thisRecord "Timestamp" ""',
+                f'Set $thisRecord "Origin Y" ""',
+                f'Set $thisRecord "Origin X" ""',
+                f'Set $thisRecord "Number of Texels Y" {img_h}',
+                f'Set $thisRecord "Number of Texels X" {img_w}',
+                f'Set $thisRecord "Notes" ""',
+                f'Set $thisRecord "Misc3" ""',
+                f'Set $thisRecord "Misc2" ""',
+                f'Set $thisRecord "Misc1" ""',
+                f'Set $thisRecord "Meters per Texels Y" ""',
+                f'Set $thisRecord "Meters per Texels X" ""',
+                f'Set $thisRecord "MaterialClassification" ""',
+                f'Set $thisRecord "Map Selection" ""',
+                f'Set $thisRecord "Map Model" "Geographic"',
+                f'Set $thisRecord "Map Datum" "WGS84"',
+                f'Set $thisRecord "Local Top" {top:.12f}',
+                f'Set $thisRecord "Local Right" {right:.12f}',
+                f'Set $thisRecord "Local Left" {left:.12f}',
+                f'Set $thisRecord "Local Bottom" {bottom:.12f}',
+                f'Set $thisRecord "Gamma" 1.800000000000',
+                f'Set $thisRecord "File Type" ""',
+                f'Set $thisRecord "File Name" "{p}"',
+                f'Set $thisRecord "Enter Date" ""',
+                f'Set $thisRecord "Data Interpretation" "GeoSpecific Format"',
+                f'Set $thisRecord "Custom Definition 2" ""',
+                f'Set $thisRecord "Custom Definition" ""',
+                f'Set $thisRecord "Conv_ Usage" "use default"',
+                f'Set $thisRecord "Conv_ Selection" ""',
+                f'Set $thisRecord "Conv_ Family" ""',
+                f'Set $thisRecord "Auto Load" ""',
+            ]
+        Path(txs_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"  [TXS] Batch-load script written: {txs_path}")
+    except Exception as exc:
+        print(f"  [TXS] Warning: could not write all_imgs.txs: {exc}")
 
 
 def _write_composite_material_xml(
@@ -953,6 +1110,51 @@ def _available_ram_bytes() -> int:
     return 2 * 1024 ** 3  # conservative 2 GB fallback
 
 
+# ---------------------------------------------------------------------------
+# Resource management — headroom constants
+# ---------------------------------------------------------------------------
+# Always reserve a fraction of RAM and CPU so the OS, desktop, and other apps
+# stay responsive.  These caps prevent the common OOM-crash scenario where
+# every core is busy with a tile and each tile has its own scratch buffers.
+
+_RAM_HEADROOM_BYTES: int = 2 * 1024 ** 3        # always keep ≥2 GB free
+_RAM_USAGE_FRAC: float   = 0.45                 # never consume >45% of *available* RAM
+_CPU_RESERVE_CORES: int  = 2                     # always keep ≥2 cores idle
+_CPU_MAX_USAGE_FRAC: float = 0.50                # never use >50% of cores
+_WORKER_THREAD_CAP: int  = 2                     # max threads inside each subprocess
+
+
+def _usable_ram_bytes() -> int:
+    """Available RAM minus headroom for system stability."""
+    avail = _available_ram_bytes()
+    usable = min(avail - _RAM_HEADROOM_BYTES,
+                 int(avail * _RAM_USAGE_FRAC))
+    return max(usable, 256 * 1024 * 1024)  # floor at 256 MB
+
+
+def _safe_worker_count(requested: Optional[int] = None,
+                       fallback: Optional[int] = None) -> int:
+    """Return a worker count that leaves CPU headroom for the OS.
+
+    Priority: *requested* > *fallback* > auto (half of cores, minus reserve).
+    """
+    cpus = os.cpu_count() or 4
+    cap = max(1, min(int(cpus * _CPU_MAX_USAGE_FRAC),
+                     cpus - _CPU_RESERVE_CORES))
+
+    if requested and requested > 0:
+        return max(1, min(requested, cap))
+    if fallback and fallback > 0:
+        return max(1, min(fallback, cap))
+    return cap
+
+
+def _ram_ok_for_next_tile(per_tile_bytes: int) -> bool:
+    """Return True if there is enough free RAM to launch another tile worker."""
+    avail = _available_ram_bytes()
+    return avail - per_tile_bytes > _RAM_HEADROOM_BYTES
+
+
 def suggest_tile_size(raster_path: str, workers: int = 4) -> int:
     """Return an ideal square tile side length (pixels) for the given raster.
 
@@ -970,11 +1172,12 @@ def suggest_tile_size(raster_path: str, workers: int = 4) -> int:
     except Exception:
         return 1024
 
-    avail = _available_ram_bytes()
-    # Budget: 60 % of available RAM shared across workers, x6 scratch copies.
-    # GDAL + NumPy own most of the rest; the x6 scratch multiplier is conservative.
-    budget_bytes = avail * 0.60 / max(1, workers)
-    bytes_per_px = max(bands, 3) * max(itemsize, 4) * 6  # x6 for working copies
+    avail = _usable_ram_bytes()
+    workers = _safe_worker_count(workers)
+    # Budget: usable RAM (with headroom) shared across workers, x8 scratch copies.
+    # x8 accounts for GDAL read + feature extraction + normalisation + labels + colour.
+    budget_bytes = avail / max(1, workers)
+    bytes_per_px = max(bands, 3) * max(itemsize, 4) * 8  # x8 for working copies
     max_px = int(budget_bytes / bytes_per_px)
     ideal = int(math.sqrt(max(max_px, 256 * 256)))
 
@@ -1117,7 +1320,10 @@ def _nearest_center_chunked(
         for rng in ranges:
             _assign_chunk(rng)
     else:
-        _n_workers = min(len(ranges), max(1, (os.cpu_count() or 4)))
+        # Cap threads to _WORKER_THREAD_CAP so parallel tile processes don't
+        # collectively saturate the CPU (each process would otherwise spawn
+        # os.cpu_count() threads).
+        _n_workers = min(len(ranges), _WORKER_THREAD_CAP)
         with ThreadPoolExecutor(max_workers=_n_workers) as pool:
             list(pool.map(_assign_chunk, ranges))
 
@@ -1206,7 +1412,7 @@ def _preprocess_shadow_balance(
             + (1.0 - blend_strength) * band[shadow_mask]
         )
 
-    _n_bands = min(raster_data.shape[0], 3)
+    _n_bands = min(raster_data.shape[0], 3, _WORKER_THREAD_CAP)
     with ThreadPoolExecutor(max_workers=_n_bands) as _tp:
         list(_tp.map(_balance_band, range(_n_bands)))
 
@@ -1908,7 +2114,7 @@ def _cap_enclosed_objects_to_asphalt(
 
             return comp_id
 
-        _n_workers = min(max(1, os.cpu_count() or 1), 8)
+        _n_workers = min(max(1, os.cpu_count() or 1), _WORKER_THREAD_CAP)
         if _n_workers > 1 and len(_eligible) >= _n_workers * 2:
             with ThreadPoolExecutor(max_workers=_n_workers) as _ex:
                 results = list(_ex.map(_check_comp, _eligible))
@@ -2104,22 +2310,36 @@ def _classify_tile_worker(args: tuple) -> str:
     )
 
     # Feature extraction + nearest-center assignment on the expanded area.
-    try:
-        features = _extract_pixel_features(tile_data, feature_flags, verbose=False)
-        scale    = np.where(scaler_scale == 0, 1.0, scaler_scale).astype(np.float32)
-        features_norm = ((features - scaler_mean) / scale).astype(np.float32)
-        del features                        # free ~20×H×W×4 bytes immediately
-        gc.collect()
-        labels = _nearest_center_chunked(features_norm, centers.astype(np.float32)) + 1
-        del features_norm
-        gc.collect()
-    except MemoryError:
-        bands, h, w = tile_data.shape
-        mb = bands * h * w / (1024 * 1024)
-        raise MemoryError(
-            f"Out of memory processing tile {tile_name} ({h}×{w}, {bands} bands, ~{mb:.0f} MB). "
-            f"Reduce tile size in Performance settings."
-        )
+    # On MemoryError: free everything, gc, and retry once before giving up.
+    for _mem_attempt in range(2):
+        try:
+            features = _extract_pixel_features(tile_data, feature_flags, verbose=False)
+            scale    = np.where(scaler_scale == 0, 1.0, scaler_scale).astype(np.float32)
+            features_norm = ((features - scaler_mean) / scale).astype(np.float32)
+            del features                        # free ~20×H×W×4 bytes immediately
+            gc.collect()
+            # Use smaller chunks on retry to reduce peak memory
+            _chunk = 131_072 if _mem_attempt == 0 else 32_768
+            labels = _nearest_center_chunked(
+                features_norm, centers.astype(np.float32), chunk=_chunk,
+            ) + 1
+            del features_norm
+            gc.collect()
+            break  # success
+        except MemoryError:
+            # Clean up any partial allocations before retry / error
+            features = features_norm = labels = None
+            gc.collect()
+            if _mem_attempt == 0:
+                print(f"  [mem] Tile {tile_name}: MemoryError on attempt 1, retrying with smaller chunks…")
+                _time.sleep(0.5)  # brief pause for other workers to release
+                continue
+            bands_t, h_t, w_t = tile_data.shape
+            mb = bands_t * h_t * w_t / (1024 * 1024)
+            raise MemoryError(
+                f"Out of memory processing tile {tile_name} ({h_t}×{w_t}, {bands_t} bands, ~{mb:.0f} MB) "
+                f"after 2 attempts. Reduce tile size in Performance settings."
+            )
     predicted_raster   = labels.reshape(h_exp, w_exp)
 
     # Smoothing on the expanded area -> boundary pixels get full context.
@@ -2151,7 +2371,11 @@ def _classify_tile_worker(args: tuple) -> str:
     del rgb, tile_data_crop, predicted_raster
     gc.collect()
 
-    return str(output_path_obj)
+    # Write .txr sidecar for this tile.
+    _write_txr_file(output_path_obj, tile_transform, tile_crs, width, height)
+    _t_left, _t_bottom, _t_right, _t_top = _bounds_wgs84(tile_transform, tile_crs, width, height)
+
+    return (str(output_path_obj), _t_left, _t_bottom, _t_right, _t_top, width, height)
 
 
 def _rasterize_tile_worker(args: Tuple[str, Optional[Tuple[int, int, int, int]], List[Tuple[List, int, Tuple[int, int, int]]], str, str]) -> str:
@@ -2210,7 +2434,11 @@ def _rasterize_tile_worker(args: Tuple[str, Optional[Tuple[int, int, int, int]],
     with rasterio.open(output_path, 'w', **write_meta) as dst:
         dst.write(output_array)
 
-    return str(output_path)
+    # Write .txr sidecar for this tile.
+    _write_txr_file(output_path, transform, raster_crs, width, height)
+    _t_left, _t_bottom, _t_right, _t_top = _bounds_wgs84(transform, raster_crs, width, height)
+
+    return (str(output_path), _t_left, _t_bottom, _t_right, _t_top, width, height)
 
 
 def rasterize_vector_onto_raster(raster_path: str, gdf, burn_value: int, output_path: str, crs,
@@ -2705,7 +2933,7 @@ def classify_and_export(
         crs       = _normalize_pseudo_mercator_crs(src.crs)
         height, width, n_bands = src.height, src.width, src.count
         _total_bytes = height * width * n_bands * int(np.dtype(src.dtypes[0]).itemsize)
-        _ram_budget  = int(_available_ram_bytes() * 0.55)
+        _ram_budget  = int(_usable_ram_bytes() * 0.70)  # 70% of usable (already has headroom)
         raster_data: np.ndarray | None = src.read() if _total_bytes <= _ram_budget else None
 
     profile["crs"] = crs
@@ -2842,14 +3070,10 @@ def classify_and_export(
         scaler_scale = scaler.scale_.astype(np.float32)
         centers      = kmeans.cluster_centers_.astype(np.float32)
 
-        # Determine max workers: use tile_workers if specified, or fill up to max_threads (if set), else all CPUs
-        if tile_workers and tile_workers > 0:
-            max_workers = tile_workers
-        elif max_threads and max_threads > 0:
-            max_workers = max_threads
-        else:
-            max_workers = max(1, os.cpu_count() or 1)
-        
+        # Determine max workers — always leave headroom for the OS / desktop.
+        max_workers = _safe_worker_count(tile_workers, max_threads)
+        print(f"  Tile workers: {max_workers} (of {os.cpu_count()} cores)")
+
         # Compute the padding each tile worker needs to read beyond its boundary
         # so the smoothing filter has full context (eliminates tile-boundary seams).
         _smooth_pad = 0
@@ -2890,19 +3114,58 @@ def classify_and_export(
             ))
 
         tile_outputs: List[str] = []
+        _tile_txs_infos: List[Tuple] = []
         _n_jobs = len(jobs)
-        # Use chunksize > 1 when many tiles to reduce IPC overhead
-        _chunksize = max(1, _n_jobs // (max_workers * 4))
         _cb("Classifying tiles", 0, _n_jobs)
+
+        # Estimate per-tile RAM (bands × tile_pixels × 8 scratch copies × 4 bytes)
+        _tile_px = tile_size * tile_size
+        _est_tile_bytes = max(n_bands, 3) * _tile_px * 8 * 4
+
+        # Submit tiles in controlled waves — never more than max_workers in
+        # flight at once, and pause if RAM pressure is high.
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_classify_tile_worker, job): i for i, job in enumerate(jobs)}
-            for future in as_completed(futures):
-                tile_outputs.append(future.result())
-                _cb("Classifying tiles", len(tile_outputs), _n_jobs)
-                if len(tile_outputs) % max(1, _n_jobs // 10) == 0 or len(tile_outputs) == _n_jobs:
-                    print(f"    tiles: {len(tile_outputs)}/{_n_jobs} done")
+            pending: dict = {}
+            job_iter = iter(enumerate(jobs))
+            _done_count = 0
+
+            def _drain_one():
+                """Wait for one future to complete, collect its result."""
+                nonlocal _done_count
+                done_set = set()
+                for f in as_completed(pending, timeout=None):
+                    done_set.add(f)
+                    break
+                for f in done_set:
+                    _res = f.result()
+                    tile_outputs.append(_res[0])
+                    _tile_txs_infos.append(_res)
+                    del pending[f]
+                    _done_count += 1
+                    _cb("Classifying tiles", _done_count, _n_jobs)
+                    if _done_count % max(1, _n_jobs // 10) == 0 or _done_count == _n_jobs:
+                        print(f"    tiles: {_done_count}/{_n_jobs} done")
+
+            for idx, job in job_iter:
+                # If we already have max_workers in flight, wait for one
+                while len(pending) >= max_workers:
+                    _drain_one()
+                # Also wait if RAM is getting tight
+                while len(pending) > 0 and not _ram_ok_for_next_tile(_est_tile_bytes):
+                    print(f"    [mem] waiting for RAM before tile {idx+1}/{_n_jobs}…")
+                    _drain_one()
+                pending[executor.submit(_classify_tile_worker, job)] = idx
+
+            # Drain remaining
+            while pending:
+                _drain_one()
 
         print(f"  [OK] Wrote {len(tile_outputs)} tiles to {output_dir}")
+
+        # Write all_imgs.txs for the complete tile set.
+        if _tile_txs_infos:
+            _write_txs_file(Path(output_dir) / "all_imgs.txs", _tile_txs_infos)
+
         _ce_stages.append(("Tiled classification", _time.perf_counter() - _t0))
         _ce_total = _time.perf_counter() - _t_ce_start
         _ce_table = _build_stats_table(_ce_stages, _ce_total)
@@ -3051,6 +3314,16 @@ def classify_and_export(
     
     with rasterio.open(output_color_path, 'w', **rgb_profile) as dst:
         dst.write(rgb)
+
+    # Write .txr sidecar and all_imgs.txs for the single output file.
+    _out_transform = profile.get("transform")
+    _out_crs = profile.get("crs")
+    _write_txr_file(output_color_path, _out_transform, _out_crs, width, height)
+    _o_left, _o_bottom, _o_right, _o_top = _bounds_wgs84(_out_transform, _out_crs, width, height)
+    _write_txs_file(
+        Path(output_color_path).parent / "all_imgs.txs",
+        [(str(output_color_path), _o_left, _o_bottom, _o_right, _o_top, width, height)],
+    )
 
     print(f"  [OK] Classification saved to {output_color_path}")
     _cb("Saving output", 1, 1)
@@ -3290,7 +3563,7 @@ def build_shared_color_table(
             with rasterio.open(rp) as src:
                 H, W   = src.height, src.width
                 nbytes = H * W * src.count * int(np.dtype(src.dtypes[0]).itemsize)
-                if nbytes > int(_available_ram_bytes() * 0.40):
+                if nbytes > int(_usable_ram_bytes() * 0.60):
                     print(f"[SharedTable][warn] {Path(rp).name} too large for semantics, skipping")
                     continue
                 rd = src.read()
@@ -3625,19 +3898,34 @@ def rasterize_vectors_onto_classification(
                 tile_name = f"{classif_path.stem}_tile_r{row}_c{col}{out_ext}"
                 jobs.append((str(classif_path), (row, col, h, w), layer_geoms, str(output_dir), tile_name))
 
-        # Determine max workers: use tile_workers if specified, or fill up to max_threads (if set), else all CPUs
-        if tile_workers and tile_workers > 0:
-            max_workers = tile_workers
-        elif max_threads and max_threads > 0:
-            max_workers = max_threads
-        else:
-            max_workers = max(1, os.cpu_count() or 1)
-        
+        # Determine max workers — always leave headroom for the OS / desktop.
+        max_workers = _safe_worker_count(tile_workers, max_threads)
+        print(f"  Rasterize workers: {max_workers} (of {os.cpu_count()} cores)")
+
         tile_outputs: List[str] = []
+        _rv_txs_infos: List[Tuple] = []
+        _n_rast_jobs = len(jobs)
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(_rasterize_tile_worker, job) for job in jobs]
-            for future in as_completed(futures):
-                tile_outputs.append(future.result())
+            pending_r: dict = {}
+            for idx_r, job in enumerate(jobs):
+                # Throttle: keep at most max_workers futures in flight
+                while len(pending_r) >= max_workers:
+                    for f in as_completed(pending_r, timeout=None):
+                        _rv_res = f.result()
+                        tile_outputs.append(_rv_res[0])
+                        _rv_txs_infos.append(_rv_res)
+                        del pending_r[f]
+                        break
+                pending_r[executor.submit(_rasterize_tile_worker, job)] = idx_r
+            # Drain remaining
+            for f in as_completed(pending_r):
+                _rv_res = f.result()
+                tile_outputs.append(_rv_res[0])
+                _rv_txs_infos.append(_rv_res)
+
+        # Write all_imgs.txs for the complete vector-rasterized tile set.
+        if _rv_txs_infos:
+            _write_txs_file(output_dir / "all_imgs.txs", _rv_txs_infos)
 
         print(f"\n[OK] Vector rasterization complete (tiles)")
         print(f"  Output: {output_dir}")
@@ -3734,6 +4022,22 @@ def rasterize_vectors_onto_classification(
             _friendly_stem + "_with_vectors" + classif_path.suffix
         )
     
+    # Write .txr sidecar + all_imgs.txs for the final vector-rasterized output.
+    try:
+        with rasterio.open(final_path) as _rv_src:
+            _rv_t  = _rv_src.transform
+            _rv_c  = _normalize_pseudo_mercator_crs(_rv_src.crs)
+            _rv_w  = _rv_src.width
+            _rv_h  = _rv_src.height
+        _write_txr_file(final_path, _rv_t, _rv_c, _rv_w, _rv_h)
+        _rv_left, _rv_bottom, _rv_right, _rv_top = _bounds_wgs84(_rv_t, _rv_c, _rv_w, _rv_h)
+        _write_txs_file(
+            Path(final_path).parent / "all_imgs.txs",
+            [(str(final_path), _rv_left, _rv_bottom, _rv_right, _rv_top, _rv_w, _rv_h)],
+        )
+    except Exception as _rv_exc:
+        print(f"  [TXR/TXS] Warning: could not write sidecar files: {_rv_exc}")
+
     print(f"\n[OK] Vector rasterization complete")
     print(f"  Output: {final_path}")
     _rv_stages.append(("Rasterize vectors", _time.perf_counter() - _t0))
@@ -3741,7 +4045,7 @@ def rasterize_vectors_onto_classification(
     _rv_table = _build_stats_table(_rv_stages, _rv_total)
     print(_rv_table)
     print("="*70)
-    
+
     return {
         "status": "ok",
         "outputPath": str(final_path),
@@ -3977,7 +4281,7 @@ def _extract_pixel_features(
             inp, out = job
             uniform_filter(inp, size=window_size, mode='reflect', output=out)
 
-        _n_workers = min(len(_filter_jobs), max(1, (os.cpu_count() or 4)))
+        _n_workers = min(len(_filter_jobs), _WORKER_THREAD_CAP)
         if _n_workers >= 2 and len(_filter_jobs) >= 2:
             with ThreadPoolExecutor(max_workers=_n_workers) as _tp:
                 list(_tp.map(_run_filter, _filter_jobs))
@@ -4493,7 +4797,7 @@ def _cluster_semantic_scores(
         return (_elongated_continuity_score(mask), _waterbody_continuity_score(mask))
 
     if n_clusters >= 4:
-        _n_cont_workers = min(n_clusters, max(1, (os.cpu_count() or 4)))
+        _n_cont_workers = min(n_clusters, _WORKER_THREAD_CAP)
         with ThreadPoolExecutor(max_workers=_n_cont_workers) as _tp:
             _cont_results = list(_tp.map(_cont_pair, _cluster_masks))
     else:

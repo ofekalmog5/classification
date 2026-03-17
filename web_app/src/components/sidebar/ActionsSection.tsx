@@ -7,6 +7,7 @@ import {
   runBatchClassify,
   generateTaskId,
   startProgressStream,
+  cancelTask,
 } from "../../api/client";
 import type { BatchResult } from "../../api/client";
 import { MEA_CLASSES } from "../../constants/mea";
@@ -26,6 +27,14 @@ export default function ActionsSection() {
   const dispatch = useAppDispatch();
   const isRunning = state.running !== "idle";
   const runStartRef = useRef<number>(0);
+  const activeTaskIdRef = useRef<string | null>(null);
+
+  const handleCancel = useCallback(async () => {
+    const tid = activeTaskIdRef.current;
+    if (!tid) return;
+    dispatch({ type: "SET_STATUS", text: "Cancelling…" });
+    await cancelTask(tid);
+  }, [dispatch]);
 
   // Short engine label shown in the status bar when a run starts
   const engineLabel = state.accelInfo
@@ -155,6 +164,7 @@ export default function ActionsSection() {
     if (rasterFiles.length > 1) {
       dispatch({ type: "SET_STATUS", text: `Step 1: Training shared model on ${rasterFiles.length} files…${engineLabel}` });
       const taskId = generateTaskId();
+      activeTaskIdRef.current = taskId;
       const stopProgress = startProgressStream(taskId, (evt) => {
         dispatch({ type: "SET_PROGRESS", progress: evt });
       });
@@ -165,10 +175,15 @@ export default function ActionsSection() {
           taskId,
           ...params,
         });
-        handleBatchResult(result, "Step 1 (batch)");
+        if ((result as any).status === "cancelled") {
+          dispatch({ type: "SET_STATUS", text: "Step 1 cancelled" });
+        } else {
+          handleBatchResult(result, "Step 1 (batch)");
+        }
       } catch (e: any) {
         dispatch({ type: "SET_STATUS", text: `Step 1 batch error: ${e.message}` });
       } finally {
+        activeTaskIdRef.current = null;
         stopProgress();
         dispatch({ type: "SET_PROGRESS", progress: null });
       }
@@ -178,15 +193,21 @@ export default function ActionsSection() {
       const fileName = file.split(/[\\/]/).pop() || file;
       dispatch({ type: "SET_STATUS", text: `Step 1: Classifying ${fileName}…${engineLabel}` });
       const taskId = generateTaskId();
+      activeTaskIdRef.current = taskId;
       const stopProgress = startProgressStream(taskId, (evt) => {
         dispatch({ type: "SET_PROGRESS", progress: evt });
       });
       try {
         const result = await runStep1({ rasterPath: file, taskId, ...params });
-        handleSingleResult(result, "Step 1");
+        if ((result as any).status === "cancelled") {
+          dispatch({ type: "SET_STATUS", text: "Step 1 cancelled" });
+        } else {
+          handleSingleResult(result, "Step 1");
+        }
       } catch (e: any) {
         dispatch({ type: "SET_STATUS", text: `Step 1 error: ${e.message}` });
       } finally {
+        activeTaskIdRef.current = null;
         stopProgress();
         dispatch({ type: "SET_PROGRESS", progress: null });
       }
@@ -202,6 +223,7 @@ export default function ActionsSection() {
     dispatch({ type: "SET_STATUS", text: "Running Step 2: Vector rasterization…" });
     dispatch({ type: "SET_PROGRESS", progress: null });
     const taskId = generateTaskId();
+    activeTaskIdRef.current = taskId;
     const stopProgress = startProgressStream(taskId, (evt) => {
       dispatch({ type: "SET_PROGRESS", progress: evt });
     });
@@ -219,10 +241,15 @@ export default function ActionsSection() {
           ? navigator.hardwareConcurrency ?? null
           : null,
       });
-      handleSingleResult(result, "Step 2");
+      if ((result as any).status === "cancelled") {
+        dispatch({ type: "SET_STATUS", text: "Step 2 cancelled" });
+      } else {
+        handleSingleResult(result, "Step 2");
+      }
     } catch (e: any) {
       dispatch({ type: "SET_STATUS", text: `Step 2 error: ${e.message}` });
     } finally {
+      activeTaskIdRef.current = null;
       stopProgress();
       dispatch({ type: "SET_PROGRESS", progress: null });
       dispatch({ type: "SET_RUNNING", step: "idle" });
@@ -248,6 +275,7 @@ export default function ActionsSection() {
     if (rasterFiles.length > 1) {
       dispatch({ type: "SET_STATUS", text: `Full Pipeline: Training shared model on ${rasterFiles.length} files…${engineLabel}` });
       const taskId = generateTaskId();
+      activeTaskIdRef.current = taskId;
       const stopProgress = startProgressStream(taskId, (evt) => {
         dispatch({ type: "SET_PROGRESS", progress: evt });
       });
@@ -258,10 +286,15 @@ export default function ActionsSection() {
           taskId,
           ...params,
         });
-        handleBatchResult(result, "Full Pipeline (batch)");
+        if ((result as any).status === "cancelled") {
+          dispatch({ type: "SET_STATUS", text: "Full Pipeline cancelled" });
+        } else {
+          handleBatchResult(result, "Full Pipeline (batch)");
+        }
       } catch (e: any) {
         dispatch({ type: "SET_STATUS", text: `Full pipeline batch error: ${e.message}` });
       } finally {
+        activeTaskIdRef.current = null;
         stopProgress();
         dispatch({ type: "SET_PROGRESS", progress: null });
       }
@@ -270,6 +303,7 @@ export default function ActionsSection() {
       const fileName = file.split(/[\\/]/).pop() || file;
       dispatch({ type: "SET_STATUS", text: `Full Pipeline: ${fileName}…${engineLabel}` });
       const taskId = generateTaskId();
+      activeTaskIdRef.current = taskId;
       const stopProgress = startProgressStream(taskId, (evt) => {
         dispatch({ type: "SET_PROGRESS", progress: evt });
       });
@@ -280,10 +314,15 @@ export default function ActionsSection() {
           taskId,
           ...params,
         });
-        handleSingleResult(result, "Full Pipeline");
+        if ((result as any).status === "cancelled") {
+          dispatch({ type: "SET_STATUS", text: "Full Pipeline cancelled" });
+        } else {
+          handleSingleResult(result, "Full Pipeline");
+        }
       } catch (e: any) {
         dispatch({ type: "SET_STATUS", text: `Full pipeline error: ${e.message}` });
       } finally {
+        activeTaskIdRef.current = null;
         stopProgress();
         dispatch({ type: "SET_PROGRESS", progress: null });
       }
@@ -310,6 +349,7 @@ export default function ActionsSection() {
     if (rasterFiles.length > 1) {
       dispatch({ type: "SET_STATUS", text: `MEA: Training shared model on ${rasterFiles.length} files…${engineLabel}` });
       const taskId = generateTaskId();
+      activeTaskIdRef.current = taskId;
       const stopProgress = startProgressStream(taskId, (evt) => {
         dispatch({ type: "SET_PROGRESS", progress: evt });
       });
@@ -331,10 +371,15 @@ export default function ActionsSection() {
           maxThreads,
           taskId,
         });
-        handleBatchResult(result, "MEA (batch)");
+        if ((result as any).status === "cancelled") {
+          dispatch({ type: "SET_STATUS", text: "MEA cancelled" });
+        } else {
+          handleBatchResult(result, "MEA (batch)");
+        }
       } catch (e: any) {
         dispatch({ type: "SET_STATUS", text: `MEA batch error: ${e.message}` });
       } finally {
+        activeTaskIdRef.current = null;
         stopProgress();
         dispatch({ type: "SET_PROGRESS", progress: null });
       }
@@ -343,6 +388,7 @@ export default function ActionsSection() {
       const fileName = file.split(/[\\/]/).pop() || file;
       dispatch({ type: "SET_STATUS", text: `MEA: ${fileName}…${engineLabel}` });
       const taskId = generateTaskId();
+      activeTaskIdRef.current = taskId;
       const stopProgress = startProgressStream(taskId, (evt) => {
         dispatch({ type: "SET_PROGRESS", progress: evt });
       });
@@ -366,10 +412,15 @@ export default function ActionsSection() {
         const result = state.vectorLayers.length
           ? await runFullPipeline(params)
           : await runStep1(params);
-        handleSingleResult(result, "MEA");
+        if ((result as any).status === "cancelled") {
+          dispatch({ type: "SET_STATUS", text: "MEA cancelled" });
+        } else {
+          handleSingleResult(result, "MEA");
+        }
       } catch (e: any) {
         dispatch({ type: "SET_STATUS", text: `MEA error: ${e.message}` });
       } finally {
+        activeTaskIdRef.current = null;
         stopProgress();
         dispatch({ type: "SET_PROGRESS", progress: null });
       }
@@ -434,6 +485,14 @@ export default function ActionsSection() {
         color="emerald"
         full
       />
+      {isRunning && (
+        <button
+          className="w-full text-xs font-medium py-1.5 px-2 rounded transition-colors bg-red-600 hover:bg-red-700 text-white"
+          onClick={handleCancel}
+        >
+          ✕ Cancel
+        </button>
+      )}
     </div>
   );
 }
