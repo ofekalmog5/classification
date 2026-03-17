@@ -34,16 +34,18 @@ from rasterio.windows import Window
 # ---------------------------------------------------------------------------
 
 _sam_model = None       # lazy singleton
-_sam_model_type = None  # "sam3" or "langsam"
+_sam_model_type = None  # "sam3" | "langsam" | "owlv2sam2"
 
 
 def _load_sam3(device: str = "auto"):
-    """Load a text-prompted SAM model (singleton).
+    """Load a text-prompted segmentation model (singleton).
 
-    Tries SamGeo3 (SAM 3, Linux/CUDA) first; falls back to LangSAM
-    (GroundingDINO + SAM 2, Windows-compatible) if triton/sam3 is unavailable.
+    Priority order:
+      1. SamGeo3  — SAM 3  (Linux/CUDA, needs triton)
+      2. LangSAM  — SAM 2 + GroundingDINO  (needs compatible transformers)
+      3. OWLv2+SAM2 — pure HuggingFace, works everywhere, no compilation
 
-    Returns (model, model_type) where model_type is "sam3" or "langsam".
+    Returns (model_bundle, model_type).
     """
     global _sam_model, _sam_model_type
     if _sam_model is not None:
@@ -53,37 +55,24 @@ def _load_sam3(device: str = "auto"):
         import torch
     except ImportError:
         raise ImportError(
-            "PyTorch is required for road extraction but is not installed.\n"
-            "Install with one of:\n\n"
-            "  GPU (CUDA 12.x):\n"
-            "    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121\n"
-            "  CPU only:\n"
-            "    pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu\n\n"
-            "Then: pip install segment-geospatial"
-        ) from None
-
-    try:
-        import samgeo as _samgeo  # noqa: F401
-    except ImportError:
-        raise ImportError(
-            "segment-geospatial is not installed.\n"
-            "Run: pip install segment-geospatial"
+            "PyTorch is required for road extraction.\n"
+            "  GPU: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121\n"
+            "  CPU: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu"
         ) from None
 
     if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        import torch as _torch
+        device = "cuda" if _torch.cuda.is_available() else "cpu"
 
-    # --- On Windows, try to inject triton-windows so sam3 can load ---
     import sys as _sys
+
+    # ── 1. Try SAM3 (Linux/CUDA, requires triton) ──────────────────────────
     if _sys.platform == "win32":
         try:
-            import triton  # noqa: F401 — triton-windows package
+            import triton  # noqa: F401
         except ImportError:
-            # triton-windows not installed — warn once, SAM3 will fail below
-            print("[RoadExtract] triton not found on Windows. "
-                  "For SAM3 support run: pip install triton-windows")
-
-    # --- Try SAM3 first ---
+            print("[RoadExtract] triton not found — SAM3 skipped on Windows "
+                  "(install triton-windows to enable)")
     try:
         from samgeo import SamGeo3
         model = SamGeo3(device=device)
@@ -93,39 +82,48 @@ def _load_sam3(device: str = "auto"):
         return _sam_model, _sam_model_type
     except Exception as e:
         msg = str(e).lower()
-        if any(k in msg for k in ("triton", "sam3", "no module named")):
-            print(f"[RoadExtract] SAM3 unavailable ({type(e).__name__}: {e})")
-            if _sys.platform == "win32":
-                print("[RoadExtract] Tip: install triton-windows to enable SAM3: "
-                      "pip install triton-windows")
-            print("[RoadExtract] Falling back to LangSAM (GroundingDINO + SAM 2) …")
+        if any(k in msg for k in ("triton", "sam3", "no module named", "importerror")):
+            print(f"[RoadExtract] SAM3 unavailable: {e}")
         else:
-            raise
+            print(f"[RoadExtract] SAM3 failed unexpectedly: {e}")
+        print("[RoadExtract] Trying LangSAM …")
 
-    # --- Fall back to LangSAM (Windows-compatible) ---
+    # ── 2. Try LangSAM (GroundingDINO + SAM2) ──────────────────────────────
     try:
         from samgeo.text_sam import LangSAM
         model = LangSAM(model_type="sam2-hiera-large")
         _sam_model = model
         _sam_model_type = "langsam"
-        print("[RoadExtract] Loaded LangSAM (SAM 2 + GroundingDINO) model")
+        print("[RoadExtract] Loaded LangSAM (SAM 2 + GroundingDINO)")
         return _sam_model, _sam_model_type
-    except NameError as e:
-        if "SLConfig" in str(e) or "slconfig" in str(e).lower():
-            raise ImportError(
-                "GroundingDINO is missing or broken (SLConfig not defined).\n"
-                "Fix with:\n"
-                "  pip install groundingdino-py\n\n"
-                "Then restart the backend and try again."
-            ) from e
-        raise
-    except ImportError as e:
+    except Exception as e:
+        print(f"[RoadExtract] LangSAM failed: {e}")
+        print("[RoadExtract] Trying OWLv2 + SAM2 (pure HuggingFace) …")
+
+    # ── 3. OWLv2 + SAM2 via HuggingFace transformers ──────────────────────
+    # Requires only: pip install transformers (+ torch already installed)
+    try:
+        from transformers import pipeline as _hf_pipeline
+        detector = _hf_pipeline(
+            "zero-shot-object-detection",
+            model="google/owlv2-base-patch16-ensemble",
+            device=0 if device == "cuda" else -1,
+        )
+        segmenter = _hf_pipeline(
+            "mask-generation",
+            model="facebook/sam2-hiera-large",
+            device=0 if device == "cuda" else -1,
+        )
+        _sam_model = {"detector": detector, "segmenter": segmenter}
+        _sam_model_type = "owlv2sam2"
+        print("[RoadExtract] Loaded OWLv2 + SAM2 (HuggingFace)")
+        return _sam_model, _sam_model_type
+    except Exception as e:
         raise ImportError(
-            f"Neither SAM3 nor LangSAM could be loaded.\n"
-            f"Error: {e}\n\n"
-            "Required packages:\n"
-            "  pip install groundingdino-py segment-geospatial\n"
-            "  pip install triton-windows  (for SAM3 on Windows)"
+            f"All road extraction backends failed. Last error: {e}\n\n"
+            "Make sure these are installed:\n"
+            "  pip install torch torchvision transformers segment-geospatial\n"
+            "  (GPU): --index-url https://download.pytorch.org/whl/cu121"
         ) from e
 
 
@@ -312,12 +310,15 @@ def extract_roads(
 def _segment_tile(sam, sam_type: str, tile_rgb: np.ndarray, text_prompt: str) -> np.ndarray:
     """Run text-prompted segmentation on a single tile.
 
-    Supports both SamGeo3 (sam_type="sam3") and LangSAM (sam_type="langsam").
+    Supports sam3, langsam, and owlv2sam2.
     Returns a binary mask (H, W) with 1 = road, 0 = background.
     """
     h, w = tile_rgb.shape[:2]
 
-    # Save tile to a temporary file (samgeo expects file paths)
+    if sam_type == "owlv2sam2":
+        return _segment_tile_owlv2(sam, tile_rgb, text_prompt)
+
+    # samgeo-based backends need file I/O
     tmp_input = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
     tmp_output = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
     tmp_input_path = tmp_input.name
@@ -326,7 +327,6 @@ def _segment_tile(sam, sam_type: str, tile_rgb: np.ndarray, text_prompt: str) ->
     tmp_output.close()
 
     try:
-        # Write input tile as PNG
         if _CV2_AVAILABLE:
             cv2.imwrite(tmp_input_path, cv2.cvtColor(tile_rgb, cv2.COLOR_RGB2BGR))
         else:
@@ -334,7 +334,6 @@ def _segment_tile(sam, sam_type: str, tile_rgb: np.ndarray, text_prompt: str) ->
             _PILImage.fromarray(tile_rgb).save(tmp_input_path)
 
         if sam_type == "langsam":
-            # LangSAM API: predict(image, text_prompt, output=path)
             sam.predict(
                 tmp_input_path,
                 text_prompt,
@@ -348,7 +347,6 @@ def _segment_tile(sam, sam_type: str, tile_rgb: np.ndarray, text_prompt: str) ->
             sam.text_prompt = text_prompt
             sam.generate(output=tmp_output_path)
 
-        # Read the generated mask
         if Path(tmp_output_path).exists():
             if _CV2_AVAILABLE:
                 mask = cv2.imread(tmp_output_path, cv2.IMREAD_GRAYSCALE)
@@ -366,6 +364,47 @@ def _segment_tile(sam, sam_type: str, tile_rgb: np.ndarray, text_prompt: str) ->
                 Path(p).unlink()
             except OSError:
                 pass
+
+
+def _segment_tile_owlv2(sam_bundle: dict, tile_rgb: np.ndarray, text_prompt: str) -> np.ndarray:
+    """Segment tile using OWLv2 (detection) + SAM2 (masks) via HuggingFace.
+
+    Returns binary mask (H, W).
+    """
+    from PIL import Image as _PILImage
+
+    h, w = tile_rgb.shape[:2]
+    pil_image = _PILImage.fromarray(tile_rgb)
+    detector = sam_bundle["detector"]
+    segmenter = sam_bundle["segmenter"]
+
+    # OWLv2: detect boxes matching the text prompt
+    # Expects list of candidate labels
+    labels = [p.strip() for p in text_prompt.replace(",", " ").split() if p.strip()]
+    detections = detector(pil_image, candidate_labels=labels, threshold=0.1)
+
+    if not detections:
+        return np.zeros((h, w), dtype=np.uint8)
+
+    # SAM2: generate masks from detected boxes
+    boxes = [[d["box"]["xmin"], d["box"]["ymin"], d["box"]["xmax"], d["box"]["ymax"]]
+             for d in detections]
+
+    outputs = segmenter(pil_image, points_per_batch=32, input_boxes=[boxes])
+    masks = outputs.get("masks", [])
+
+    if not masks:
+        return np.zeros((h, w), dtype=np.uint8)
+
+    # Union all masks
+    combined = np.zeros((h, w), dtype=np.uint8)
+    for mask in masks:
+        arr = np.array(mask)
+        if arr.ndim == 3:
+            arr = arr[0]
+        combined = np.logical_or(combined, arr > 0).astype(np.uint8)
+
+    return combined
 
 
 def _morphological_close(
