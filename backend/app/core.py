@@ -4098,6 +4098,14 @@ def _extract_pixel_features(
 
     # Pre-allocate output (n_pixels, n_features) in float32 and fill column-by-column
     n_features = len(feature_list)
+    _feat_bytes = n_pixels * n_features * 4  # float32 = 4 bytes
+    _avail = _usable_ram_bytes()
+    if _feat_bytes > _avail:
+        raise MemoryError(
+            f"Image too large for non-tiled processing: feature array would need "
+            f"{_feat_bytes / 1e9:.1f} GB but only {_avail / 1e9:.1f} GB is available. "
+            f"Please enable Tile Mode in the settings to process this image in chunks."
+        )
     features = np.empty((n_pixels, n_features), dtype=np.float32)
     for col_idx, col_data in enumerate(feature_list):
         features[:, col_idx] = col_data
