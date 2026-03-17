@@ -66,13 +66,29 @@ def _load_sam3(device: str = "auto"):
 
     import sys as _sys
 
-    # ── 1. Try SAM3 (Linux/CUDA, requires triton) ──────────────────────────
+    # ── 1. Try SAM3 ────────────────────────────────────────────────────────
+    # On Windows, triton may not be installed. We try three paths:
+    #   a) triton-windows package is installed — works natively
+    #   b) inject a MagicMock for triton so sam3 can import (inference only)
+    #   c) neither works — fall through to LangSAM / OWLv2+SAM2
     if _sys.platform == "win32":
         try:
-            import triton  # noqa: F401
+            import triton  # noqa: F401  (triton-windows)
+            print("[RoadExtract] triton-windows found — attempting SAM3")
         except ImportError:
-            print("[RoadExtract] triton not found — SAM3 skipped on Windows "
-                  "(install triton-windows to enable)")
+            # Inject a minimal mock so sam3 can import on Windows.
+            # SAM3 uses triton only for JIT-compiled CUDA kernels; at inference
+            # time PyTorch's built-in SDPA is used instead, so the mock is safe.
+            try:
+                from unittest.mock import MagicMock as _MM
+                _triton_mock = _MM()
+                for _mod in ("triton", "triton.language", "triton.runtime",
+                             "triton.runtime.jit", "triton.ops",
+                             "triton.compiler", "triton.backends"):
+                    _sys.modules.setdefault(_mod, _MM())
+                print("[RoadExtract] triton mocked for Windows SAM3 inference")
+            except Exception:
+                pass
     try:
         from samgeo import SamGeo3
         model = SamGeo3(device=device)
