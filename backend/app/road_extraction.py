@@ -83,6 +83,14 @@ def _load_sam3(device: str = "auto"):
 
     try:
         _sam_model = SamGeo3(device=device)
+    except ImportError as e:
+        if "sam3" in str(e).lower():
+            raise ImportError(
+                "SAM3 extra is not installed.\n"
+                "Run: pip install \"segment-geospatial[samgeo3]\"\n"
+                f"(Underlying error: {e})"
+            ) from e
+        raise
     except RuntimeError as e:
         if "torchvision" in str(e).lower() or "nms" in str(e).lower():
             raise ImportError(

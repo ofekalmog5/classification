@@ -30,5 +30,5 @@ pynvml           # GPU detection (optional, gracefully skipped if missing)
 #     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 #   CPU only:
 #     pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-segment-geospatial   # samgeo: SAM 3 text-prompted geospatial segmentation
+segment-geospatial[samgeo3]   # samgeo: SAM 3 text-prompted geospatial segmentation
 opencv-python-headless  # cv2 for morphological post-processing (optional, falls back to scipy)
