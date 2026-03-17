@@ -105,7 +105,7 @@ def _load_sam3(device: str = "auto"):
     # --- Fall back to LangSAM (Windows-compatible) ---
     try:
         from samgeo.text_sam import LangSAM
-        model = LangSAM(model_type="sam2-hiera-large", device=device)
+        model = LangSAM(model_type="sam2-hiera-large")
         _sam_model = model
         _sam_model_type = "langsam"
         print("[RoadExtract] Loaded LangSAM (SAM 2 + GroundingDINO) model")
