@@ -33,45 +33,37 @@ from rasterio.windows import Window
 # SAM 3 model loading
 # ---------------------------------------------------------------------------
 
-_sam_model = None  # lazy singleton
+_sam_model = None       # lazy singleton
+_sam_model_type = None  # "sam3" or "langsam"
 
 
 def _load_sam3(device: str = "auto"):
-    """Load SamGeo3 model (singleton)."""
-    global _sam_model
+    """Load a text-prompted SAM model (singleton).
+
+    Tries SamGeo3 (SAM 3, Linux/CUDA) first; falls back to LangSAM
+    (GroundingDINO + SAM 2, Windows-compatible) if triton/sam3 is unavailable.
+
+    Returns (model, model_type) where model_type is "sam3" or "langsam".
+    """
+    global _sam_model, _sam_model_type
     if _sam_model is not None:
-        return _sam_model
+        return _sam_model, _sam_model_type
 
     try:
         import torch
     except ImportError:
         raise ImportError(
             "PyTorch is required for road extraction but is not installed.\n"
-            "Install it with one of the following commands:\n\n"
-            "  GPU (CUDA 12.x, RTX 30xx/40xx):\n"
-            "    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121\n\n"
+            "Install with one of:\n\n"
+            "  GPU (CUDA 12.x):\n"
+            "    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121\n"
             "  CPU only:\n"
             "    pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu\n\n"
-            "After installing torch, also run:\n"
-            "    pip install segment-geospatial"
-        ) from None
-
-    # torchvision with C++ ops is required by SAM for NMS (non-maximum suppression)
-    try:
-        import torchvision  # noqa: F401
-        torch.ops.torchvision.nms  # verify C++ ops are available
-    except (ImportError, AttributeError, RuntimeError):
-        raise ImportError(
-            "torchvision with C++ operators is required for road extraction.\n"
-            "The 'torchvision::nms' operator is missing — reinstall torch + torchvision together:\n\n"
-            "  GPU (CUDA 12.x):\n"
-            "    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121\n\n"
-            "  CPU only:\n"
-            "    pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu\n"
+            "Then: pip install segment-geospatial"
         ) from None
 
     try:
-        from samgeo import SamGeo3
+        import samgeo as _samgeo  # noqa: F401
     except ImportError:
         raise ImportError(
             "segment-geospatial is not installed.\n"
@@ -81,26 +73,37 @@ def _load_sam3(device: str = "auto"):
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # --- Try SAM3 first (requires triton, Linux/CUDA only) ---
     try:
-        _sam_model = SamGeo3(device=device)
+        from samgeo import SamGeo3
+        model = SamGeo3(device=device)
+        _sam_model = model
+        _sam_model_type = "sam3"
+        print("[RoadExtract] Loaded SAM 3 model")
+        return _sam_model, _sam_model_type
+    except Exception as e:
+        msg = str(e).lower()
+        if any(k in msg for k in ("triton", "sam3", "no module named")):
+            print(f"[RoadExtract] SAM3 unavailable ({type(e).__name__}: {e}), "
+                  "falling back to LangSAM (GroundingDINO + SAM 2) …")
+        else:
+            raise
+
+    # --- Fall back to LangSAM (Windows-compatible) ---
+    try:
+        from samgeo.text_sam import LangSAM
+        model = LangSAM(model_type="sam2-hiera-large", device=device)
+        _sam_model = model
+        _sam_model_type = "langsam"
+        print("[RoadExtract] Loaded LangSAM (SAM 2 + GroundingDINO) model")
+        return _sam_model, _sam_model_type
     except ImportError as e:
-        if "sam3" in str(e).lower():
-            raise ImportError(
-                "SAM3 extra is not installed.\n"
-                "Run: pip install \"segment-geospatial[samgeo3]\"\n"
-                f"(Underlying error: {e})"
-            ) from e
-        raise
-    except RuntimeError as e:
-        if "torchvision" in str(e).lower() or "nms" in str(e).lower():
-            raise ImportError(
-                f"SAM 3 model failed to load: {e}\n\n"
-                "Reinstall torch + torchvision together:\n"
-                "  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121\n"
-                "  (or /cpu for CPU-only)"
-            ) from e
-        raise
-    return _sam_model
+        raise ImportError(
+            f"Neither SAM3 nor LangSAM could be loaded.\n"
+            f"LangSAM error: {e}\n\n"
+            "Make sure segment-geospatial is installed:\n"
+            "  pip install segment-geospatial"
+        ) from e
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +226,7 @@ def extract_roads(
         progress_callback("Loading SAM 3 model", 0, total_tiles + 2)
 
     # --- load model ---
-    sam = _load_sam3(device)
+    sam, sam_type = _load_sam3(device)
 
     if progress_callback:
         progress_callback("Loading SAM 3 model", 1, total_tiles + 2)
@@ -247,8 +250,8 @@ def extract_roads(
                     # Convert to HWC uint8 for SAM
                     tile_rgb = np.moveaxis(tile_data[:3], 0, -1).astype(np.uint8)
 
-                    # --- Run SAM 3 text-prompted segmentation ---
-                    mask_tile = _segment_tile(sam, tile_rgb, text_prompt)
+                    # --- Run SAM text-prompted segmentation ---
+                    mask_tile = _segment_tile(sam, sam_type, tile_rgb, text_prompt)
                     # mask_tile: (H, W) binary uint8 {0, 1}
 
                     # Crop to write region (inner portion)
@@ -283,9 +286,10 @@ def extract_roads(
     return {"status": "ok", "outputPath": output_path}
 
 
-def _segment_tile(sam, tile_rgb: np.ndarray, text_prompt: str) -> np.ndarray:
-    """Run SAM 3 text-prompted segmentation on a single tile.
+def _segment_tile(sam, sam_type: str, tile_rgb: np.ndarray, text_prompt: str) -> np.ndarray:
+    """Run text-prompted segmentation on a single tile.
 
+    Supports both SamGeo3 (sam_type="sam3") and LangSAM (sam_type="langsam").
     Returns a binary mask (H, W) with 1 = road, 0 = background.
     """
     h, w = tile_rgb.shape[:2]
@@ -299,16 +303,27 @@ def _segment_tile(sam, tile_rgb: np.ndarray, text_prompt: str) -> np.ndarray:
     tmp_output.close()
 
     try:
-        # Write input tile as PNG (use PIL if cv2 unavailable)
+        # Write input tile as PNG
         if _CV2_AVAILABLE:
             cv2.imwrite(tmp_input_path, cv2.cvtColor(tile_rgb, cv2.COLOR_RGB2BGR))
         else:
             from PIL import Image as _PILImage
             _PILImage.fromarray(tile_rgb).save(tmp_input_path)
 
-        sam.set_image(tmp_input_path)
-        sam.text_prompt = text_prompt
-        sam.generate(output=tmp_output_path)
+        if sam_type == "langsam":
+            # LangSAM API: predict(image, text_prompt, output=path)
+            sam.predict(
+                tmp_input_path,
+                text_prompt,
+                box_threshold=0.24,
+                text_threshold=0.24,
+                output=tmp_output_path,
+            )
+        else:
+            # SamGeo3 API
+            sam.set_image(tmp_input_path)
+            sam.text_prompt = text_prompt
+            sam.generate(output=tmp_output_path)
 
         # Read the generated mask
         if Path(tmp_output_path).exists():
@@ -316,11 +331,9 @@ def _segment_tile(sam, tile_rgb: np.ndarray, text_prompt: str) -> np.ndarray:
                 mask = cv2.imread(tmp_output_path, cv2.IMREAD_GRAYSCALE)
             else:
                 from PIL import Image as _PILImage
-                import numpy as _np
-                mask = _np.array(_PILImage.open(tmp_output_path).convert("L"))
+                mask = np.array(_PILImage.open(tmp_output_path).convert("L"))
             if mask is not None:
-                binary = (mask > 0).astype(np.uint8)
-                return binary
+                return (mask > 0).astype(np.uint8)
 
         return np.zeros((h, w), dtype=np.uint8)
 
