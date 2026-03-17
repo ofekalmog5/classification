@@ -763,16 +763,31 @@ def _write_composite_material_xml(
     The XML is placed next to ``output_path`` with the same stem and a ``.xml``
     extension.  Each MEA class produces one ``<Composite_Material>`` entry whose
     color is the ARGB hex of the class colour (fully-opaque, lower-case).
-    """
-    import xml.etree.ElementTree as ET
 
+    Output format (2-space indent, no XML declaration):
+
+        <Composite_Material_Table>
+          <Composite_Material index="1">
+            <Name>GENVEGETATION</Name>
+            <Color>#ff004600</Color>
+            <Primary_Substrate>
+              <Thickness>1</Thickness>
+              <Material>
+                <Name>BM_VEGETATION</Name>
+                <Weight>100</Weight>
+              </Material>
+            </Primary_Substrate>
+          </Composite_Material>
+          ...
+        </Composite_Material_Table>
+    """
     xml_path = Path(output_path).with_suffix(".xml")
 
-    root = ET.Element("Composite_Material_Table")
+    lines: List[str] = ["<Composite_Material_Table>"]
 
     for idx, cls in enumerate(classes, start=1):
-        bm_name   = cls.get("name", "")
-        color_hex = cls.get("color", "#000000")
+        bm_name        = cls.get("name", "")
+        color_hex      = cls.get("color", "#000000")
         composite_name = _MEA_COMPOSITE_NAMES.get(bm_name, bm_name.replace("BM_", ""))
 
         # Build ARGB colour: #ff + RRGGBB (lower-case, no alpha adjustment).
@@ -781,19 +796,24 @@ def _write_composite_material_xml(
         else:
             argb_color = "#ff000000"
 
-        cm = ET.SubElement(root, "Composite_Material", index=str(idx))
-        ET.SubElement(cm, "Name").text = composite_name
-        ET.SubElement(cm, "Color").text = argb_color
-        ps  = ET.SubElement(cm, "Primary_Substrate")
-        ET.SubElement(ps, "Thickness").text = "1"
-        mat = ET.SubElement(ps, "Material")
-        ET.SubElement(mat, "Name").text = bm_name
-        ET.SubElement(mat, "Weight").text = "100"
+        lines += [
+            f'  <Composite_Material index="{idx}">',
+            f'    <Name>{composite_name}</Name>',
+            f'    <Color>{argb_color}</Color>',
+            f'    <Primary_Substrate>',
+            f'      <Thickness>1</Thickness>',
+            f'      <Material>',
+            f'        <Name>{bm_name}</Name>',
+            f'        <Weight>100</Weight>',
+            f'      </Material>',
+            f'    </Primary_Substrate>',
+            f'  </Composite_Material>',
+        ]
 
-    ET.indent(root, space="  ")
-    tree = ET.ElementTree(root)
+    lines.append("</Composite_Material_Table>")
+
     try:
-        tree.write(str(xml_path), encoding="unicode", xml_declaration=False)
+        xml_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         print(f"  [XML] Composite material table written: {xml_path}")
         return str(xml_path)
     except Exception as exc:
