@@ -49,11 +49,25 @@ def _load_sam3(device: str = "auto"):
             "PyTorch is required for road extraction but is not installed.\n"
             "Install it with one of the following commands:\n\n"
             "  GPU (CUDA 12.x, RTX 30xx/40xx):\n"
-            "    pip install torch --index-url https://download.pytorch.org/whl/cu121\n\n"
+            "    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121\n\n"
             "  CPU only:\n"
-            "    pip install torch --index-url https://download.pytorch.org/whl/cpu\n\n"
+            "    pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu\n\n"
             "After installing torch, also run:\n"
             "    pip install segment-geospatial"
+        ) from None
+
+    # torchvision with C++ ops is required by SAM for NMS (non-maximum suppression)
+    try:
+        import torchvision  # noqa: F401
+        torch.ops.torchvision.nms  # verify C++ ops are available
+    except (ImportError, AttributeError, RuntimeError):
+        raise ImportError(
+            "torchvision with C++ operators is required for road extraction.\n"
+            "The 'torchvision::nms' operator is missing — reinstall torch + torchvision together:\n\n"
+            "  GPU (CUDA 12.x):\n"
+            "    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121\n\n"
+            "  CPU only:\n"
+            "    pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu\n"
         ) from None
 
     try:
@@ -67,7 +81,17 @@ def _load_sam3(device: str = "auto"):
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    _sam_model = SamGeo3(device=device)
+    try:
+        _sam_model = SamGeo3(device=device)
+    except RuntimeError as e:
+        if "torchvision" in str(e).lower() or "nms" in str(e).lower():
+            raise ImportError(
+                f"SAM 3 model failed to load: {e}\n\n"
+                "Reinstall torch + torchvision together:\n"
+                "  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121\n"
+                "  (or /cpu for CPU-only)"
+            ) from e
+        raise
     return _sam_model
 
 

@@ -3718,8 +3718,13 @@ def build_shared_color_table(
             with rasterio.open(rp) as src:
                 H, W   = src.height, src.width
                 nbytes = H * W * src.count * int(np.dtype(src.dtypes[0]).itemsize)
-                if nbytes > int(_usable_ram_bytes() * 0.60):
-                    print(f"[SharedTable][warn] {Path(rp).name} too large for semantics, skipping")
+                # Also estimate feature array: ~15 features × 4 bytes (float32) per pixel
+                _feat_est = H * W * 15 * 4
+                _ram_avail = _usable_ram_bytes()
+                if nbytes + _feat_est > int(_ram_avail * 0.70):
+                    print(f"[SharedTable][warn] {Path(rp).name} too large for semantics "
+                          f"(raster {nbytes/1e9:.1f}GB + features ~{_feat_est/1e9:.1f}GB "
+                          f"> {_ram_avail*0.70/1e9:.1f}GB budget), skipping")
                     continue
                 rd = src.read()
         except Exception as e:
@@ -3727,8 +3732,9 @@ def build_shared_color_table(
             continue
 
         feat   = _extract_pixel_features(rd, feature_flags, verbose=False)
+        _mean  = scaler.mean_.astype(np.float32)
         scale  = np.where(scaler.scale_ == 0, 1.0, scaler.scale_).astype(np.float32)
-        fnorm  = ((feat - scaler.mean_) / scale).astype(np.float32)
+        fnorm  = ((feat - _mean) / scale)  # stays float32, no float64 intermediate
         labels = _nearest_center_chunked(fnorm, kmeans.cluster_centers_.astype(np.float32)) + 1
         cr     = labels.reshape(H, W)
         counts = np.bincount(labels - 1, minlength=n_clusters).astype(np.float64)
@@ -4527,6 +4533,14 @@ def _extract_pixel_features(
 
     # Pre-allocate output (n_pixels, n_features) in float32 and fill column-by-column
     n_features = len(feature_list)
+    _feat_bytes = n_pixels * n_features * 4  # float32 = 4 bytes
+    _avail = _available_ram_bytes()
+    if _feat_bytes > _avail:
+        raise MemoryError(
+            f"Image too large for non-tiled processing: feature array would need "
+            f"{_feat_bytes / 1e9:.1f} GB but only {_avail / 1e9:.1f} GB is available. "
+            f"Please enable Tile Mode in the settings to process this image in chunks."
+        )
     features = np.empty((n_pixels, n_features), dtype=np.float32)
     for col_idx, col_data in enumerate(feature_list):
         features[:, col_idx] = col_data

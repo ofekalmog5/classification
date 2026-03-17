@@ -28,7 +28,7 @@ export const initialState: AppState = {
   classCount: 3,
   vectorLayers: [],
   performance: {
-    useTiling: false,
+    useTiling: true,
     tileSize: "Auto",
     tileWorkers: cpuCount,
     imageWorkers: Math.min(4, cpuCount),
