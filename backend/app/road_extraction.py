@@ -110,12 +110,22 @@ def _load_sam3(device: str = "auto"):
         _sam_model_type = "langsam"
         print("[RoadExtract] Loaded LangSAM (SAM 2 + GroundingDINO) model")
         return _sam_model, _sam_model_type
+    except NameError as e:
+        if "SLConfig" in str(e) or "slconfig" in str(e).lower():
+            raise ImportError(
+                "GroundingDINO is missing or broken (SLConfig not defined).\n"
+                "Fix with:\n"
+                "  pip install groundingdino-py\n\n"
+                "Then restart the backend and try again."
+            ) from e
+        raise
     except ImportError as e:
         raise ImportError(
             f"Neither SAM3 nor LangSAM could be loaded.\n"
-            f"LangSAM error: {e}\n\n"
-            "To use SAM3 on Windows: pip install triton-windows\n"
-            "To use LangSAM:         pip install segment-geospatial"
+            f"Error: {e}\n\n"
+            "Required packages:\n"
+            "  pip install groundingdino-py segment-geospatial\n"
+            "  pip install triton-windows  (for SAM3 on Windows)"
         ) from e
 
 
