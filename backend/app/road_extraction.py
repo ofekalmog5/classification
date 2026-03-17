@@ -234,9 +234,19 @@ def extract_roads(
     input_path = str(input_path)
     inp = Path(input_path)
 
+    # Handle output path - ensure it's a valid .tif file path
     if output_path is None:
         output_path = str(inp.with_name(f"{inp.stem}_roads.tif"))
-    output_path = str(output_path)
+    else:
+        outp = Path(output_path)
+        if outp.is_dir():
+            # Directory provided - create filename inside it
+            output_path = str(outp / f"{inp.stem}_roads.tif")
+        elif not outp.suffix or outp.suffix.lower() not in ['.tif', '.tiff']:
+            # No extension or wrong extension - add .tif
+            output_path = str(outp.with_suffix('.tif'))
+        else:
+            output_path = str(outp)
 
     # --- open source raster metadata ---
     with rasterio.open(input_path) as src:
@@ -510,9 +520,20 @@ def merge_road_mask_onto_classification(
     dict  ``{"status": "ok", "outputPath": "..."}``
     """
     cls_path = Path(classification_path)
+
+    # Handle output path - ensure it's a valid .tif file path
     if output_path is None:
         output_path = str(cls_path.with_name(f"{cls_path.stem}_roads_merged.tif"))
-    output_path = str(output_path)
+    else:
+        outp = Path(output_path)
+        if outp.is_dir():
+            # Directory provided - create filename inside it
+            output_path = str(outp / f"{cls_path.stem}_roads_merged.tif")
+        elif not outp.suffix or outp.suffix.lower() not in ['.tif', '.tiff']:
+            # No extension or wrong extension - add .tif
+            output_path = str(outp.with_suffix('.tif'))
+        else:
+            output_path = str(outp)
 
     with rasterio.open(classification_path) as cls_src:
         profile = cls_src.profile.copy()
