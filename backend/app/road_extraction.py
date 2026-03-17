@@ -73,7 +73,17 @@ def _load_sam3(device: str = "auto"):
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # --- Try SAM3 first (requires triton, Linux/CUDA only) ---
+    # --- On Windows, try to inject triton-windows so sam3 can load ---
+    import sys as _sys
+    if _sys.platform == "win32":
+        try:
+            import triton  # noqa: F401 — triton-windows package
+        except ImportError:
+            # triton-windows not installed — warn once, SAM3 will fail below
+            print("[RoadExtract] triton not found on Windows. "
+                  "For SAM3 support run: pip install triton-windows")
+
+    # --- Try SAM3 first ---
     try:
         from samgeo import SamGeo3
         model = SamGeo3(device=device)
@@ -84,8 +94,11 @@ def _load_sam3(device: str = "auto"):
     except Exception as e:
         msg = str(e).lower()
         if any(k in msg for k in ("triton", "sam3", "no module named")):
-            print(f"[RoadExtract] SAM3 unavailable ({type(e).__name__}: {e}), "
-                  "falling back to LangSAM (GroundingDINO + SAM 2) …")
+            print(f"[RoadExtract] SAM3 unavailable ({type(e).__name__}: {e})")
+            if _sys.platform == "win32":
+                print("[RoadExtract] Tip: install triton-windows to enable SAM3: "
+                      "pip install triton-windows")
+            print("[RoadExtract] Falling back to LangSAM (GroundingDINO + SAM 2) …")
         else:
             raise
 
@@ -101,8 +114,8 @@ def _load_sam3(device: str = "auto"):
         raise ImportError(
             f"Neither SAM3 nor LangSAM could be loaded.\n"
             f"LangSAM error: {e}\n\n"
-            "Make sure segment-geospatial is installed:\n"
-            "  pip install segment-geospatial"
+            "To use SAM3 on Windows: pip install triton-windows\n"
+            "To use LangSAM:         pip install segment-geospatial"
         ) from e
 
 
