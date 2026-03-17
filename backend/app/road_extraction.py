@@ -18,7 +18,13 @@ import tempfile
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-import cv2
+try:
+    import cv2
+    _CV2_AVAILABLE = True
+except ImportError:
+    cv2 = None  # type: ignore
+    _CV2_AVAILABLE = False
+
 import numpy as np
 import rasterio
 from rasterio.windows import Window
@@ -242,7 +248,12 @@ def _segment_tile(sam, tile_rgb: np.ndarray, text_prompt: str) -> np.ndarray:
     tmp_output.close()
 
     try:
-        cv2.imwrite(tmp_input_path, cv2.cvtColor(tile_rgb, cv2.COLOR_RGB2BGR))
+        # Write input tile as PNG (use PIL if cv2 unavailable)
+        if _CV2_AVAILABLE:
+            cv2.imwrite(tmp_input_path, cv2.cvtColor(tile_rgb, cv2.COLOR_RGB2BGR))
+        else:
+            from PIL import Image as _PILImage
+            _PILImage.fromarray(tile_rgb).save(tmp_input_path)
 
         sam.set_image(tmp_input_path)
         sam.text_prompt = text_prompt
@@ -250,13 +261,16 @@ def _segment_tile(sam, tile_rgb: np.ndarray, text_prompt: str) -> np.ndarray:
 
         # Read the generated mask
         if Path(tmp_output_path).exists():
-            mask = cv2.imread(tmp_output_path, cv2.IMREAD_GRAYSCALE)
+            if _CV2_AVAILABLE:
+                mask = cv2.imread(tmp_output_path, cv2.IMREAD_GRAYSCALE)
+            else:
+                from PIL import Image as _PILImage
+                import numpy as _np
+                mask = _np.array(_PILImage.open(tmp_output_path).convert("L"))
             if mask is not None:
-                # Binarize — any non-zero pixel is road
                 binary = (mask > 0).astype(np.uint8)
                 return binary
 
-        # If SAM produced no mask, return zeros
         return np.zeros((h, w), dtype=np.uint8)
 
     finally:
@@ -276,10 +290,15 @@ def _morphological_close(
     """Apply morphological closing to bridge small gaps in the road mask.
 
     Processes in horizontal strips to handle very large rasters without OOM.
+    Falls back to scipy binary_closing if cv2 is not installed.
     """
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
-    )
+    if _CV2_AVAILABLE:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+        )
+    else:
+        from scipy.ndimage import generate_binary_structure as _gbs
+        kernel = None  # used as flag; scipy path below
     pad = kernel_size  # context rows needed above/below each strip
 
     with rasterio.open(raw_mask_path) as src:
@@ -298,7 +317,16 @@ def _morphological_close(
                 win = Window(0, read_start, width, read_h)
                 data = src.read(1, window=win)  # (H, W) uint8
 
-                closed = cv2.morphologyEx(data, cv2.MORPH_CLOSE, kernel)
+                if _CV2_AVAILABLE:
+                    closed = cv2.morphologyEx(data, cv2.MORPH_CLOSE, kernel)
+                else:
+                    from scipy.ndimage import binary_closing as _bc
+                    import numpy as _np
+                    disk = _np.zeros((kernel_size, kernel_size), dtype=bool)
+                    cx = kernel_size // 2
+                    Y, X = _np.ogrid[:kernel_size, :kernel_size]
+                    disk[(X - cx) ** 2 + (Y - cx) ** 2 <= cx ** 2] = True
+                    closed = _bc(data.astype(bool), structure=disk).astype(np.uint8)
 
                 # Crop back to the inner strip (remove padding)
                 inner_top = row_start - read_start
