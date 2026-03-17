@@ -1,5 +1,6 @@
 node_modules/
 dist/
+*.exe
 app/dist/
 app/node_modules/
 app/.venv/
