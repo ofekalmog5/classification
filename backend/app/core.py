@@ -659,6 +659,59 @@ def _pad_array_to_pow2(arr: np.ndarray) -> Tuple[np.ndarray, int, int]:
     return padded, new_h, new_w
 
 
+def _reproject_to_wgs84(
+    arr: np.ndarray,
+    src_transform,
+    src_crs,
+    width: int,
+    height: int,
+) -> Tuple[np.ndarray, object, int, int, object]:
+    """Reproject *arr* to EPSG:4326 (WGS-84 geographic).
+
+    Returns ``(reprojected_array, new_transform, new_height, new_width, new_crs)``.
+    If the source CRS is already EPSG:4326, or reprojection fails, the inputs
+    are returned unchanged so callers can always unpack the 5-tuple safely.
+    """
+    from rasterio.warp import calculate_default_transform, reproject, Resampling
+
+    dst_crs = CRS.from_epsg(4326)
+
+    if src_crs is None:
+        return arr, src_transform, height, width, src_crs
+    try:
+        if src_crs.to_epsg() == 4326:
+            return arr, src_transform, height, width, src_crs
+    except Exception:
+        pass
+
+    try:
+        dst_transform, dst_w, dst_h = calculate_default_transform(
+            src_crs, dst_crs, width, height, transform=src_transform,
+        )
+        if arr.ndim == 2:
+            dst_arr = np.zeros((dst_h, dst_w), dtype=arr.dtype)
+            reproject(
+                source=arr, destination=dst_arr,
+                src_transform=src_transform, src_crs=src_crs,
+                dst_transform=dst_transform, dst_crs=dst_crs,
+                resampling=Resampling.nearest,
+            )
+        else:
+            bands = arr.shape[0]
+            dst_arr = np.zeros((bands, dst_h, dst_w), dtype=arr.dtype)
+            for i in range(bands):
+                reproject(
+                    source=arr[i], destination=dst_arr[i],
+                    src_transform=src_transform, src_crs=src_crs,
+                    dst_transform=dst_transform, dst_crs=dst_crs,
+                    resampling=Resampling.nearest,
+                )
+        return dst_arr, dst_transform, dst_h, dst_w, dst_crs
+    except Exception as _exc:
+        print(f"  [REPROJECT] Warning: could not reproject to EPSG:4326: {_exc}")
+        return arr, src_transform, height, width, src_crs
+
+
 def _write_txr_file(
     output_path,
     transform,
@@ -2419,6 +2472,13 @@ def _classify_tile_worker(args: tuple) -> str:
 
     rgb = _apply_color_table(predicted_raster, color_table, verbose=False)
 
+    # Reproject to EPSG:4326 — GeoSpecific engine requirement.
+    rgb, tile_transform, height, width, tile_crs = _reproject_to_wgs84(
+        rgb, tile_transform, tile_crs, width, height,
+    )
+    # Propagate updated georeferencing into the profile so write_profile inherits it.
+    profile.update(transform=tile_transform, crs=tile_crs, height=height, width=width)
+
     # Pad to power-of-2 dimensions — GeoSpecific engine requirement.
     rgb, pad_h, pad_w = _pad_array_to_pow2(rgb)
 
@@ -2494,6 +2554,12 @@ def _rasterize_tile_worker(args: Tuple[str, Optional[Tuple[int, int, int, int]],
             output_array[0][burned_mask > 0] = r
             output_array[1][burned_mask > 0] = g
             output_array[2][burned_mask > 0] = b
+
+    # Reproject to EPSG:4326 — GeoSpecific engine requirement.
+    output_array, transform, height, width, raster_crs = _reproject_to_wgs84(
+        output_array, transform, raster_crs, width, height,
+    )
+    meta.update(transform=transform, crs=raster_crs, height=height, width=width)
 
     # Pad to power-of-2 dimensions — GeoSpecific engine requirement.
     output_array, pad_h, pad_w = _pad_array_to_pow2(output_array)
@@ -2738,6 +2804,12 @@ def rasterize_vector_onto_raster(raster_path: str, gdf, burn_value: int, output_
     unique_values = np.unique(output_array)
     print(f"    Unique values in output: {unique_values[:20]}..." if len(unique_values) > 20 else f"    Unique values in output: {unique_values}")
     
+    # Reproject to EPSG:4326 — GeoSpecific engine requirement.
+    output_array, transform, height, width, raster_crs = _reproject_to_wgs84(
+        output_array, transform, raster_crs, width, height,
+    )
+    meta.update(transform=transform, crs=raster_crs, height=height, width=width)
+
     # Pad to power-of-2 dimensions — GeoSpecific engine requirement.
     output_array, _pad_h, _pad_w = _pad_array_to_pow2(output_array)
     meta.update(height=_pad_h, width=_pad_w)
@@ -3358,6 +3430,14 @@ def classify_and_export(
     # Free large arrays before writing — only rgb is needed from here.
     del predicted_raster, raster_data
     gc.collect()
+
+    # Reproject to EPSG:4326 — GeoSpecific engine requirement.
+    _rp_transform = profile.get("transform")
+    _rp_crs = profile.get("crs")
+    rgb, _rp_transform, _rp_h, _rp_w, _rp_crs = _reproject_to_wgs84(
+        rgb, _rp_transform, _rp_crs, rgb.shape[2], rgb.shape[1],
+    )
+    profile.update(transform=_rp_transform, crs=_rp_crs, height=_rp_h, width=_rp_w)
 
     # Write RGB output
     rgb_profile = profile.copy()
