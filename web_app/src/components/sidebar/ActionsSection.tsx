@@ -1,10 +1,12 @@
-import { useCallback, useRef } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useAppState, useAppDispatch } from "../../store";
 import {
   runStep1,
   runStep2,
   runFullPipeline,
   runBatchClassify,
+  extractRoads,
+  mergeRoadMask,
   generateTaskId,
   startProgressStream,
   cancelTask,
@@ -28,6 +30,7 @@ export default function ActionsSection() {
   const isRunning = state.running !== "idle";
   const runStartRef = useRef<number>(0);
   const activeTaskIdRef = useRef<string | null>(null);
+  const [roadMaskPath, setRoadMaskPath] = useState<string | null>(null);
 
   const handleCancel = useCallback(async () => {
     const tid = activeTaskIdRef.current;
@@ -428,6 +431,88 @@ export default function ActionsSection() {
     dispatch({ type: "SET_RUNNING", step: "idle" });
   };
 
+  const handleExtractRoads = async () => {
+    const rasterFiles = getRasterFiles();
+    if (rasterFiles.length === 0) {
+      if (!state.rasterPath) return alert("Select a raster image first.");
+      rasterFiles.push(state.rasterPath);
+    }
+    const file = rasterFiles[0];
+    const fileName = file.split(/[\\/]/).pop() || file;
+    runStartRef.current = Date.now();
+    dispatch({ type: "SET_RUNNING", step: "step1" });
+    dispatch({ type: "SET_STATUS", text: `Extracting roads (SAM 3): ${fileName}…` });
+    dispatch({ type: "SET_PROGRESS", progress: null });
+    const taskId = generateTaskId();
+    activeTaskIdRef.current = taskId;
+    const stopProgress = startProgressStream(taskId, (evt) => {
+      dispatch({ type: "SET_PROGRESS", progress: evt });
+    });
+    try {
+      const result = await extractRoads({
+        rasterPath: file,
+        outputPath: state.outputPath || undefined,
+        taskId,
+      });
+      const elapsed = formatElapsed(Date.now() - runStartRef.current);
+      if ((result as any).status === "cancelled") {
+        dispatch({ type: "SET_STATUS", text: "Road extraction cancelled" });
+      } else if (result.status === "ok" && result.outputPath) {
+        setRoadMaskPath(result.outputPath);
+        dispatch({ type: "SET_STATUS", text: `Road extraction complete (${elapsed})` });
+        addResultsToGroup("Road Mask (SAM 3)", [result.outputPath]);
+      } else {
+        dispatch({ type: "SET_STATUS", text: `Road extraction failed: ${(result as any).message ?? "Unknown"}` });
+      }
+    } catch (e: any) {
+      dispatch({ type: "SET_STATUS", text: `Road extraction error: ${e.message}` });
+    } finally {
+      activeTaskIdRef.current = null;
+      stopProgress();
+      dispatch({ type: "SET_PROGRESS", progress: null });
+      dispatch({ type: "SET_RUNNING", step: "idle" });
+    }
+  };
+
+  const handleMergeRoadMask = async () => {
+    if (!roadMaskPath) return alert("Run 'Extract Roads' first to produce a road mask.");
+    if (!state.lastResultPath) return alert("Run classification first to produce an output.");
+    runStartRef.current = Date.now();
+    dispatch({ type: "SET_RUNNING", step: "step2" });
+    dispatch({ type: "SET_STATUS", text: "Merging road mask onto classification…" });
+    dispatch({ type: "SET_PROGRESS", progress: null });
+    const taskId = generateTaskId();
+    activeTaskIdRef.current = taskId;
+    const stopProgress = startProgressStream(taskId, (evt) => {
+      dispatch({ type: "SET_PROGRESS", progress: evt });
+    });
+    try {
+      const result = await mergeRoadMask({
+        classificationPath: state.lastResultPath,
+        roadMaskPath,
+        outputPath: state.outputPath || undefined,
+        taskId,
+      });
+      const elapsed = formatElapsed(Date.now() - runStartRef.current);
+      if ((result as any).status === "cancelled") {
+        dispatch({ type: "SET_STATUS", text: "Merge cancelled" });
+      } else if (result.status === "ok" && result.outputPath) {
+        dispatch({ type: "SET_LAST_RESULT_PATH", path: result.outputPath });
+        dispatch({ type: "SET_STATUS", text: `Road mask merged (${elapsed})` });
+        addResultsToGroup("Classification + Roads", [result.outputPath]);
+      } else {
+        dispatch({ type: "SET_STATUS", text: `Merge failed: ${(result as any).message ?? "Unknown"}` });
+      }
+    } catch (e: any) {
+      dispatch({ type: "SET_STATUS", text: `Merge error: ${e.message}` });
+    } finally {
+      activeTaskIdRef.current = null;
+      stopProgress();
+      dispatch({ type: "SET_PROGRESS", progress: null });
+      dispatch({ type: "SET_RUNNING", step: "idle" });
+    }
+  };
+
   const handleSingleResult = (result: any, label: string) => {
     const elapsed = formatElapsed(Date.now() - runStartRef.current);
     if (result.status === "ok") {
@@ -485,6 +570,20 @@ export default function ActionsSection() {
         color="emerald"
         full
       />
+      <div className="grid grid-cols-2 gap-1.5 pt-1 border-t border-surface-700">
+        <ActionBtn
+          label="Extract Roads (SAM)"
+          onClick={handleExtractRoads}
+          disabled={isRunning}
+          color="amber"
+        />
+        <ActionBtn
+          label="Merge Road Mask"
+          onClick={handleMergeRoadMask}
+          disabled={isRunning || !roadMaskPath || !state.lastResultPath}
+          color="amber"
+        />
+      </div>
       {isRunning && (
         <button
           className="w-full text-xs font-medium py-1.5 px-2 rounded transition-colors bg-red-600 hover:bg-red-700 text-white"
@@ -507,7 +606,7 @@ function ActionBtn({
   label: string;
   onClick: () => void;
   disabled: boolean;
-  color: "blue" | "indigo" | "emerald";
+  color: "blue" | "indigo" | "emerald" | "amber";
   full?: boolean;
 }) {
   const base =
@@ -516,6 +615,7 @@ function ActionBtn({
     blue: "bg-primary-600 hover:bg-primary-700 text-white",
     indigo: "bg-indigo-600 hover:bg-indigo-700 text-white",
     emerald: "bg-emerald-600 hover:bg-emerald-700 text-white",
+    amber: "bg-amber-600 hover:bg-amber-700 text-white",
   };
   return (
     <button

@@ -29,6 +29,8 @@ from .core import classify_and_export as run_classify_and_export
 from .core import rasterize_vectors_onto_classification as run_rasterize_vectors
 from .core import train_kmeans_model, build_shared_color_table, suggest_tile_size
 from .core import _ACCEL_ENGINE, _ACCEL_GPU, _ACCEL_GPU_INFO
+from .road_extraction import extract_roads as run_extract_roads
+from .road_extraction import merge_road_mask_onto_classification as run_merge_road_mask
 
 # ─── SSE progress streaming infrastructure ───────────────────────────────
 
@@ -56,6 +58,11 @@ _PHASE_WEIGHTS: Dict[str, float] = {
     # Batch phases
     "Training shared model": 15,
     "Classifying": 5,
+    # Road extraction phases
+    "Loading SAM 3 model": 10,
+    "Extracting roads": 70,
+    "Morphological closing": 10,
+    "Merging road mask": 80,
 }
 
 # Approximate total weight per pipeline (for normalising to 0–100 %).
@@ -64,6 +71,8 @@ _PIPELINE_TOTALS: Dict[str, float] = {
     "full": 180,   # step1 + step2
     "mea": 180,
     "step2": 80,
+    "road_extract": 100,
+    "road_merge": 100,
 }
 
 
@@ -590,6 +599,77 @@ def classify_step2(request: ClassifyStep2Request) -> dict:
     except TaskCancelledError:
         return JSONResponse(status_code=499, content={"status": "cancelled", "message": "Task cancelled by user"})
     except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+    finally:
+        if tracker:
+            tracker.finish()
+
+
+# ─── Road extraction (SAM 3) ────────────────────────────────────────────
+
+
+class ExtractRoadsRequest(BaseModel):
+    rasterPath: str
+    outputPath: str | None = None
+    textPrompt: str = "road, highway, asphalt path"
+    tileSize: int = 1024
+    overlapPct: float = 0.1
+    closingKernelSize: int = 15
+    device: str = "auto"
+    taskId: str | None = None
+
+
+@app.post("/extract-roads")
+def extract_roads(request: ExtractRoadsRequest) -> dict:
+    """Extract roads from a GeoTIFF using SAM 3 text-prompted segmentation."""
+    print(f"[API /extract-roads] rasterPath={request.rasterPath!r}")
+    tracker = _ProgressTracker(request.taskId, "road_extract") if request.taskId else None
+    try:
+        result = run_extract_roads(
+            input_path=request.rasterPath,
+            output_path=request.outputPath,
+            text_prompt=request.textPrompt,
+            tile_size=request.tileSize,
+            overlap_pct=request.overlapPct,
+            closing_kernel_size=request.closingKernelSize,
+            device=request.device,
+            progress_callback=tracker,
+        )
+        return result
+    except TaskCancelledError:
+        return JSONResponse(status_code=499, content={"status": "cancelled", "message": "Task cancelled by user"})
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+    finally:
+        if tracker:
+            tracker.finish()
+
+
+class MergeRoadMaskRequest(BaseModel):
+    classificationPath: str
+    roadMaskPath: str
+    outputPath: str | None = None
+    taskId: str | None = None
+
+
+@app.post("/merge-road-mask")
+def merge_road_mask(request: MergeRoadMaskRequest) -> dict:
+    """Merge a road mask onto a classification output as BM_ASPHALT."""
+    print(f"[API /merge-road-mask] classification={request.classificationPath!r} mask={request.roadMaskPath!r}")
+    tracker = _ProgressTracker(request.taskId, "road_merge") if request.taskId else None
+    try:
+        result = run_merge_road_mask(
+            classification_path=request.classificationPath,
+            road_mask_path=request.roadMaskPath,
+            output_path=request.outputPath,
+            progress_callback=tracker,
+        )
+        return result
+    except TaskCancelledError:
+        return JSONResponse(status_code=499, content={"status": "cancelled", "message": "Task cancelled by user"})
+    except Exception as e:
+        import traceback; traceback.print_exc()
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
     finally:
         if tracker:

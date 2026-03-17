@@ -276,6 +276,60 @@ export function startProgressStream(
   return () => es.close();
 }
 
+/* ── Road extraction (SAM 3) ─────────────────────────────────────── */
+export interface ExtractRoadsParams {
+  rasterPath: string;
+  outputPath?: string;
+  textPrompt?: string;
+  tileSize?: number;
+  overlapPct?: number;
+  closingKernelSize?: number;
+  device?: string;
+  taskId?: string;
+}
+
+export async function extractRoads(params: ExtractRoadsParams): Promise<ClassifyResult> {
+  const body = {
+    rasterPath: params.rasterPath,
+    outputPath: params.outputPath || null,
+    textPrompt: params.textPrompt || "road, highway, asphalt path",
+    tileSize: params.tileSize ?? 1024,
+    overlapPct: params.overlapPct ?? 0.1,
+    closingKernelSize: params.closingKernelSize ?? 15,
+    device: params.device || "auto",
+    taskId: params.taskId ?? null,
+  };
+  const r = await fetch(`${BASE}/extract-roads`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return parseApiResponse<ClassifyResult>(r);
+}
+
+/* ── Merge road mask onto classification ─────────────────────────── */
+export interface MergeRoadMaskParams {
+  classificationPath: string;
+  roadMaskPath: string;
+  outputPath?: string;
+  taskId?: string;
+}
+
+export async function mergeRoadMask(params: MergeRoadMaskParams): Promise<ClassifyResult> {
+  const body = {
+    classificationPath: params.classificationPath,
+    roadMaskPath: params.roadMaskPath,
+    outputPath: params.outputPath || null,
+    taskId: params.taskId ?? null,
+  };
+  const r = await fetch(`${BASE}/merge-road-mask`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return parseApiResponse<ClassifyResult>(r);
+}
+
 /* ── File browsing (used in electron / local mode) ───────────────── */
 export async function browseFile(
   options?: { directory?: boolean; save?: boolean; filters?: string[] }

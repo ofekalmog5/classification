@@ -23,3 +23,7 @@ faiss-cpu        # Fast CPU KMeans (3-8x sklearn). For faiss-gpu: conda install 
 # If not installed, the app automatically falls back to faiss-cpu.
 
 pynvml           # GPU detection (optional, gracefully skipped if missing)
+
+# ── Road extraction via SAM 3 (Segment Anything Model 3) ─────────────────
+segment-geospatial   # samgeo: SAM 3 text-prompted geospatial segmentation
+opencv-python-headless  # cv2 for morphological post-processing
