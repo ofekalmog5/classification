@@ -2440,6 +2440,11 @@ def _classify_tile_worker(args: tuple) -> str:
     _write_txr_file(output_path_obj, tile_transform, tile_crs, pad_w, pad_h)
     _t_left, _t_bottom, _t_right, _t_top = _bounds_wgs84(tile_transform, tile_crs, pad_w, pad_h)
 
+    # Write companion XML for every classified tile.
+    _tile_classes = extra.get("classes", [])
+    if _tile_classes:
+        _write_composite_material_xml(output_path_obj, list(_tile_classes))
+
     return (str(output_path_obj), _t_left, _t_bottom, _t_right, _t_top, pad_w, pad_h)
 
 
@@ -3247,11 +3252,6 @@ def classify_and_export(
         print(_ce_table)
         print("="*70)
 
-        # Write companion XML alongside the first tile (same dir as all tiles).
-        _tile_xml: Optional[str] = None
-        if _is_mea_classes(classes) and tile_outputs:
-            _tile_xml = _write_composite_material_xml(tile_outputs[0], classes)
-
         return {
             "status": "ok",
             "outputPath": str(output_dir),
@@ -3260,7 +3260,6 @@ def classify_and_export(
             "meaMapping": mea_mapping,
             "stats": _ce_stages,
             "statsTable": _ce_table,
-            "xmlPath": _tile_xml,
         }
 
     # === NN assignment ===
@@ -3413,10 +3412,9 @@ def classify_and_export(
     print(_ce_table)
     print("="*70)
 
-    # Write companion Composite_Material_Table XML for MEA classifications.
+    # Write companion Composite_Material_Table XML for every classification output.
     xml_out: Optional[str] = None
-    if _is_mea_classes(classes):
-        xml_out = _write_composite_material_xml(output_color_path, classes)
+    xml_out = _write_composite_material_xml(output_color_path, classes)
 
     return {
         "status": "ok",
@@ -4004,6 +4002,10 @@ def rasterize_vectors_onto_classification(
         if _rv_txs_infos:
             _write_txs_file(output_dir / "all_imgs.txs", _rv_txs_infos)
 
+        # Write companion XML for every vector-rasterized tile.
+        for _rv_tile_out in tile_outputs:
+            _write_composite_material_xml(_rv_tile_out, classes)
+
         print(f"\n[OK] Vector rasterization complete (tiles)")
         print(f"  Output: {output_dir}")
         _rv_stages.append(("Rasterize vectors (tiles)", _time.perf_counter() - _t0))
@@ -4114,6 +4116,9 @@ def rasterize_vectors_onto_classification(
         )
     except Exception as _rv_exc:
         print(f"  [TXR/TXS] Warning: could not write sidecar files: {_rv_exc}")
+
+    # Write companion XML for the final vector-rasterized output.
+    _write_composite_material_xml(final_path, classes)
 
     print(f"\n[OK] Vector rasterization complete")
     print(f"  Output: {final_path}")
