@@ -31,4 +31,5 @@ pynvml           # GPU detection (optional, gracefully skipped if missing)
 #   CPU only:
 #     pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 segment-geospatial[samgeo3]   # samgeo: SAM 3 text-prompted geospatial segmentation
+triton-windows            # Windows port of triton — required for SAM3 on Windows
 opencv-python-headless  # cv2 for morphological post-processing (optional, falls back to scipy)
