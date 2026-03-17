@@ -627,6 +627,16 @@ def _bounds_wgs84(
         return left, bottom, right, top
 
 
+def _next_pow2(n: int) -> int:
+    """Return the smallest power of 2 that is >= n."""
+    if n <= 0:
+        return 1
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
+
+
 def _write_txr_file(
     output_path,
     transform,
@@ -637,17 +647,23 @@ def _write_txr_file(
     """Write a .txr sidecar file next to *output_path*.
 
     The .txr contains the WGS-84 bounding box in the format expected by the
-    GIS toolchain (csm / EndMapTokens format).
+    GIS toolchain (csm / EndMapTokens format), one token per line.
     """
     try:
         left, bottom, right, top = _bounds_wgs84(transform, crs, width, height)
         txr_path = Path(output_path).with_suffix(".txr")
-        content = (
-            f"csm=Geographic datumId=4326 dcType=NONE dcSelectorId=0 EndMapTokens "
-            f"Top: {top:.12f} Bottom: {bottom:.12f} "
-            f"Left: {left:.12f} Right: {right:.12f}"
-        )
-        txr_path.write_text(content, encoding="utf-8")
+        lines = [
+            "csm=Geographic",
+            "datumId=4326",
+            "dcType=NONE",
+            "dcSelectorId=0",
+            "EndMapTokens",
+            f"Top: {top:.12f}",
+            f"Bottom: {bottom:.12f}",
+            f"Left: {left:.12f}",
+            f"Right: {right:.12f}",
+        ]
+        txr_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     except Exception as exc:
         print(f"  [TXR] Warning: could not write .txr sidecar for {output_path}: {exc}")
 
@@ -667,6 +683,9 @@ def _write_txs_file(
         for img_path, left, bottom, right, top, img_w, img_h in image_infos:
             p = str(img_path)
             p_bak = f"{p} (backup)"
+            # Texel counts must be power-of-2 (GeoSpecific engine requirement).
+            texels_x = _next_pow2(img_w)
+            texels_y = _next_pow2(img_h)
             lines += [
                 f'Delete "{lib};{p_bak}"',
                 f'Rename "{lib};{p}" "{p_bak}"',
@@ -679,8 +698,8 @@ def _write_txs_file(
                 f'Set $thisRecord "Timestamp" ""',
                 f'Set $thisRecord "Origin Y" ""',
                 f'Set $thisRecord "Origin X" ""',
-                f'Set $thisRecord "Number of Texels Y" {img_h}',
-                f'Set $thisRecord "Number of Texels X" {img_w}',
+                f'Set $thisRecord "Number of Texels Y" {texels_y}',
+                f'Set $thisRecord "Number of Texels X" {texels_x}',
                 f'Set $thisRecord "Notes" ""',
                 f'Set $thisRecord "Misc3" ""',
                 f'Set $thisRecord "Misc2" ""',
