@@ -6,7 +6,13 @@ import sys
 import gc
 import site
 import time as _time
+import threading
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+
+
+class TaskCancelledError(Exception):
+    """Raised when a task is cancelled by the user."""
+    pass
 from rasterio.windows import Window
 from rasterio.windows import transform as window_transform
 from rasterio.transform import array_bounds
@@ -2501,6 +2507,7 @@ def classify(
     pretrained_mea_mapping=None,
     export_format: str = "tif",
     progress_callback=None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, object]:
     """
     Complete classification pipeline: KMeans + Vector rasterization.
@@ -2552,23 +2559,27 @@ def classify(
         pretrained_mea_mapping=pretrained_mea_mapping,
         export_format=export_format,
         progress_callback=progress_callback,
+        cancel_event=cancel_event,
     )
     _pipeline_stages.append(("Step 1: Classification & Export", _time.perf_counter() - _t0))
-    
+
     if result1["status"] != "ok":
         return result1
-    
+
     classif_file = result1["outputPath"]
     print(f"Classification saved to: {classif_file}")
-    
+
     # Merge sub-stage stats from classify_and_export
     _step1_stats = result1.get("stats", [])
-    
+
     # === STEP 2: Rasterize vectors ===
     _t0 = _time.perf_counter()
     result2 = None
     if vector_layers:
         print("\n>>> STEP 2: Vector Rasterization")
+        # Check cancellation before starting step 2
+        if cancel_event is not None and cancel_event.is_set():
+            raise TaskCancelledError("Task cancelled by user")
         # Write vectorized output to a separate adjacent folder so the
         # classified output from Step 1 is preserved.
         if tile_mode:
@@ -2594,6 +2605,7 @@ def classify(
             tile_workers=tile_workers,
             max_threads=max_threads,
             progress_callback=progress_callback,
+            cancel_event=cancel_event,
         )
         _pipeline_stages.append(("Step 2: Vector Rasterization", _time.perf_counter() - _t0))
         
@@ -2655,11 +2667,12 @@ def classify_and_export(
     pretrained_mea_mapping=None,   # List[Dict]               - returned as-is in result
     progress_callback=None,        # callable(phase: str, done: int, total: int) | None
     export_format: str = "tif",
+    cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, object]:
     """
     Step 1: KMeans classification and color export (without vectors).
     Outputs an RGB GeoTIFF with the classified clusters colored.
-    
+
     Returns: {"status": "ok", "outputPath": "..."}
     """
     path = Path(raster_path)
@@ -2679,6 +2692,10 @@ def classify_and_export(
             except Exception:
                 pass
 
+    def _check_cancel() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise TaskCancelledError("Task cancelled by user")
+
     n_clusters = len(classes)
     _t_ce_start = _time.perf_counter()
     _ce_stages: List[Tuple[str, float]] = []
@@ -2696,6 +2713,7 @@ def classify_and_export(
     _cb(f"Engine: {_accel_label}", 0, 1)
 
     # === Load raster ===
+    _check_cancel()
     _t0 = _time.perf_counter()
     _cb("Loading raster", 0, 1)
     print(f"\n[1/5] Loading raster: {path.name}")
@@ -2718,6 +2736,7 @@ def classify_and_export(
     _ce_stages.append(("Load raster", _time.perf_counter() - _t0))
 
     # === Extract features ===
+    _check_cancel()
     _t0 = _time.perf_counter()
     _cb("Feature extraction", 0, 1)
     print(f"\n[2/5] Extracting pixel-level features...")
@@ -2733,6 +2752,7 @@ def classify_and_export(
     _ce_stages.append(("Feature extraction", _time.perf_counter() - _t0))
 
     # === KMeans clustering ===
+    _check_cancel()
     _t0 = _time.perf_counter()
     _cb("KMeans clustering", 0, 1)
     print(f"\n[3/5] KMeans clustering ({n_clusters} clusters)...")
@@ -2894,6 +2914,7 @@ def classify_and_export(
         # Use chunksize > 1 when many tiles to reduce IPC overhead
         _chunksize = max(1, _n_jobs // (max_workers * 4))
         _cb("Classifying tiles", 0, _n_jobs)
+        _cancelled = False
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_classify_tile_worker, job): i for i, job in enumerate(jobs)}
             for future in as_completed(futures):
@@ -2901,6 +2922,13 @@ def classify_and_export(
                 _cb("Classifying tiles", len(tile_outputs), _n_jobs)
                 if len(tile_outputs) % max(1, _n_jobs // 10) == 0 or len(tile_outputs) == _n_jobs:
                     print(f"    tiles: {len(tile_outputs)}/{_n_jobs} done")
+                if cancel_event is not None and cancel_event.is_set():
+                    _cancelled = True
+                    for f in futures:
+                        f.cancel()
+                    break
+        if _cancelled:
+            raise TaskCancelledError("Task cancelled by user")
 
         print(f"  [OK] Wrote {len(tile_outputs)} tiles to {output_dir}")
         _ce_stages.append(("Tiled classification", _time.perf_counter() - _t0))
@@ -3357,6 +3385,7 @@ def rasterize_vectors_onto_classification(
     tile_workers: Optional[int] = None,
     max_threads: Optional[int] = None,
     progress_callback=None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, object]:
     """
     Step 2: Rasterize vector layers onto an existing classification file.
@@ -3634,10 +3663,18 @@ def rasterize_vectors_onto_classification(
             max_workers = max(1, os.cpu_count() or 1)
         
         tile_outputs: List[str] = []
+        _cancelled = False
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(_rasterize_tile_worker, job) for job in jobs]
             for future in as_completed(futures):
                 tile_outputs.append(future.result())
+                if cancel_event is not None and cancel_event.is_set():
+                    _cancelled = True
+                    for f in futures:
+                        f.cancel()
+                    break
+        if _cancelled:
+            raise TaskCancelledError("Task cancelled by user")
 
         print(f"\n[OK] Vector rasterization complete (tiles)")
         print(f"  Output: {output_dir}")

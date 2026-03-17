@@ -28,11 +28,12 @@ from .core import classify as run_classify
 from .core import classify_and_export as run_classify_and_export
 from .core import rasterize_vectors_onto_classification as run_rasterize_vectors
 from .core import train_kmeans_model, build_shared_color_table, suggest_tile_size
-from .core import _ACCEL_ENGINE, _ACCEL_GPU, _ACCEL_GPU_INFO
+from .core import _ACCEL_ENGINE, _ACCEL_GPU, _ACCEL_GPU_INFO, TaskCancelledError
 
 # ─── SSE progress streaming infrastructure ───────────────────────────────
 
 _PROGRESS_QUEUES: Dict[str, Queue] = {}
+_CANCEL_EVENTS: Dict[str, threading.Event] = {}
 
 # Per-phase weights reflecting typical relative durations.
 # Step 1 phases sum to ~100; other pipelines normalise by total weight.
@@ -69,11 +70,13 @@ class _ProgressTracker:
     def __init__(self, task_id: str, pipeline: str = "step1"):
         self.task_id = task_id
         self.queue: Queue = Queue()
+        self.cancel_event: threading.Event = threading.Event()
         self.completed_weight = 0.0
         self.current_phase: Optional[str] = None
         self.current_weight: float = 0
         self.total_weight = _PIPELINE_TOTALS.get(pipeline, 100)
         _PROGRESS_QUEUES[task_id] = self.queue
+        _CANCEL_EVENTS[task_id] = self.cancel_event
 
     def __call__(self, phase: str, done: int, total: int):
         if phase != self.current_phase:
@@ -93,13 +96,14 @@ class _ProgressTracker:
         })
 
     def finish(self):
-        """Send sentinel and schedule queue cleanup."""
+        """Send sentinel and schedule queue/cancel-event cleanup."""
         self.queue.put(None)
 
         def _cleanup():
             import time
             time.sleep(3)
             _PROGRESS_QUEUES.pop(self.task_id, None)
+            _CANCEL_EVENTS.pop(self.task_id, None)
         threading.Thread(target=_cleanup, daemon=True).start()
 
 
@@ -243,6 +247,18 @@ async def progress_sse(task_id: str):
     )
 
 
+# ─── Cancel endpoint ─────────────────────────────────────────────────────
+
+@app.post("/cancel/{task_id}")
+def cancel_task(task_id: str) -> dict:
+    """Signal a running task to stop at the next safe checkpoint."""
+    event = _CANCEL_EVENTS.get(task_id)
+    if event is None:
+        return {"status": "not_found", "message": "No running task with that ID"}
+    event.set()
+    return {"status": "ok", "message": "Cancel signal sent"}
+
+
 # ─── Classify endpoints ──────────────────────────────────────────────────
 
 @app.post("/classify")
@@ -267,8 +283,11 @@ def classify(request: ClassifyRequest) -> dict:
             max_threads=request.maxThreads,
             export_format=request.exportFormat,
             progress_callback=tracker,
+            cancel_event=tracker.cancel_event if tracker else None,
         )
         return result
+    except TaskCancelledError:
+        return JSONResponse(status_code=200, content={"status": "cancelled", "message": "Task was cancelled"})
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
     finally:
@@ -297,8 +316,11 @@ def classify_step1(request: ClassifyStep1Request) -> dict:
             max_threads=request.maxThreads,
             export_format=request.exportFormat,
             progress_callback=tracker,
+            cancel_event=tracker.cancel_event if tracker else None,
         )
         return result
+    except TaskCancelledError:
+        return JSONResponse(status_code=200, content={"status": "cancelled", "message": "Task was cancelled"})
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
     finally:
@@ -397,6 +419,7 @@ def classify_batch(request: BatchClassifyRequest) -> dict:
                     pretrained_mea_mapping=mea_mapping,
                     export_format=request.exportFormat,
                     progress_callback=tracker,
+                    cancel_event=tracker.cancel_event if tracker else None,
                 )
 
                 all_results.append(result)
@@ -415,6 +438,8 @@ def classify_batch(request: BatchClassifyRequest) -> dict:
                             all_output_paths.extend(str(t) for t in tiles)
                 else:
                     errors.append((rpath, result.get("message", "unknown error")))
+            except TaskCancelledError:
+                raise  # propagate to outer handler
             except Exception as e:
                 import traceback
                 error_log = Path("classification_error.log")
@@ -425,6 +450,9 @@ def classify_batch(request: BatchClassifyRequest) -> dict:
                     f.write("-" * 50 + "\n")
                 errors.append((rpath, str(e)))
                 print(f"[Batch][error] {fname}: {e}")
+            # Check cancellation between files
+            if tracker and tracker.cancel_event.is_set():
+                raise TaskCancelledError("Task cancelled by user")
         if tracker:
             tracker(f"Classifying", n, n)
 
@@ -466,6 +494,7 @@ def classify_batch(request: BatchClassifyRequest) -> dict:
                         tile_workers=request.tileWorkers,
                         max_threads=request.maxThreads,
                         progress_callback=tracker,
+                        cancel_event=tracker.cancel_event if tracker else None,
                     )
                     print(f"  vec_result={vec_result}")
                     sys.stdout.flush()
@@ -515,6 +544,8 @@ def classify_batch(request: BatchClassifyRequest) -> dict:
             "errors": errors if errors else None,
             "meaMapping": mea_mapping,
         }
+    except TaskCancelledError:
+        return JSONResponse(status_code=200, content={"status": "cancelled", "message": "Task was cancelled"})
     except Exception as e:
         import traceback
         # Write full traceback to file (stdout/stderr may fail with charmap on Windows)
@@ -554,8 +585,11 @@ def classify_step2(request: ClassifyStep2Request) -> dict:
             tile_workers=request.tileWorkers,
             max_threads=request.maxThreads,
             progress_callback=tracker,
+            cancel_event=tracker.cancel_event if tracker else None,
         )
         return result
+    except TaskCancelledError:
+        return JSONResponse(status_code=200, content={"status": "cancelled", "message": "Task was cancelled"})
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
     finally:

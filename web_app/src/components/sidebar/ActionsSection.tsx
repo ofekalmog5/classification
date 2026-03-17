@@ -7,6 +7,7 @@ import {
   runBatchClassify,
   generateTaskId,
   startProgressStream,
+  cancelTask,
 } from "../../api/client";
 import type { BatchResult } from "../../api/client";
 import { MEA_CLASSES } from "../../constants/mea";
@@ -26,6 +27,14 @@ export default function ActionsSection() {
   const dispatch = useAppDispatch();
   const isRunning = state.running !== "idle";
   const runStartRef = useRef<number>(0);
+  const currentTaskIdRef = useRef<string | null>(null);
+
+  const handleCancel = useCallback(async () => {
+    const taskId = currentTaskIdRef.current;
+    if (!taskId) return;
+    dispatch({ type: "SET_STATUS", text: "Cancelling…" });
+    await cancelTask(taskId);
+  }, [dispatch]);
 
   // Short engine label shown in the status bar when a run starts
   const engineLabel = state.accelInfo
@@ -100,8 +109,12 @@ export default function ActionsSection() {
 
   /** Process a BatchResult — add layers to a group even on partial success */
   const handleBatchResult = useCallback(
-    (result: BatchResult, label: string) => {
+    (result: BatchResult & { status?: string }, label: string) => {
       const elapsed = formatElapsed(Date.now() - runStartRef.current);
+      if ((result as any).status === "cancelled") {
+        dispatch({ type: "SET_STATUS", text: `${label} cancelled` });
+        return;
+      }
       const paths: string[] = result.outputPaths ?? [];
       const errCount = result.errors?.length ?? 0;
 
@@ -155,6 +168,7 @@ export default function ActionsSection() {
     if (rasterFiles.length > 1) {
       dispatch({ type: "SET_STATUS", text: `Step 1: Training shared model on ${rasterFiles.length} files…${engineLabel}` });
       const taskId = generateTaskId();
+      currentTaskIdRef.current = taskId;
       const stopProgress = startProgressStream(taskId, (evt) => {
         dispatch({ type: "SET_PROGRESS", progress: evt });
       });
@@ -178,6 +192,7 @@ export default function ActionsSection() {
       const fileName = file.split(/[\\/]/).pop() || file;
       dispatch({ type: "SET_STATUS", text: `Step 1: Classifying ${fileName}…${engineLabel}` });
       const taskId = generateTaskId();
+      currentTaskIdRef.current = taskId;
       const stopProgress = startProgressStream(taskId, (evt) => {
         dispatch({ type: "SET_PROGRESS", progress: evt });
       });
@@ -202,6 +217,7 @@ export default function ActionsSection() {
     dispatch({ type: "SET_STATUS", text: "Running Step 2: Vector rasterization…" });
     dispatch({ type: "SET_PROGRESS", progress: null });
     const taskId = generateTaskId();
+    currentTaskIdRef.current = taskId;
     const stopProgress = startProgressStream(taskId, (evt) => {
       dispatch({ type: "SET_PROGRESS", progress: evt });
     });
@@ -248,6 +264,7 @@ export default function ActionsSection() {
     if (rasterFiles.length > 1) {
       dispatch({ type: "SET_STATUS", text: `Full Pipeline: Training shared model on ${rasterFiles.length} files…${engineLabel}` });
       const taskId = generateTaskId();
+      currentTaskIdRef.current = taskId;
       const stopProgress = startProgressStream(taskId, (evt) => {
         dispatch({ type: "SET_PROGRESS", progress: evt });
       });
@@ -270,6 +287,7 @@ export default function ActionsSection() {
       const fileName = file.split(/[\\/]/).pop() || file;
       dispatch({ type: "SET_STATUS", text: `Full Pipeline: ${fileName}…${engineLabel}` });
       const taskId = generateTaskId();
+      currentTaskIdRef.current = taskId;
       const stopProgress = startProgressStream(taskId, (evt) => {
         dispatch({ type: "SET_PROGRESS", progress: evt });
       });
@@ -310,6 +328,7 @@ export default function ActionsSection() {
     if (rasterFiles.length > 1) {
       dispatch({ type: "SET_STATUS", text: `MEA: Training shared model on ${rasterFiles.length} files…${engineLabel}` });
       const taskId = generateTaskId();
+      currentTaskIdRef.current = taskId;
       const stopProgress = startProgressStream(taskId, (evt) => {
         dispatch({ type: "SET_PROGRESS", progress: evt });
       });
@@ -343,6 +362,7 @@ export default function ActionsSection() {
       const fileName = file.split(/[\\/]/).pop() || file;
       dispatch({ type: "SET_STATUS", text: `MEA: ${fileName}…${engineLabel}` });
       const taskId = generateTaskId();
+      currentTaskIdRef.current = taskId;
       const stopProgress = startProgressStream(taskId, (evt) => {
         dispatch({ type: "SET_PROGRESS", progress: evt });
       });
@@ -379,6 +399,10 @@ export default function ActionsSection() {
 
   const handleSingleResult = (result: any, label: string) => {
     const elapsed = formatElapsed(Date.now() - runStartRef.current);
+    if (result.status === "cancelled") {
+      dispatch({ type: "SET_STATUS", text: `${label} cancelled` });
+      return;
+    }
     if (result.status === "ok") {
       const path = result.outputPath || result.saved?.[0] || "";
       const classifiedPath: string = result.classifiedPath || "";
@@ -434,6 +458,14 @@ export default function ActionsSection() {
         color="emerald"
         full
       />
+      {isRunning && (
+        <button
+          className="w-full text-xs font-medium py-1.5 px-2 rounded transition-colors bg-red-700 hover:bg-red-800 text-white"
+          onClick={handleCancel}
+        >
+          Cancel
+        </button>
+      )}
     </div>
   );
 }
