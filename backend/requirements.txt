@@ -23,6 +23,7 @@ faiss-cpu        # Fast CPU KMeans (3-8x sklearn). For faiss-gpu: conda install 
 # If not installed, the app automatically falls back to faiss-cpu.
 
 pynvml           # GPU detection (optional, gracefully skipped if missing)
+psutil           # System memory info (used by suggest_tile_size + samgeo)
 
 # ── Road extraction via SAM 3 (Segment Anything Model 3) ─────────────────
 # PyTorch + torchvision must be installed MANUALLY (too large for auto-install):

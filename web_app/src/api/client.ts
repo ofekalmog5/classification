@@ -330,6 +330,116 @@ export async function mergeRoadMask(params: MergeRoadMaskParams): Promise<Classi
   return parseApiResponse<ClassifyResult>(r);
 }
 
+/* ── Generic feature extraction (buildings / vegetation / roads) ──── */
+export interface ExtractFeaturesParams {
+  rasterPath: string;
+  featureType: "roads" | "buildings" | "vegetation";
+  outputPath?: string;
+  tileSize?: number;
+  overlapPct?: number;
+  closingKernelSize?: number;
+  device?: string;
+  taskId?: string;
+}
+
+export interface ExtractFeaturesResult {
+  status: string;
+  maskPaths?: string[];
+  colors?: [number, number, number][];
+  message?: string;
+}
+
+export async function extractFeatures(params: ExtractFeaturesParams): Promise<ExtractFeaturesResult> {
+  const body = {
+    rasterPath: params.rasterPath,
+    featureType: params.featureType,
+    outputPath: params.outputPath || null,
+    tileSize: params.tileSize ?? 1024,
+    overlapPct: params.overlapPct ?? 0.1,
+    closingKernelSize: params.closingKernelSize ?? 15,
+    device: params.device || "auto",
+    taskId: params.taskId ?? null,
+  };
+  const r = await fetch(`${BASE}/extract-features`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return parseApiResponse<ExtractFeaturesResult>(r);
+}
+
+export interface MergeFeatureMasksParams {
+  classificationPath: string;
+  maskPaths: string[];
+  colors: [number, number, number][];
+  outputPath?: string;
+  taskId?: string;
+}
+
+export async function mergeFeatureMasks(params: MergeFeatureMasksParams): Promise<ClassifyResult> {
+  const body = {
+    classificationPath: params.classificationPath,
+    maskPaths: params.maskPaths,
+    colors: params.colors,
+    outputPath: params.outputPath || null,
+    taskId: params.taskId ?? null,
+  };
+  const r = await fetch(`${BASE}/merge-feature-masks`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return parseApiResponse<ClassifyResult>(r);
+}
+
+/* ── App config (persistent settings) ────────────────────────────── */
+export interface AppConfig {
+  sam3_local_dir: string | null;
+  hf_cache_dir: string | null;
+  offline_mode: boolean;
+  configPath: string;
+}
+
+export async function getAppConfig(): Promise<AppConfig> {
+  const r = await fetch(`${BASE}/app-config`);
+  return r.json();
+}
+
+export async function setAppConfig(updates: Partial<Omit<AppConfig, "configPath">>): Promise<AppConfig> {
+  const r = await fetch(`${BASE}/app-config`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(updates),
+  });
+  return r.json();
+}
+
+/* ── Road extraction config ──────────────────────────────────────── */
+export interface RoadExtractConfig {
+  sam3LocalDir: string | null;
+  sam3CheckpointFound: boolean;
+  sam3CheckpointPath: string | null;
+  loadedBackend: string | null;
+  offlineMode: boolean;
+  hfCacheDir: string;
+  owlv2Cached: boolean;
+  sam2Cached: boolean;
+}
+
+export async function getRoadExtractConfig(): Promise<RoadExtractConfig> {
+  const r = await fetch(`${BASE}/road-extract-config`);
+  return r.json();
+}
+
+export async function setSam3Path(path: string | null): Promise<RoadExtractConfig> {
+  const r = await fetch(`${BASE}/set-sam3-path`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  return r.json();
+}
+
 /* ── File browsing (used in electron / local mode) ───────────────── */
 export async function browseFile(
   options?: { directory?: boolean; save?: boolean; filters?: string[] }

@@ -5,6 +5,7 @@ import VectorsSection from "./sidebar/VectorsSection";
 import PerformanceSection from "./sidebar/PerformanceSection";
 import ClassificationSection from "./sidebar/ClassificationSection";
 import ActionsSection from "./sidebar/ActionsSection";
+import SettingsSection from "./sidebar/SettingsSection";
 
 export default function Sidebar() {
   return (
@@ -16,6 +17,7 @@ export default function Sidebar() {
       <PerformanceSection />
       <ClassificationSection />
       <ActionsSection />
+      <SettingsSection />
     </div>
   );
 }

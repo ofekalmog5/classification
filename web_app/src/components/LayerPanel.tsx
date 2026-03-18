@@ -107,6 +107,18 @@ export default function LayerPanel() {
                 >
                   ◌ Sel
                 </button>
+                <button
+                  className="text-[9px] px-1.5 py-0.5 rounded bg-red-900/50 text-red-400 hover:bg-red-800/60 hover:text-red-300"
+                  onClick={() => {
+                    if (confirm(`Remove ${selectedIds.size} selected layer${selectedIds.size > 1 ? "s" : ""}?`)) {
+                      dispatch({ type: "REMOVE_MANY_LAYERS", ids: Array.from(selectedIds) });
+                      setSelectedIds(new Set());
+                    }
+                  }}
+                  title="Remove selected layers"
+                >
+                  ✕ Sel
+                </button>
               </>
             ) : (
               <>

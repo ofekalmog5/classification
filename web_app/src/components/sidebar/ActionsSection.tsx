@@ -7,11 +7,15 @@ import {
   runBatchClassify,
   extractRoads,
   mergeRoadMask,
+  extractFeatures,
+  mergeFeatureMasks,
   generateTaskId,
   startProgressStream,
   cancelTask,
+  getRoadExtractConfig,
+  setSam3Path,
 } from "../../api/client";
-import type { BatchResult } from "../../api/client";
+import type { BatchResult, RoadExtractConfig, ExtractFeaturesResult } from "../../api/client";
 import { MEA_CLASSES } from "../../constants/mea";
 
 function formatElapsed(ms: number): string {
@@ -30,7 +34,11 @@ export default function ActionsSection() {
   const isRunning = state.running !== "idle";
   const runStartRef = useRef<number>(0);
   const activeTaskIdRef = useRef<string | null>(null);
-  const [roadMaskPath, setRoadMaskPath] = useState<string | null>(null);
+  const [roadMasks, setRoadMasks] = useState<ExtractFeaturesResult | null>(null);
+  const [buildingMasks, setBuildingMasks] = useState<ExtractFeaturesResult | null>(null);
+  const [vegetationMasks, setVegetationMasks] = useState<ExtractFeaturesResult | null>(null);
+  const [roadConfig, setRoadConfig] = useState<RoadExtractConfig | null>(null);
+  const [sam3PathInput, setSam3PathInput] = useState("");
 
   const handleCancel = useCallback(async () => {
     const tid = activeTaskIdRef.current;
@@ -437,11 +445,9 @@ export default function ActionsSection() {
       if (!state.rasterPath) return alert("Select a raster image first.");
       rasterFiles.push(state.rasterPath);
     }
-    const file = rasterFiles[0];
-    const fileName = file.split(/[\\/]/).pop() || file;
     runStartRef.current = Date.now();
     dispatch({ type: "SET_RUNNING", step: "step1" });
-    dispatch({ type: "SET_STATUS", text: `Extracting roads (SAM 3): ${fileName}…` });
+    dispatch({ type: "SET_STATUS", text: `Extracting roads from ${rasterFiles.length} file(s)…` });
     dispatch({ type: "SET_PROGRESS", progress: null });
     const taskId = generateTaskId();
     activeTaskIdRef.current = taskId;
@@ -449,20 +455,34 @@ export default function ActionsSection() {
       dispatch({ type: "SET_PROGRESS", progress: evt });
     });
     try {
-      const result = await extractRoads({
-        rasterPath: file,
-        outputPath: state.outputPath || undefined,
-        taskId,
-      });
+      const allMaskPaths: string[] = [];
+      const allColors: [number, number, number][] = [];
+      for (const file of rasterFiles) {
+        const fileName = file.split(/[\\/]/).pop() || file;
+        dispatch({ type: "SET_STATUS", text: `Extracting roads: ${fileName}…` });
+        const result = await extractRoads({
+          rasterPath: file,
+          outputPath: state.outputPath || undefined,
+          taskId,
+        });
+        if ((result as any).status === "cancelled") {
+          dispatch({ type: "SET_STATUS", text: "Road extraction cancelled" });
+          return;
+        }
+        if (result.status === "ok" && result.outputPath) {
+          allMaskPaths.push(result.outputPath);
+          allColors.push([45, 45, 48]);
+        } else {
+          console.warn(`Roads failed for ${fileName}: ${(result as any).message}`);
+        }
+      }
       const elapsed = formatElapsed(Date.now() - runStartRef.current);
-      if ((result as any).status === "cancelled") {
-        dispatch({ type: "SET_STATUS", text: "Road extraction cancelled" });
-      } else if (result.status === "ok" && result.outputPath) {
-        setRoadMaskPath(result.outputPath);
-        dispatch({ type: "SET_STATUS", text: `Road extraction complete (${elapsed})` });
-        addResultsToGroup("Road Mask (SAM 3)", [result.outputPath]);
+      if (allMaskPaths.length > 0) {
+        setRoadMasks({ status: "ok", maskPaths: allMaskPaths, colors: allColors });
+        dispatch({ type: "SET_STATUS", text: `Roads extracted: ${allMaskPaths.length}/${rasterFiles.length} files (${elapsed})` });
+        addResultsToGroup("Road Masks (SAM)", allMaskPaths);
       } else {
-        dispatch({ type: "SET_STATUS", text: `Road extraction failed: ${(result as any).message ?? "Unknown"}` });
+        dispatch({ type: "SET_STATUS", text: "Road extraction failed for all files" });
       }
     } catch (e: any) {
       dispatch({ type: "SET_STATUS", text: `Road extraction error: ${e.message}` });
@@ -475,11 +495,16 @@ export default function ActionsSection() {
   };
 
   const handleMergeRoadMask = async () => {
-    if (!roadMaskPath) return alert("Run 'Extract Roads' first to produce a road mask.");
-    if (!state.lastResultPath) return alert("Run classification first to produce an output.");
+    handleMergeFeature(roadMasks, "Roads");
+  };
+
+  const handleExtractFeature = async (featureType: "buildings" | "vegetation", label: string) => {
+    const rasterFiles = getRasterFiles();
+    if (rasterFiles.length === 0 && state.rasterPath) rasterFiles.push(state.rasterPath);
+    if (rasterFiles.length === 0) return alert("Select a raster image first.");
     runStartRef.current = Date.now();
-    dispatch({ type: "SET_RUNNING", step: "step2" });
-    dispatch({ type: "SET_STATUS", text: "Merging road mask onto classification…" });
+    dispatch({ type: "SET_RUNNING", step: "step1" });
+    dispatch({ type: "SET_STATUS", text: `Extracting ${label} from ${rasterFiles.length} file(s)…` });
     dispatch({ type: "SET_PROGRESS", progress: null });
     const taskId = generateTaskId();
     activeTaskIdRef.current = taskId;
@@ -487,24 +512,139 @@ export default function ActionsSection() {
       dispatch({ type: "SET_PROGRESS", progress: evt });
     });
     try {
-      const result = await mergeRoadMask({
+      const allMaskPaths: string[] = [];
+      const allColors: [number, number, number][] = [];
+      for (const file of rasterFiles) {
+        const fileName = file.split(/[\\/]/).pop() || file;
+        dispatch({ type: "SET_STATUS", text: `Extracting ${label}: ${fileName}…` });
+        const result = await extractFeatures({
+          rasterPath: file,
+          featureType,
+          outputPath: state.outputPath || undefined,
+          taskId,
+        });
+        if ((result as any).status === "cancelled") {
+          dispatch({ type: "SET_STATUS", text: `${label} extraction cancelled` });
+          return;
+        }
+        if (result.status === "ok" && result.maskPaths?.length) {
+          allMaskPaths.push(...result.maskPaths);
+          allColors.push(...result.colors!);
+        } else {
+          console.warn(`${label} failed for ${fileName}: ${(result as any).message}`);
+        }
+      }
+      const elapsed = formatElapsed(Date.now() - runStartRef.current);
+      if (allMaskPaths.length > 0) {
+        const combined: ExtractFeaturesResult = { status: "ok", maskPaths: allMaskPaths, colors: allColors };
+        if (featureType === "buildings") setBuildingMasks(combined);
+        else setVegetationMasks(combined);
+        dispatch({ type: "SET_STATUS", text: `${label} extracted: ${rasterFiles.length} file(s) (${elapsed})` });
+        addResultsToGroup(`${label} Masks`, allMaskPaths);
+      } else {
+        dispatch({ type: "SET_STATUS", text: `${label} extraction failed for all files` });
+      }
+    } catch (e: any) {
+      dispatch({ type: "SET_STATUS", text: `${label} extraction error: ${e.message}` });
+    } finally {
+      activeTaskIdRef.current = null;
+      stopProgress();
+      dispatch({ type: "SET_PROGRESS", progress: null });
+      dispatch({ type: "SET_RUNNING", step: "idle" });
+    }
+  };
+
+  const handleMergeFeature = async (
+    masks: ExtractFeaturesResult | null,
+    label: string,
+  ) => {
+    if (!masks?.maskPaths?.length) return alert(`Run 'Extract ${label}' first.`);
+    if (!state.lastResultPath) return alert("Run classification first to produce an output.");
+    runStartRef.current = Date.now();
+    dispatch({ type: "SET_RUNNING", step: "step2" });
+    dispatch({ type: "SET_STATUS", text: `Merging ${label} masks…` });
+    dispatch({ type: "SET_PROGRESS", progress: null });
+    const taskId = generateTaskId();
+    activeTaskIdRef.current = taskId;
+    const stopProgress = startProgressStream(taskId, (evt) => {
+      dispatch({ type: "SET_PROGRESS", progress: evt });
+    });
+    try {
+      const result = await mergeFeatureMasks({
         classificationPath: state.lastResultPath,
-        roadMaskPath,
+        maskPaths: masks.maskPaths,
+        colors: masks.colors!,
         outputPath: state.outputPath || undefined,
         taskId,
       });
       const elapsed = formatElapsed(Date.now() - runStartRef.current);
       if ((result as any).status === "cancelled") {
-        dispatch({ type: "SET_STATUS", text: "Merge cancelled" });
+        dispatch({ type: "SET_STATUS", text: `${label} merge cancelled` });
       } else if (result.status === "ok" && result.outputPath) {
         dispatch({ type: "SET_LAST_RESULT_PATH", path: result.outputPath });
-        dispatch({ type: "SET_STATUS", text: `Road mask merged (${elapsed})` });
-        addResultsToGroup("Classification + Roads", [result.outputPath]);
+        dispatch({ type: "SET_STATUS", text: `${label} merged (${elapsed})` });
+        const tileOutputs = (result as any).tileOutputs as string[] | undefined;
+        addResultsToGroup(`Classification + ${label}`, tileOutputs?.length ? tileOutputs : [result.outputPath]);
       } else {
-        dispatch({ type: "SET_STATUS", text: `Merge failed: ${(result as any).message ?? "Unknown"}` });
+        dispatch({ type: "SET_STATUS", text: `${label} merge failed: ${(result as any).message ?? "Unknown"}` });
       }
     } catch (e: any) {
-      dispatch({ type: "SET_STATUS", text: `Merge error: ${e.message}` });
+      dispatch({ type: "SET_STATUS", text: `${label} merge error: ${e.message}` });
+    } finally {
+      activeTaskIdRef.current = null;
+      stopProgress();
+      dispatch({ type: "SET_PROGRESS", progress: null });
+      dispatch({ type: "SET_RUNNING", step: "idle" });
+    }
+  };
+
+  const handleMergeAll = async () => {
+    if (!state.lastResultPath) return alert("Run classification first.");
+    const allMaskPaths: string[] = [];
+    const allColors: [number, number, number][] = [];
+    if (roadMasks?.maskPaths) {
+      allMaskPaths.push(...roadMasks.maskPaths);
+      allColors.push(...roadMasks.colors!);
+    }
+    if (buildingMasks?.maskPaths) {
+      allMaskPaths.push(...buildingMasks.maskPaths);
+      allColors.push(...buildingMasks.colors!);
+    }
+    if (vegetationMasks?.maskPaths) {
+      allMaskPaths.push(...vegetationMasks.maskPaths);
+      allColors.push(...vegetationMasks.colors!);
+    }
+    if (!allMaskPaths.length) return alert("Extract at least one feature first.");
+    runStartRef.current = Date.now();
+    dispatch({ type: "SET_RUNNING", step: "step2" });
+    dispatch({ type: "SET_STATUS", text: "Merging all feature masks…" });
+    dispatch({ type: "SET_PROGRESS", progress: null });
+    const taskId = generateTaskId();
+    activeTaskIdRef.current = taskId;
+    const stopProgress = startProgressStream(taskId, (evt) => {
+      dispatch({ type: "SET_PROGRESS", progress: evt });
+    });
+    try {
+      const result = await mergeFeatureMasks({
+        classificationPath: state.lastResultPath,
+        maskPaths: allMaskPaths,
+        colors: allColors,
+        outputPath: state.outputPath || undefined,
+        taskId,
+      });
+      const elapsed = formatElapsed(Date.now() - runStartRef.current);
+      if ((result as any).status === "cancelled") {
+        dispatch({ type: "SET_STATUS", text: "Merge all cancelled" });
+      } else if (result.status === "ok" && result.outputPath) {
+        dispatch({ type: "SET_LAST_RESULT_PATH", path: result.outputPath });
+        dispatch({ type: "SET_STATUS", text: `All features merged (${elapsed})` });
+        const tileOutputs = (result as any).tileOutputs as string[] | undefined;
+        addResultsToGroup("Classification + All Features", tileOutputs?.length ? tileOutputs : [result.outputPath]);
+      } else {
+        dispatch({ type: "SET_STATUS", text: `Merge all failed: ${(result as any).message ?? "Unknown"}` });
+      }
+    } catch (e: any) {
+      dispatch({ type: "SET_STATUS", text: `Merge all error: ${e.message}` });
     } finally {
       activeTaskIdRef.current = null;
       stopProgress();
@@ -570,19 +710,119 @@ export default function ActionsSection() {
         color="emerald"
         full
       />
-      <div className="grid grid-cols-2 gap-1.5 pt-1 border-t border-surface-700">
+      <div className="pt-1 border-t border-surface-700 space-y-1.5">
+        {/* Header row */}
+        <div className="text-[10px] text-surface-400 font-medium uppercase tracking-wide px-0.5">
+          SAM Feature Extraction
+        </div>
+
+        {/* Roads */}
+        <div className="grid grid-cols-2 gap-1.5">
+          <ActionBtn
+            label="Extract Roads"
+            onClick={handleExtractRoads}
+            disabled={isRunning}
+            color="amber"
+          />
+          <ActionBtn
+            label="Merge Roads"
+            onClick={handleMergeRoadMask}
+            disabled={isRunning || !roadMasks?.maskPaths?.length || !state.lastResultPath}
+            color="amber"
+          />
+        </div>
+
+        {/* Buildings */}
+        <div className="grid grid-cols-2 gap-1.5">
+          <ActionBtn
+            label="Extract Buildings"
+            onClick={() => handleExtractFeature("buildings", "Buildings")}
+            disabled={isRunning}
+            color="amber"
+          />
+          <ActionBtn
+            label="Merge Buildings"
+            onClick={() => handleMergeFeature(buildingMasks, "Buildings")}
+            disabled={isRunning || !buildingMasks || !state.lastResultPath}
+            color="amber"
+          />
+        </div>
+
+        {/* Vegetation */}
+        <div className="grid grid-cols-2 gap-1.5">
+          <ActionBtn
+            label="Extract Vegetation"
+            onClick={() => handleExtractFeature("vegetation", "Vegetation")}
+            disabled={isRunning}
+            color="amber"
+          />
+          <ActionBtn
+            label="Merge Vegetation"
+            onClick={() => handleMergeFeature(vegetationMasks, "Vegetation")}
+            disabled={isRunning || !vegetationMasks || !state.lastResultPath}
+            color="amber"
+          />
+        </div>
+
+        {/* Merge All */}
         <ActionBtn
-          label="Extract Roads (SAM)"
-          onClick={handleExtractRoads}
-          disabled={isRunning}
-          color="amber"
+          label="Merge All Features"
+          onClick={handleMergeAll}
+          disabled={isRunning || (!roadMasks && !buildingMasks && !vegetationMasks) || !state.lastResultPath}
+          color="orange"
+          full
         />
-        <ActionBtn
-          label="Merge Road Mask"
-          onClick={handleMergeRoadMask}
-          disabled={isRunning || !roadMaskPath || !state.lastResultPath}
-          color="amber"
-        />
+
+        {/* Status indicators */}
+        <div className="text-[9px] text-surface-500 flex gap-2 px-0.5">
+          <span className={roadMasks ? "text-green-500" : ""}>
+            {roadMasks ? `✓ Roads (${roadMasks.maskPaths?.length})` : "· Roads"}
+          </span>
+          <span className={buildingMasks ? "text-green-500" : ""}>
+            {buildingMasks ? "✓ Buildings" : "· Buildings"}
+          </span>
+          <span className={vegetationMasks ? "text-green-500" : ""}>
+            {vegetationMasks ? `✓ Vegetation (${vegetationMasks.maskPaths?.length} masks)` : "· Vegetation"}
+          </span>
+        </div>
+
+        {/* SAM3 backend config */}
+        <details
+          className="text-[10px] text-surface-400"
+          onToggle={async (e) => {
+            if ((e.target as HTMLDetailsElement).open && !roadConfig) {
+              try { setRoadConfig(await getRoadExtractConfig()); } catch {}
+            }
+          }}
+        >
+          <summary className="cursor-pointer hover:text-surface-200">
+            SAM backend: {roadConfig?.loadedBackend ?? "click to check"}
+          </summary>
+          {roadConfig && (
+            <div className="mt-1 space-y-1 text-surface-500">
+              <div>Backend: <span className="text-surface-300">{roadConfig.loadedBackend ?? "not loaded yet"}</span></div>
+              <div>SAM3 dir: <span className="text-surface-300">{roadConfig.sam3LocalDir ?? "not found"}</span></div>
+              <div>SAM3 checkpoint: <span className={roadConfig.sam3CheckpointFound ? "text-green-400" : "text-red-400"}>
+                {roadConfig.sam3CheckpointFound ? "✓ found" : "✗ missing"}
+              </span></div>
+              <div className="flex gap-1 items-center">
+                <input
+                  className="flex-1 bg-surface-800 text-surface-200 text-[10px] px-1 py-0.5 rounded border border-surface-600"
+                  placeholder="Path to sam3 folder…"
+                  value={sam3PathInput}
+                  onChange={(e) => setSam3PathInput(e.target.value)}
+                />
+                <button
+                  className="px-1.5 py-0.5 bg-amber-700 hover:bg-amber-600 text-white rounded text-[10px]"
+                  onClick={async () => {
+                    const cfg = await setSam3Path(sam3PathInput || null);
+                    setRoadConfig(cfg);
+                  }}
+                >Set</button>
+              </div>
+            </div>
+          )}
+        </details>
       </div>
       {isRunning && (
         <button
@@ -606,7 +846,7 @@ function ActionBtn({
   label: string;
   onClick: () => void;
   disabled: boolean;
-  color: "blue" | "indigo" | "emerald" | "amber";
+  color: "blue" | "indigo" | "emerald" | "amber" | "orange";
   full?: boolean;
 }) {
   const base =
@@ -616,6 +856,7 @@ function ActionBtn({
     indigo: "bg-indigo-600 hover:bg-indigo-700 text-white",
     emerald: "bg-emerald-600 hover:bg-emerald-700 text-white",
     amber: "bg-amber-600 hover:bg-amber-700 text-white",
+    orange: "bg-orange-600 hover:bg-orange-700 text-white",
   };
   return (
     <button

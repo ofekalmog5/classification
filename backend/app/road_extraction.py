@@ -1,6 +1,13 @@
 """
-Road extraction from GeoTIFFs using SAM 3 (Segment Anything Model 3)
-via the samgeo (segment-geospatial) library.
+Road extraction from GeoTIFFs using SAM 3 (Segment Anything Model 3).
+
+Supports multiple backends (tried in order):
+  0. Local SAM3  — Meta's SAM 3 from a local directory
+  1. SamGeo3    — segment-geospatial wrapper
+  2. LangSAM    — SAM 2 + GroundingDINO
+  3. OWLv2+SAM2 — pure HuggingFace, works everywhere
+
+All backends work fully offline once models are downloaded.
 
 Standalone usage:
     python road_extraction.py input.tif -o roads_mask.tif
@@ -13,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -30,17 +38,125 @@ import rasterio
 from rasterio.windows import Window
 
 # ---------------------------------------------------------------------------
+# Configuration — all paths/settings can be overridden at runtime
+# ---------------------------------------------------------------------------
+
+# For fully-offline standalone stations, set these env vars BEFORE launching:
+#   set HF_HUB_OFFLINE=1
+#   set TRANSFORMERS_OFFLINE=1
+# This forces HuggingFace to use only cached models (no network requests).
+# On a dev machine with internet, leave them unset so models can download.
+
+# ---------------------------------------------------------------------------
 # SAM 3 model loading
 # ---------------------------------------------------------------------------
 
 _sam_model = None       # lazy singleton
-_sam_model_type = None  # "sam3" | "langsam" | "owlv2sam2"
+_sam_model_type = None  # "sam3_local" | "sam3" | "langsam" | "owlv2sam2"
+
+# Path to locally cloned SAM3 repo (Meta's SAM 3).
+# Can be overridden via:
+#   - Environment variable  SAM3_LOCAL_DIR
+#   - Calling  set_sam3_local_dir(path)  at runtime
+#   - POST /set-sam3-path  API endpoint
+_sam3_local_dir: Optional[Path] = None
+
+def _resolve_sam3_dir() -> Optional[Path]:
+    """Return the SAM3 local directory, checking env var and default paths."""
+    if _sam3_local_dir is not None:
+        return _sam3_local_dir
+
+    # Check persistent config
+    try:
+        from . import config as _cfg
+        saved = _cfg.get("sam3_local_dir")
+        if saved:
+            p = Path(saved)
+            if p.exists() and (p / "sam3").is_dir():
+                return p
+    except Exception:
+        pass
+
+    # Check environment variable
+    env = os.environ.get("SAM3_LOCAL_DIR")
+    if env:
+        p = Path(env)
+        if p.exists():
+            return p
+
+    # Default paths to search (portable — works on any station)
+    _project_root = Path(__file__).resolve().parent.parent.parent
+    candidates = [
+        _project_root / "sam3-main",   # sibling of project root
+        _project_root / "sam3",        # sibling of project root
+    ]
+    # When frozen, also check next to the exe
+    if getattr(sys, "frozen", False):
+        _exe_dir = Path(sys.executable).parent
+        candidates.insert(0, _exe_dir / "sam3-main")
+        candidates.insert(1, _exe_dir / "sam3")
+
+    for c in candidates:
+        if c.exists() and (c / "sam3").is_dir():
+            return c
+
+    return None
+
+
+def set_sam3_local_dir(path: str | Path | None):
+    """Set (or clear) the local SAM3 directory at runtime.
+
+    Persists to app_config.json so the setting survives restarts.
+    Clears the cached model so the next extraction re-loads from the new path.
+    """
+    global _sam3_local_dir
+    _sam3_local_dir = Path(path) if path else None
+    reset_model_cache()
+    # Persist to config file
+    try:
+        from . import config as _cfg
+        _cfg.save({"sam3_local_dir": str(path) if path else None})
+    except Exception:
+        pass
+
+
+def get_road_extract_config() -> dict:
+    """Return current road-extraction configuration."""
+    sam3_dir = _resolve_sam3_dir()
+    sam3_ckpt = None
+    if sam3_dir:
+        ckpt = sam3_dir / "sam3.pt"
+        sam3_ckpt = str(ckpt) if ckpt.exists() else None
+
+    # Check HuggingFace cache for OWLv2+SAM2 models
+    hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
+    owlv2_cached = (hf_cache / "models--google--owlv2-base-patch16-ensemble").exists()
+    sam2_cached = (hf_cache / "models--facebook--sam2-hiera-large").exists()
+
+    return {
+        "sam3LocalDir": str(sam3_dir) if sam3_dir else None,
+        "sam3CheckpointFound": sam3_ckpt is not None,
+        "sam3CheckpointPath": sam3_ckpt,
+        "loadedBackend": _sam_model_type,
+        "offlineMode": os.environ.get("HF_HUB_OFFLINE") == "1",
+        "hfCacheDir": str(hf_cache),
+        "owlv2Cached": owlv2_cached,
+        "sam2Cached": sam2_cached,
+    }
+
+
+def reset_model_cache():
+    """Clear the cached SAM model singleton (e.g. after code changes)."""
+    global _sam_model, _sam_model_type
+    _sam_model = None
+    _sam_model_type = None
 
 
 def _load_sam3(device: str = "auto"):
     """Load a text-prompted segmentation model (singleton).
 
     Priority order:
+      0. Local SAM3 — Meta's SAM 3 from local directory (needs checkpoint)
       1. SamGeo3  — SAM 3  (Linux/CUDA, needs triton)
       2. LangSAM  — SAM 2 + GroundingDINO  (needs compatible transformers)
       3. OWLv2+SAM2 — pure HuggingFace, works everywhere, no compilation
@@ -66,7 +182,62 @@ def _load_sam3(device: str = "auto"):
 
     import sys as _sys
 
-    # ── 1. Try SAM3 ────────────────────────────────────────────────────────
+    # ── 0. Try local SAM3 (Meta's repo) ─────────────────────────────────
+    sam3_dir = _resolve_sam3_dir()
+    if sam3_dir is not None:
+        try:
+            # Add sam3 repo to path so we can import it
+            sam3_str = str(sam3_dir)
+            if sam3_str not in _sys.path:
+                _sys.path.insert(0, sam3_str)
+
+            # Mock triton if on Windows (SAM3 needs it for imports but not inference)
+            if _sys.platform == "win32":
+                try:
+                    import triton  # noqa: F401
+                except ImportError:
+                    from unittest.mock import MagicMock as _MM
+                    for _mod in ("triton", "triton.language", "triton.runtime",
+                                 "triton.runtime.jit", "triton.ops",
+                                 "triton.compiler", "triton.backends"):
+                        _sys.modules.setdefault(_mod, _MM())
+
+            from sam3.model_builder import build_sam3_image_model
+            from sam3.model.sam3_image_processor import Sam3Processor
+
+            # Look for checkpoint — local file or HuggingFace cache
+            ckpt_path = sam3_dir / "sam3.pt"
+            if not ckpt_path.exists():
+                # Check HuggingFace cache
+                try:
+                    from huggingface_hub import try_to_load_from_cache
+                    cached = try_to_load_from_cache("facebook/sam3", "sam3.pt")
+                    if cached and Path(cached).exists():
+                        ckpt_path = Path(cached)
+                    else:
+                        raise FileNotFoundError("No local SAM3 checkpoint found")
+                except Exception:
+                    raise FileNotFoundError(
+                        f"SAM3 checkpoint not found. Place sam3.pt in {sam3_dir} "
+                        "or run: huggingface-cli login && huggingface-cli download facebook/sam3 sam3.pt"
+                    )
+
+            print(f"[RoadExtract] Loading local SAM3 from {ckpt_path} …")
+            model = build_sam3_image_model(
+                device=device,
+                eval_mode=True,
+                checkpoint_path=str(ckpt_path),
+                load_from_HF=False,
+            )
+            processor = Sam3Processor(model, device=device)
+            _sam_model = {"processor": processor, "device": device}
+            _sam_model_type = "sam3_local"
+            print("[RoadExtract] Loaded local SAM 3 (Meta)")
+            return _sam_model, _sam_model_type
+        except Exception as e:
+            print(f"[RoadExtract] Local SAM3 failed: {e}")
+
+    # ── 1. Try SamGeo3 ──────────────────────────────────────────────────
     # On Windows, triton may not be installed. We try three paths:
     #   a) triton-windows package is installed — works natively
     #   b) inject a MagicMock for triton so sam3 can import (inference only)
@@ -74,19 +245,15 @@ def _load_sam3(device: str = "auto"):
     if _sys.platform == "win32":
         try:
             import triton  # noqa: F401  (triton-windows)
-            print("[RoadExtract] triton-windows found — attempting SAM3")
+            print("[RoadExtract] triton-windows found — attempting SamGeo3")
         except ImportError:
-            # Inject a minimal mock so sam3 can import on Windows.
-            # SAM3 uses triton only for JIT-compiled CUDA kernels; at inference
-            # time PyTorch's built-in SDPA is used instead, so the mock is safe.
             try:
                 from unittest.mock import MagicMock as _MM
-                _triton_mock = _MM()
                 for _mod in ("triton", "triton.language", "triton.runtime",
                              "triton.runtime.jit", "triton.ops",
                              "triton.compiler", "triton.backends"):
                     _sys.modules.setdefault(_mod, _MM())
-                print("[RoadExtract] triton mocked for Windows SAM3 inference")
+                print("[RoadExtract] triton mocked for Windows SamGeo3 inference")
             except Exception:
                 pass
     try:
@@ -94,14 +261,15 @@ def _load_sam3(device: str = "auto"):
         model = SamGeo3(device=device)
         _sam_model = model
         _sam_model_type = "sam3"
-        print("[RoadExtract] Loaded SAM 3 model")
+        print("[RoadExtract] Loaded SamGeo3 model")
         return _sam_model, _sam_model_type
     except Exception as e:
         msg = str(e).lower()
-        if any(k in msg for k in ("triton", "sam3", "no module named", "importerror")):
-            print(f"[RoadExtract] SAM3 unavailable: {e}")
+        if any(k in msg for k in ("triton", "sam3", "no module named", "importerror",
+                                   "401 client error", "gated repo", "restricted")):
+            print(f"[RoadExtract] SamGeo3 unavailable: {e}")
         else:
-            print(f"[RoadExtract] SAM3 failed unexpectedly: {e}")
+            print(f"[RoadExtract] SamGeo3 failed unexpectedly: {e}")
         print("[RoadExtract] Trying LangSAM …")
 
     # ── 2. Try LangSAM (GroundingDINO + SAM2) ──────────────────────────────
@@ -118,19 +286,29 @@ def _load_sam3(device: str = "auto"):
 
     # ── 3. OWLv2 + SAM2 via HuggingFace transformers ──────────────────────
     # Requires only: pip install transformers (+ torch already installed)
+    # NOTE: We use Sam2Processor + Sam2Model (not the mask-generation pipeline)
+    # because the pipeline doesn't accept input_boxes for prompted segmentation.
     try:
+        import torch as _torch
         from transformers import pipeline as _hf_pipeline
+        from transformers import Sam2Processor, Sam2Model
+
+        _dev = 0 if device == "cuda" else -1
         detector = _hf_pipeline(
             "zero-shot-object-detection",
             model="google/owlv2-base-patch16-ensemble",
-            device=0 if device == "cuda" else -1,
+            device=_dev,
         )
-        segmenter = _hf_pipeline(
-            "mask-generation",
-            model="facebook/sam2-hiera-large",
-            device=0 if device == "cuda" else -1,
-        )
-        _sam_model = {"detector": detector, "segmenter": segmenter}
+        sam2_processor = Sam2Processor.from_pretrained("facebook/sam2-hiera-large")
+        sam2_model = Sam2Model.from_pretrained("facebook/sam2-hiera-large")
+        sam2_model.to(device)
+        sam2_model.eval()
+        _sam_model = {
+            "detector": detector,
+            "sam2_processor": sam2_processor,
+            "sam2_model": sam2_model,
+            "device": device,
+        }
         _sam_model_type = "owlv2sam2"
         print("[RoadExtract] Loaded OWLv2 + SAM2 (HuggingFace)")
         return _sam_model, _sam_model_type
@@ -298,7 +476,11 @@ def extract_roads(
                     tile_rgb = np.moveaxis(tile_data[:3], 0, -1).astype(np.uint8)
 
                     # --- Run SAM text-prompted segmentation ---
-                    mask_tile = _segment_tile(sam, sam_type, tile_rgb, text_prompt)
+                    try:
+                        mask_tile = _segment_tile(sam, sam_type, tile_rgb, text_prompt)
+                    except Exception as tile_err:
+                        print(f"[RoadExtract] Tile {idx+1}/{total_tiles} failed: {tile_err}")
+                        mask_tile = np.zeros(tile_rgb.shape[:2], dtype=np.uint8)
                     # mask_tile: (H, W) binary uint8 {0, 1}
 
                     # Crop to write region (inner portion)
@@ -336,10 +518,13 @@ def extract_roads(
 def _segment_tile(sam, sam_type: str, tile_rgb: np.ndarray, text_prompt: str) -> np.ndarray:
     """Run text-prompted segmentation on a single tile.
 
-    Supports sam3, langsam, and owlv2sam2.
+    Supports sam3_local, sam3, langsam, and owlv2sam2.
     Returns a binary mask (H, W) with 1 = road, 0 = background.
     """
     h, w = tile_rgb.shape[:2]
+
+    if sam_type == "sam3_local":
+        return _segment_tile_sam3_local(sam, tile_rgb, text_prompt)
 
     if sam_type == "owlv2sam2":
         return _segment_tile_owlv2(sam, tile_rgb, text_prompt)
@@ -367,20 +552,33 @@ def _segment_tile(sam, sam_type: str, tile_rgb: np.ndarray, text_prompt: str) ->
                 text_threshold=0.24,
                 output=tmp_output_path,
             )
+            if Path(tmp_output_path).exists():
+                if _CV2_AVAILABLE:
+                    mask = cv2.imread(tmp_output_path, cv2.IMREAD_GRAYSCALE)
+                else:
+                    from PIL import Image as _PILImage
+                    mask = np.array(_PILImage.open(tmp_output_path).convert("L"))
+                if mask is not None:
+                    return (mask > 0).astype(np.uint8)
         else:
-            # SamGeo3 API
+            # SamGeo3: set_image → generate_masks (sets sam.masks as side effect)
             sam.set_image(tmp_input_path)
-            sam.text_prompt = text_prompt
-            sam.generate(output=tmp_output_path)
-
-        if Path(tmp_output_path).exists():
-            if _CV2_AVAILABLE:
-                mask = cv2.imread(tmp_output_path, cv2.IMREAD_GRAYSCALE)
-            else:
-                from PIL import Image as _PILImage
-                mask = np.array(_PILImage.open(tmp_output_path).convert("L"))
-            if mask is not None:
-                return (mask > 0).astype(np.uint8)
+            sam.generate_masks(text_prompt, quiet=True)
+            print(f"    [SamGeo3] found {len(sam.masks)} mask(s) for prompt={text_prompt!r}")
+            if len(sam.masks) > 0:
+                combined = np.zeros((h, w), dtype=np.uint8)
+                for m in sam.masks:
+                    arr = np.asarray(m)
+                    # Handle (1, H, W) or (H, W) shapes
+                    if arr.ndim == 3:
+                        arr = arr[0]
+                    # Resize to tile dimensions if needed
+                    if arr.shape != (h, w):
+                        from PIL import Image as _PILImg
+                        arr = np.array(_PILImg.fromarray(arr.astype(np.uint8)).resize(
+                            (w, h), resample=_PILImg.NEAREST))
+                    combined |= (arr > 0).astype(np.uint8)
+                return combined
 
         return np.zeros((h, w), dtype=np.uint8)
 
@@ -392,8 +590,8 @@ def _segment_tile(sam, sam_type: str, tile_rgb: np.ndarray, text_prompt: str) ->
                 pass
 
 
-def _segment_tile_owlv2(sam_bundle: dict, tile_rgb: np.ndarray, text_prompt: str) -> np.ndarray:
-    """Segment tile using OWLv2 (detection) + SAM2 (masks) via HuggingFace.
+def _segment_tile_sam3_local(sam_bundle: dict, tile_rgb: np.ndarray, text_prompt: str) -> np.ndarray:
+    """Segment tile using local Meta SAM3 model with text prompts.
 
     Returns binary mask (H, W).
     """
@@ -401,34 +599,97 @@ def _segment_tile_owlv2(sam_bundle: dict, tile_rgb: np.ndarray, text_prompt: str
 
     h, w = tile_rgb.shape[:2]
     pil_image = _PILImage.fromarray(tile_rgb)
+    processor = sam_bundle["processor"]
+
+    # SAM3 API: set_image → set_text_prompt → read masks
+    state = processor.set_image(pil_image)
+    state = processor.set_text_prompt(text_prompt, state)
+
+    masks = state.get("masks")  # shape: (N, 1, H, W) boolean tensor
+    if masks is None or masks.numel() == 0:
+        return np.zeros((h, w), dtype=np.uint8)
+
+    # Union all detected masks
+    combined = masks.squeeze(1).any(dim=0).cpu().numpy().astype(np.uint8)
+    return combined
+
+
+def _segment_tile_owlv2(sam_bundle: dict, tile_rgb: np.ndarray, text_prompt: str) -> np.ndarray:
+    """Segment tile using OWLv2 (detection) + SAM2 (masks) via HuggingFace.
+
+    Uses Sam2Processor + Sam2Model with input_boxes for prompted segmentation
+    (the mask-generation pipeline does NOT support input_boxes).
+
+    Returns binary mask (H, W).
+    """
+    import torch as _torch
+    from PIL import Image as _PILImage
+
+    h, w = tile_rgb.shape[:2]
+    pil_image = _PILImage.fromarray(tile_rgb)
     detector = sam_bundle["detector"]
-    segmenter = sam_bundle["segmenter"]
+    sam2_processor = sam_bundle["sam2_processor"]
+    sam2_model = sam_bundle["sam2_model"]
+    device = sam_bundle["device"]
 
     # OWLv2: detect boxes matching the text prompt
-    # Expects list of candidate labels
-    labels = [p.strip() for p in text_prompt.replace(",", " ").split() if p.strip()]
-    detections = detector(pil_image, candidate_labels=labels, threshold=0.1)
+    # Split by commas to keep multi-word labels intact
+    # e.g. "road, highway, asphalt path" → ["road", "highway", "asphalt path"]
+    labels = [p.strip() for p in text_prompt.split(",") if p.strip()]
+    raw_detections = detector(pil_image, candidate_labels=labels, threshold=0.05)
+
+    # Pipeline may return [[{...}]] (batched) or [{...}] (single image)
+    if raw_detections and isinstance(raw_detections[0], list):
+        detections = raw_detections[0]
+    else:
+        detections = raw_detections
+
+    print(f"    [OWLv2] {len(detections)} detection(s) for prompt={text_prompt!r} "
+          f"(top scores: {sorted([d['score'] for d in detections], reverse=True)[:5]})")
 
     if not detections:
         return np.zeros((h, w), dtype=np.uint8)
 
-    # SAM2: generate masks from detected boxes
+    # Collect detected boxes as [[xmin, ymin, xmax, ymax], ...]
     boxes = [[d["box"]["xmin"], d["box"]["ymin"], d["box"]["xmax"], d["box"]["ymax"]]
              for d in detections]
 
-    outputs = segmenter(pil_image, points_per_batch=32, input_boxes=[boxes])
-    masks = outputs.get("masks", [])
+    # SAM2: prompted segmentation using detected boxes
+    # input_boxes must be nested: [[[x0,y0,x1,y1], ...]] (batch=1, image boxes)
+    inputs = sam2_processor(
+        images=pil_image,
+        input_boxes=[boxes],
+        return_tensors="pt",
+    ).to(device)
 
-    if not masks:
+    with _torch.no_grad():
+        outputs = sam2_model(**inputs)
+
+    # Post-process masks back to original image size
+    pred_masks = sam2_processor.post_process_masks(
+        outputs.pred_masks.cpu(),
+        inputs["original_sizes"].cpu(),
+        inputs["reshaped_input_sizes"].cpu(),
+    )
+
+    if not pred_masks or len(pred_masks) == 0:
         return np.zeros((h, w), dtype=np.uint8)
 
-    # Union all masks
+    # pred_masks[0] shape: (num_boxes, num_predictions_per_box, H, W)
+    # Union all predicted masks
     combined = np.zeros((h, w), dtype=np.uint8)
-    for mask in masks:
-        arr = np.array(mask)
-        if arr.ndim == 3:
-            arr = arr[0]
-        combined = np.logical_or(combined, arr > 0).astype(np.uint8)
+    masks_tensor = pred_masks[0]  # first (and only) image in batch
+    if hasattr(masks_tensor, "numpy"):
+        masks_arr = masks_tensor.numpy()
+    else:
+        masks_arr = np.array(masks_tensor)
+
+    # Flatten all mask predictions and union them
+    for box_masks in masks_arr:
+        if box_masks.ndim >= 2:
+            # Take the highest-confidence mask per box (first prediction)
+            mask_2d = box_masks[0] if box_masks.ndim == 3 else box_masks
+            combined = np.logical_or(combined, mask_2d > 0).astype(np.uint8)
 
     return combined
 
@@ -521,6 +782,40 @@ def merge_road_mask_onto_classification(
     """
     cls_path = Path(classification_path)
 
+    # If the classification path is a directory (tile output), process each
+    # tile file individually and return the list of merged tile outputs.
+    if cls_path.is_dir():
+        tile_files = sorted(
+            p for p in cls_path.iterdir()
+            if p.is_file() and p.suffix.lower() in (".tif", ".tiff", ".img")
+        )
+        if not tile_files:
+            return {"status": "error", "message": f"No raster tiles found in directory: {cls_path}"}
+        print(f"[merge_road_mask] Directory input — processing {len(tile_files)} tiles")
+        merged_outputs: list[str] = []
+        for i, tf in enumerate(tile_files):
+            if progress_callback:
+                progress_callback(f"Merging road mask (tile {i+1}/{len(tile_files)})", i, len(tile_files))
+            tile_result = merge_road_mask_onto_classification(
+                classification_path=str(tf),
+                road_mask_path=road_mask_path,
+                output_path=None,  # auto-generate per tile
+                asphalt_color=asphalt_color,
+                progress_callback=None,
+            )
+            if tile_result.get("status") == "ok":
+                merged_outputs.append(tile_result["outputPath"])
+            else:
+                print(f"  [warn] Tile {tf.name} merge failed: {tile_result.get('message')}")
+        if progress_callback:
+            progress_callback("Merging road mask", len(tile_files), len(tile_files))
+        return {
+            "status": "ok",
+            "outputPath": str(cls_path),
+            "tileOutputs": merged_outputs,
+            "message": f"Road mask merged onto {len(merged_outputs)}/{len(tile_files)} tiles",
+        }
+
     # Handle output path - ensure it's a valid .tif file path
     if output_path is None:
         output_path = str(cls_path.with_name(f"{cls_path.stem}_roads_merged.tif"))
@@ -535,10 +830,16 @@ def merge_road_mask_onto_classification(
         else:
             output_path = str(outp)
 
+    from rasterio.windows import from_bounds as window_from_bounds
+    import numpy as np
+
     with rasterio.open(classification_path) as cls_src:
         profile = cls_src.profile.copy()
         width = cls_src.width
         height = cls_src.height
+        cls_transform = cls_src.transform
+        cls_crs = cls_src.crs
+        cls_bounds = cls_src.bounds
 
     profile.update(driver="GTiff", compress="deflate")
 
@@ -549,30 +850,395 @@ def merge_road_mask_onto_classification(
          rasterio.open(road_mask_path) as mask_src, \
          rasterio.open(output_path, "w", **profile) as dst:
 
+        # Check if mask and classification share the same grid (full-image case)
+        # or if we need to use geographic alignment (tile case).
+        _same_grid = (
+            mask_src.width == cls_src.width
+            and mask_src.height == cls_src.height
+            and mask_src.transform == cls_src.transform
+        )
+
         for strip_idx in range(total_strips):
             if progress_callback:
                 progress_callback("Merging road mask", strip_idx, total_strips)
 
             row_start = strip_idx * strip_h
             h = min(strip_h, height - row_start)
-            win = Window(0, row_start, width, h)
+            cls_win = Window(0, row_start, width, h)
 
-            # Read RGB classification tile (C, H, W)
-            rgb = cls_src.read(window=win)
+            # Read RGB classification strip (C, H, W)
+            rgb = cls_src.read(window=cls_win)
 
-            # Read mask tile (H, W)
-            mask_band = mask_src.read(1, window=win)
+            if _same_grid:
+                # Same dimensions — read mask with same pixel window
+                mask_band = mask_src.read(1, window=cls_win)
+            else:
+                # Geographic alignment: compute the bounds of this classification
+                # strip and read the corresponding area from the road mask.
+                strip_transform = rasterio.windows.transform(cls_win, cls_transform)
+                strip_bounds = rasterio.transform.array_bounds(h, width, strip_transform)
+                # left, bottom, right, top
+                try:
+                    mask_win = window_from_bounds(
+                        *strip_bounds, transform=mask_src.transform,
+                    )
+                    # Clamp to mask extent
+                    mask_win = mask_win.intersection(
+                        Window(0, 0, mask_src.width, mask_src.height)
+                    )
+                    raw_mask = mask_src.read(1, window=mask_win)
+                    # Resize to match the classification strip if needed
+                    if raw_mask.shape != (h, width):
+                        from rasterio.enums import Resampling
+                        mask_band = np.zeros((h, width), dtype=raw_mask.dtype)
+                        rasterio.warp.reproject(
+                            source=raw_mask,
+                            destination=mask_band,
+                            src_transform=rasterio.windows.transform(mask_win, mask_src.transform),
+                            src_crs=mask_src.crs,
+                            dst_transform=strip_transform,
+                            dst_crs=cls_crs,
+                            resampling=Resampling.nearest,
+                        )
+                    else:
+                        mask_band = raw_mask
+                except Exception as e:
+                    # Strip falls outside mask extent — no roads here
+                    print(f"  [merge] Strip {strip_idx}: no mask overlap ({e})")
+                    mask_band = np.zeros((h, width), dtype=np.uint8)
+
             road_pixels = mask_band > 0
 
             # Apply asphalt color where mask is 1
             for band_idx in range(min(rgb.shape[0], 3)):
                 rgb[band_idx][road_pixels] = asphalt_color[band_idx]
 
-            dst.write(rgb, window=win)
+            dst.write(rgb, window=cls_win)
 
     if progress_callback:
         progress_callback("Done", total_strips, total_strips)
 
+    return {"status": "ok", "outputPath": output_path}
+
+
+# ---------------------------------------------------------------------------
+# Feature extraction configs (prompt + merge color per sub-type)
+# Colors are RGB tuples matching MEA class hex codes
+# ---------------------------------------------------------------------------
+
+FEATURE_CONFIGS: Dict[str, List[Dict]] = {
+    "roads": [
+        {
+            "prompt": "road, highway, asphalt path",
+            "suffix": "roads",
+            "color": (45, 45, 48),       # BM_ASPHALT #2D2D30
+        },
+    ],
+    "buildings": [
+        {
+            "prompt": "building, structure, rooftop, house, concrete building",
+            "suffix": "buildings",
+            "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
+        },
+    ],
+    "vegetation": [
+        {
+            "prompt": "trees, forest, forest canopy, dense foliage, woodland",
+            "suffix": "veg_foliage",
+            "color": (0, 100, 0),         # BM_FOLIAGE #006400
+        },
+        {
+            "prompt": "dry grass, brown grass, arid land, dead grass, straw",
+            "suffix": "veg_dry_grass",
+            "color": (189, 183, 107),     # BM_LAND_DRY_GRASS #BDB76B
+        },
+        {
+            "prompt": "grass, lawn, green grass, green field, turf",
+            "suffix": "veg_grass",
+            "color": (124, 252, 0),       # BM_LAND_GRASS #7CFC00
+        },
+        {
+            "prompt": "vegetation, shrubs, bushes, plants, undergrowth",
+            "suffix": "veg_vegetation",
+            "color": (34, 139, 34),       # BM_VEGETATION #228B22
+        },
+    ],
+}
+
+
+def extract_feature_masks(
+    input_path: str,
+    output_path: str | None = None,
+    feature_type: str = "roads",
+    tile_size: int = 1024,
+    overlap_pct: float = 0.1,
+    closing_kernel_size: int = 15,
+    device: str = "auto",
+    progress_callback: Optional[Callable] = None,
+) -> Dict[str, object]:
+    """Extract one or more feature masks from a GeoTIFF using SAM text prompts.
+
+    Parameters
+    ----------
+    feature_type : str
+        One of ``"roads"``, ``"buildings"``, ``"vegetation"``.
+        Vegetation produces 4 masks (foliage / dry grass / grass / vegetation).
+
+    Returns
+    -------
+    dict
+        ``{"status": "ok", "maskPaths": [...], "colors": [(r,g,b), ...]}``
+    """
+    configs = FEATURE_CONFIGS.get(feature_type)
+    if configs is None:
+        return {"status": "error", "message": f"Unknown feature_type: {feature_type!r}"}
+
+    inp = Path(input_path)
+    n = len(configs)
+    mask_paths: List[str] = []
+    colors: List[Tuple[int, int, int]] = []
+
+    # Load SAM model once, reuse for all sub-prompts
+    if progress_callback:
+        progress_callback("Loading SAM model", 0, n * 100 + 2)
+    sam, sam_type = _load_sam3(device)
+
+    for i, cfg in enumerate(configs):
+        suffix = cfg["suffix"]
+        color = cfg["color"]
+        prompt = cfg["prompt"]
+
+        if output_path is None:
+            out = str(inp.with_name(f"{inp.stem}_{suffix}.tif"))
+        else:
+            outp = Path(output_path)
+            if outp.is_dir():
+                out = str(outp / f"{inp.stem}_{suffix}.tif")
+            else:
+                # Use stem of provided path + suffix
+                out = str(outp.with_name(f"{outp.stem}_{suffix}.tif"))
+
+        def _cb(phase: str, done: int, total: int, _i: int = i, _n: int = n) -> None:
+            if progress_callback:
+                progress_callback(phase, _i * 100 + done, _n * 100 + 2)
+
+        result = _run_single_extraction(
+            input_path=input_path,
+            output_path=out,
+            text_prompt=prompt,
+            sam=sam,
+            sam_type=sam_type,
+            tile_size=tile_size,
+            overlap_pct=overlap_pct,
+            closing_kernel_size=closing_kernel_size,
+            progress_callback=_cb,
+        )
+        if result.get("status") == "ok":
+            mask_paths.append(result["outputPath"])
+            colors.append(color)
+        else:
+            print(f"[extract_feature_masks] Sub-extraction {suffix} failed: {result.get('message')}")
+
+    if not mask_paths:
+        return {"status": "error", "message": f"All {feature_type} sub-extractions failed"}
+
+    if progress_callback:
+        progress_callback("Done", n * 100 + 2, n * 100 + 2)
+
+    return {"status": "ok", "maskPaths": mask_paths, "colors": colors}
+
+
+def _run_single_extraction(
+    input_path: str,
+    output_path: str,
+    text_prompt: str,
+    sam,
+    sam_type: str,
+    tile_size: int = 1024,
+    overlap_pct: float = 0.1,
+    closing_kernel_size: int = 15,
+    progress_callback: Optional[Callable] = None,
+) -> Dict[str, object]:
+    """Run a single SAM text-prompted mask extraction (reuses an already-loaded model)."""
+    with rasterio.open(input_path) as src:
+        profile = src.profile.copy()
+        width = src.width
+        height = src.height
+
+    profile.update(driver="GTiff", dtype="uint8", count=1, compress="deflate", nodata=0)
+    overlap = max(1, int(tile_size * overlap_pct))
+    tiles = _generate_tiles(width, height, tile_size, overlap)
+    total_tiles = len(tiles)
+
+    tmp_mask_path = output_path + ".tmp_raw.tif"
+    try:
+        with rasterio.open(tmp_mask_path, "w", **profile) as dst:
+            with rasterio.open(input_path) as src:
+                for idx, (read_win, write_win, inner_col, inner_row) in enumerate(tiles):
+                    if progress_callback:
+                        progress_callback("Extracting", idx, total_tiles)
+                    bands_to_read = min(src.count, 3)
+                    tile_data = src.read(list(range(1, bands_to_read + 1)), window=read_win)
+                    tile_rgb = np.moveaxis(tile_data[:3], 0, -1).astype(np.uint8)
+                    try:
+                        mask_tile = _segment_tile(sam, sam_type, tile_rgb, text_prompt)
+                    except Exception as tile_err:
+                        print(f"[Extract] Tile {idx+1}/{total_tiles} failed: {tile_err}")
+                        mask_tile = np.zeros(tile_rgb.shape[:2], dtype=np.uint8)
+                    w_h = write_win.height
+                    w_w = write_win.width
+                    inner_mask = mask_tile[inner_row: inner_row + w_h, inner_col: inner_col + w_w]
+                    dst.write(inner_mask.astype(np.uint8)[np.newaxis, :, :], window=write_win)
+
+        if progress_callback:
+            progress_callback("Closing", total_tiles, total_tiles + 1)
+        _morphological_close(tmp_mask_path, output_path, profile, closing_kernel_size)
+    finally:
+        tmp = Path(tmp_mask_path)
+        if tmp.exists():
+            tmp.unlink()
+
+    if progress_callback:
+        progress_callback("Done", total_tiles + 1, total_tiles + 1)
+    return {"status": "ok", "outputPath": output_path}
+
+
+def merge_feature_masks_onto_classification(
+    classification_path: str,
+    mask_paths: List[str],
+    colors: List[Tuple[int, int, int]],
+    output_path: str | None = None,
+    progress_callback: Optional[Callable] = None,
+) -> Dict[str, object]:
+    """Merge one or more feature masks onto a classification GeoTIFF.
+
+    Masks are applied in order — later masks override earlier ones where they overlap.
+    Each mask is painted with its corresponding RGB color.
+
+    Parameters
+    ----------
+    classification_path : str
+        Path to the RGB classification GeoTIFF (or directory of tiles).
+    mask_paths : list of str
+        Paths to binary mask GeoTIFFs (1 = feature, 0 = background).
+    colors : list of (r, g, b) tuples
+        RGB color for each mask (same order as mask_paths).
+    output_path : str, optional
+        Output path. Defaults to ``<classification_stem>_features_merged.tif``.
+    """
+    cls_path = Path(classification_path)
+
+    # Handle tiled classification directory
+    if cls_path.is_dir():
+        tile_files = sorted(
+            p for p in cls_path.iterdir()
+            if p.is_file() and p.suffix.lower() in (".tif", ".tiff", ".img")
+        )
+        if not tile_files:
+            return {"status": "error", "message": f"No raster tiles found in: {cls_path}"}
+        print(f"[merge_features] Directory — processing {len(tile_files)} tiles")
+        merged_outputs: list[str] = []
+        for i, tf in enumerate(tile_files):
+            if progress_callback:
+                progress_callback(f"Merging tile {i+1}/{len(tile_files)}", i, len(tile_files))
+            r = merge_feature_masks_onto_classification(
+                classification_path=str(tf),
+                mask_paths=mask_paths,
+                colors=colors,
+                output_path=None,
+                progress_callback=None,
+            )
+            if r.get("status") == "ok":
+                merged_outputs.append(r["outputPath"])
+            else:
+                print(f"  [warn] Tile {tf.name} failed: {r.get('message')}")
+        if progress_callback:
+            progress_callback("Done", len(tile_files), len(tile_files))
+        return {"status": "ok", "outputPath": str(cls_path), "tileOutputs": merged_outputs}
+
+    # Resolve output path
+    if output_path is None:
+        output_path = str(cls_path.with_name(f"{cls_path.stem}_features_merged.tif"))
+    else:
+        outp = Path(output_path)
+        if outp.is_dir():
+            output_path = str(outp / f"{cls_path.stem}_features_merged.tif")
+        elif not outp.suffix or outp.suffix.lower() not in (".tif", ".tiff"):
+            output_path = str(outp.with_suffix(".tif"))
+
+    from rasterio.windows import from_bounds as window_from_bounds
+    import numpy as np
+
+    with rasterio.open(classification_path) as cls_src:
+        profile = cls_src.profile.copy()
+        width = cls_src.width
+        height = cls_src.height
+        cls_transform = cls_src.transform
+        cls_crs = cls_src.crs
+
+    profile.update(driver="GTiff", compress="deflate")
+
+    strip_h = 2048
+    total_strips = math.ceil(height / strip_h)
+
+    # Pre-open all mask files
+    mask_srcs = [rasterio.open(mp) for mp in mask_paths]
+    try:
+        same_grids = [
+            ms.width == width and ms.height == height and ms.transform == cls_transform
+            for ms in mask_srcs
+        ]
+
+        with rasterio.open(classification_path) as cls_src, \
+             rasterio.open(output_path, "w", **profile) as dst:
+
+            for strip_idx in range(total_strips):
+                if progress_callback:
+                    progress_callback("Merging", strip_idx, total_strips)
+
+                row_start = strip_idx * strip_h
+                h = min(strip_h, height - row_start)
+                cls_win = Window(0, row_start, width, h)
+                rgb = cls_src.read(window=cls_win)
+
+                for mask_src, color, same_grid in zip(mask_srcs, colors, same_grids):
+                    if same_grid:
+                        mask_band = mask_src.read(1, window=cls_win)
+                    else:
+                        strip_transform = rasterio.windows.transform(cls_win, cls_transform)
+                        strip_bounds = rasterio.transform.array_bounds(h, width, strip_transform)
+                        try:
+                            mask_win = window_from_bounds(*strip_bounds, transform=mask_src.transform)
+                            mask_win = mask_win.intersection(Window(0, 0, mask_src.width, mask_src.height))
+                            raw_mask = mask_src.read(1, window=mask_win)
+                            if raw_mask.shape != (h, width):
+                                from rasterio.enums import Resampling
+                                mask_band = np.zeros((h, width), dtype=raw_mask.dtype)
+                                rasterio.warp.reproject(
+                                    source=raw_mask,
+                                    destination=mask_band,
+                                    src_transform=rasterio.windows.transform(mask_win, mask_src.transform),
+                                    src_crs=mask_src.crs,
+                                    dst_transform=strip_transform,
+                                    dst_crs=cls_crs,
+                                    resampling=Resampling.nearest,
+                                )
+                            else:
+                                mask_band = raw_mask
+                        except Exception:
+                            mask_band = np.zeros((h, width), dtype=np.uint8)
+
+                    feature_pixels = mask_band > 0
+                    for band_idx in range(min(rgb.shape[0], 3)):
+                        rgb[band_idx][feature_pixels] = color[band_idx]
+
+                dst.write(rgb, window=cls_win)
+    finally:
+        for ms in mask_srcs:
+            ms.close()
+
+    if progress_callback:
+        progress_callback("Done", total_strips, total_strips)
     return {"status": "ok", "outputPath": output_path}
 
 

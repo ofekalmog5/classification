@@ -78,6 +78,7 @@ export type Action =
   | { type: "SET_ALL_LAYERS_VISIBLE"; visible: boolean }
   | { type: "SET_LAYERS_VISIBLE"; ids: string[]; visible: boolean }
   | { type: "REMOVE_ALL_LAYERS" }
+  | { type: "REMOVE_MANY_LAYERS"; ids: string[] }
   // Run state
   | { type: "SET_RUNNING"; step: PipelineStep }
   | { type: "SET_PROGRESS"; progress: ProgressEvent | null }
@@ -167,6 +168,18 @@ function reducer(state: AppState, action: Action): AppState {
 
     case "REMOVE_ALL_LAYERS":
       return { ...state, mapLayers: [], layerGroups: [] };
+
+    case "REMOVE_MANY_LAYERS": {
+      const idsToRemove = new Set(action.ids);
+      return {
+        ...state,
+        mapLayers: state.mapLayers.filter((l) => !idsToRemove.has(l.id)),
+        layerGroups: state.layerGroups.map((g) => ({
+          ...g,
+          layerIds: g.layerIds.filter((lid) => !idsToRemove.has(lid)),
+        })),
+      };
+    }
 
     case "REMOVE_MAP_LAYER":
       return {

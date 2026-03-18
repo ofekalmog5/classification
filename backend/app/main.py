@@ -13,6 +13,7 @@ if hasattr(sys.stderr, 'reconfigure'):
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Literal, Dict, Tuple, Optional
 from pathlib import Path
@@ -31,6 +32,9 @@ from .core import train_kmeans_model, build_shared_color_table, suggest_tile_siz
 from .core import _ACCEL_ENGINE, _ACCEL_GPU, _ACCEL_GPU_INFO
 from .road_extraction import extract_roads as run_extract_roads
 from .road_extraction import merge_road_mask_onto_classification as run_merge_road_mask
+from .road_extraction import extract_feature_masks as run_extract_feature_masks
+from .road_extraction import merge_feature_masks_onto_classification as run_merge_feature_masks
+from .road_extraction import set_sam3_local_dir, get_road_extract_config
 
 # ─── SSE progress streaming infrastructure ───────────────────────────────
 
@@ -440,17 +444,18 @@ def classify_batch(request: BatchClassifyRequest) -> dict:
                 all_results.append(result)
                 if result.get("status") == "ok":
                     op = result.get("outputPath", "")
-                    if op:
-                        # Only add classified paths to output list when no vectors;
-                        # when vectors present, we only show with_vectors outputs.
-                        if not has_vectors:
-                            all_output_paths.append(str(op))
-                        classified_outputs.append((rpath, str(op)))
                     tiles = result.get("tileOutputs")
+                    if op:
+                        classified_outputs.append((rpath, str(op)))
                     if tiles:
+                        # Tile mode: add individual tile files (not the directory)
                         all_tile_outputs.extend(tiles)
                         if not has_vectors:
                             all_output_paths.extend(str(t) for t in tiles)
+                    elif op:
+                        # Single-file mode: add the output file
+                        if not has_vectors:
+                            all_output_paths.append(str(op))
                 else:
                     errors.append((rpath, result.get("message", "unknown error")))
             except Exception as e:
@@ -509,15 +514,16 @@ def classify_batch(request: BatchClassifyRequest) -> dict:
                     sys.stdout.flush()
                     if vec_result.get("status") == "ok":
                         vec_op = vec_result.get("outputPath", "")
-                        if vec_op:
-                            all_output_paths.append(str(vec_op))
-                            # Verify the file was actually written
-                            if not Path(vec_op).exists():
-                                print(f"  [WARN] outputPath={vec_op} does NOT exist on disk!")
                         vec_tiles = vec_result.get("tileOutputs")
                         if vec_tiles:
+                            # Tile mode: add individual tile files (not the directory)
                             all_tile_outputs.extend(vec_tiles)
                             all_output_paths.extend(str(t) for t in vec_tiles)
+                        elif vec_op:
+                            # Single-file mode: add the output file
+                            all_output_paths.append(str(vec_op))
+                            if not Path(vec_op).exists():
+                                print(f"  [WARN] outputPath={vec_op} does NOT exist on disk!")
                         print(f"  [OK] Vectors rasterized -> {vec_op}")
                     else:
                         print(f"  [WARN] Vector rasterize failed: {vec_result.get('message')}")
@@ -676,6 +682,129 @@ def merge_road_mask(request: MergeRoadMaskRequest) -> dict:
             tracker.finish()
 
 
+# ─── Generic feature extraction (buildings, vegetation, roads) ───────────
+
+
+class ExtractFeaturesRequest(BaseModel):
+    rasterPath: str
+    featureType: str  # "roads" | "buildings" | "vegetation"
+    outputPath: str | None = None
+    tileSize: int = 1024
+    overlapPct: float = 0.1
+    closingKernelSize: int = 15
+    device: str = "auto"
+    taskId: str | None = None
+
+
+@app.post("/extract-features")
+def extract_features(request: ExtractFeaturesRequest) -> dict:
+    """Extract feature masks (roads/buildings/vegetation) using SAM text prompts."""
+    print(f"[API /extract-features] featureType={request.featureType!r} rasterPath={request.rasterPath!r}")
+    tracker = _ProgressTracker(request.taskId, "feature_extract") if request.taskId else None
+    try:
+        result = run_extract_feature_masks(
+            input_path=request.rasterPath,
+            output_path=request.outputPath,
+            feature_type=request.featureType,
+            tile_size=request.tileSize,
+            overlap_pct=request.overlapPct,
+            closing_kernel_size=request.closingKernelSize,
+            device=request.device,
+            progress_callback=tracker,
+        )
+        return result
+    except TaskCancelledError:
+        return JSONResponse(status_code=499, content={"status": "cancelled", "message": "Task cancelled by user"})
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+    finally:
+        if tracker:
+            tracker.finish()
+
+
+class MergeFeatureMasksRequest(BaseModel):
+    classificationPath: str
+    maskPaths: list[str]
+    colors: list[list[int]]  # [[r, g, b], ...]
+    outputPath: str | None = None
+    taskId: str | None = None
+
+
+@app.post("/merge-feature-masks")
+def merge_feature_masks(request: MergeFeatureMasksRequest) -> dict:
+    """Merge feature masks (buildings/vegetation/roads) onto a classification output."""
+    print(f"[API /merge-feature-masks] classification={request.classificationPath!r} masks={len(request.maskPaths)}")
+    tracker = _ProgressTracker(request.taskId, "feature_merge") if request.taskId else None
+    colors = [tuple(c) for c in request.colors]
+    try:
+        result = run_merge_feature_masks(
+            classification_path=request.classificationPath,
+            mask_paths=request.maskPaths,
+            colors=colors,
+            output_path=request.outputPath,
+            progress_callback=tracker,
+        )
+        return result
+    except TaskCancelledError:
+        return JSONResponse(status_code=499, content={"status": "cancelled", "message": "Task cancelled by user"})
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+    finally:
+        if tracker:
+            tracker.finish()
+
+
+# ─── App config (persistent settings) ────────────────────────────────────
+
+from .config import load as _load_config, save as _save_config, config_path as _config_path
+
+
+class AppConfigUpdate(BaseModel):
+    sam3_local_dir: str | None = None
+    hf_cache_dir: str | None = None
+    offline_mode: bool | None = None
+
+
+@app.get("/app-config")
+def app_config_get() -> dict:
+    """Return all persistent app settings + config file path."""
+    cfg = _load_config()
+    return {**cfg, "configPath": _config_path()}
+
+
+@app.post("/app-config")
+def app_config_set(request: AppConfigUpdate) -> dict:
+    """Update persistent app settings. Only provided fields are changed."""
+    updates = {k: v for k, v in request.model_dump().items() if v is not None}
+    # If sam3 path changed, also update the road extraction module
+    if "sam3_local_dir" in updates:
+        set_sam3_local_dir(updates["sam3_local_dir"])
+    cfg = _save_config(updates)
+    return {**cfg, "configPath": _config_path()}
+
+
+# ─── Road extraction config ──────────────────────────────────────────────
+
+
+class SetSam3PathRequest(BaseModel):
+    path: str | None = None   # None → clear override, revert to auto-detection
+
+
+@app.post("/set-sam3-path")
+def set_sam3_path(request: SetSam3PathRequest) -> dict:
+    """Set (or clear) the local SAM3 directory. Clears cached model."""
+    set_sam3_local_dir(request.path)
+    return get_road_extract_config()
+
+
+@app.get("/road-extract-config")
+def road_extract_config() -> dict:
+    """Return current road-extraction backend configuration."""
+    return get_road_extract_config()
+
+
 # ─── Suggest tile size ───────────────────────────────────────────────────
 
 
@@ -803,6 +932,12 @@ def raster_info(request: RasterInfoRequest) -> dict:
         import rasterio
         from rasterio.warp import transform_bounds
 
+        p = Path(request.filePath)
+        if not p.exists():
+            return JSONResponse(status_code=400, content={"error": f"File not found: {request.filePath}"})
+        if p.is_dir():
+            return JSONResponse(status_code=400, content={"error": f"Path is a directory, not a file: {request.filePath}"})
+
         with rasterio.open(request.filePath) as ds:
             src_crs = ds.crs
             bounds = ds.bounds
@@ -849,6 +984,8 @@ def _render_raster_as_image(file_path: str, max_dim: int = 1536):
     p = Path(file_path)
     if not p.exists():
         return None, None, f"File not found: {file_path}"
+    if p.is_dir():
+        return None, None, f"Path is a directory, not a file: {file_path}"
 
     MAX_DIM = max(256, min(max_dim, 4096))
     DST_CRS = CRS.from_epsg(4326)
@@ -992,3 +1129,16 @@ def raster_as_png(file_path: str, max_dim: int = 1536):
         import traceback
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# ─── Serve compiled frontend (for standalone exe deployment) ──────────────
+# When the Vite frontend is built (`npm run build` → web_app/dist/), FastAPI
+# serves it directly so no separate dev server is needed.
+# In development the Vite dev server handles the frontend instead.
+_STATIC_DIR = Path(__file__).parent.parent.parent / "web_app" / "dist"
+if _STATIC_DIR.is_dir():
+    app.mount("/assets", StaticFiles(directory=str(_STATIC_DIR / "assets")), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def spa_fallback(full_path: str):
+        return FileResponse(str(_STATIC_DIR / "index.html"))

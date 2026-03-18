@@ -1162,31 +1162,72 @@ def _auto_tile_size(height: int, width: int, max_pixels: int) -> int:
 def _sample_raster_for_training(
     raster_path: str,
     feature_flags: Dict[str, bool],
-    n_samples: int = MAX_TRAIN_PIXELS,
-    grid_steps: int = 8,
-    window_size: int = 512,
+    n_samples: int = 500_000,
+    grid_steps: int = 16,
+    window_size: int = 256,
+    n_random_extra: int = 64,
 ) -> np.ndarray:
-    """Return a pixel-feature matrix sampled uniformly across the raster.
+    """Return a pixel-feature matrix sampled broadly across the raster.
 
-    Spreads ``grid_steps x grid_steps`` windows over the full image extent
-    and concatenates their features.  Used when the raster is too large to
-    load into RAM for full-image feature extraction.
+    Uses a two-stage strategy to ensure good material coverage:
+
+    1. **Grid sampling** — ``grid_steps × grid_steps`` evenly-spaced windows.
+    2. **Random windows** — ``n_random_extra`` additional random positions.
+
+    Each window is spatially sub-sampled to ``pixels_per_window`` pixels
+    *before* feature extraction — so we never extract features for more than
+    ``n_samples`` pixels total.  This avoids the old bottleneck of extracting
+    83 M features and then discarding 99 % of them.
     """
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng()
+    n_windows = grid_steps * grid_steps + n_random_extra
+    pixels_per_window = max(32, n_samples // n_windows)
+
     parts: List[np.ndarray] = []
+
+    def _sample_window(tile_data: np.ndarray) -> np.ndarray:
+        """Extract features from a window, sub-sampling pixels first."""
+        n_bands, h, w = tile_data.shape
+        n_px = h * w
+        if n_px <= pixels_per_window:
+            return _extract_pixel_features(tile_data, feature_flags, verbose=False)
+        # Randomly pick pixel indices; reshape tile to (bands, n_px) for indexing
+        idx = rng.choice(n_px, pixels_per_window, replace=False)
+        flat = tile_data.reshape(n_bands, n_px)[:, idx]          # (bands, k)
+        sampled_tile = flat.reshape(n_bands, 1, pixels_per_window)  # fake 1×k tile
+        return _extract_pixel_features(sampled_tile, feature_flags, verbose=False)
+
     with rasterio.open(raster_path) as src:
         H, W = src.height, src.width
-        rows_pos = np.linspace(0, max(0, H - window_size), grid_steps, dtype=int)
-        cols_pos = np.linspace(0, max(0, W - window_size), grid_steps, dtype=int)
+        actual_win = min(window_size, H, W)
+
+        # --- Stage 1: uniform grid ---
+        rows_pos = np.linspace(0, max(0, H - actual_win), grid_steps, dtype=int)
+        cols_pos = np.linspace(0, max(0, W - actual_win), grid_steps, dtype=int)
         for r in rows_pos:
             for c in cols_pos:
-                win = Window(int(c), int(r), min(window_size, W - int(c)), min(window_size, H - int(r)))
-                tile_data = src.read(window=win)
-                parts.append(_extract_pixel_features(tile_data, feature_flags, verbose=False))
+                win = Window(int(c), int(r),
+                             min(actual_win, W - int(c)),
+                             min(actual_win, H - int(r)))
+                parts.append(_sample_window(src.read(window=win)))
+
+        # --- Stage 2: random extra windows ---
+        for _ in range(n_random_extra):
+            r = int(rng.integers(0, max(1, H - actual_win)))
+            c = int(rng.integers(0, max(1, W - actual_win)))
+            win = Window(c, r,
+                         min(actual_win, W - c),
+                         min(actual_win, H - r))
+            parts.append(_sample_window(src.read(window=win)))
+
     combined = np.concatenate(parts, axis=0)
-    if len(combined) > n_samples:
-        idx = rng.choice(len(combined), n_samples, replace=False)
-        combined = combined[idx]
+    n_total = len(combined)
+    print(f"  [SAMPLE] {n_total:,} px from {grid_steps}×{grid_steps} grid "
+          f"+ {n_random_extra} random windows (~{pixels_per_window} px/window)")
+    # Final trim to exact budget (may be slightly over due to small windows)
+    if n_total > n_samples:
+        combined = combined[rng.choice(n_total, n_samples, replace=False)]
+        print(f"  [SAMPLE] Trimmed to {n_samples:,} training pixels")
     return combined
 
 
@@ -3098,14 +3139,64 @@ def classify_and_export(
     # === Extract features ===
     _t0 = _time.perf_counter()
     _cb("Feature extraction", 0, 1)
-    print(f"\n[2/5] Extracting pixel-level features...")
-    if raster_data is not None:
-        pixel_features    = _extract_pixel_features(raster_data, feature_flags)
-        _full_features    = True
+    print(f"\n[2/5] Extracting pixel-level features...  [tile_mode={tile_mode}]")
+
+    # In tile mode, we only need a subsample for KMeans training — each tile
+    # worker will extract its own features later.  Attempting full-image feature
+    # extraction on a huge raster wastes RAM and can OOM even though the raster
+    # data itself fits.  So: always use sampled training when tile_mode is on.
+    if tile_mode:
+        # In tile mode each worker extracts features for its own small window,
+        # so we only need a lightweight sample for KMeans training — never the
+        # full-image feature matrix.  This avoids OOM on large rasters where
+        # the raw data fits in RAM but the feature array (n_pixels × n_features)
+        # does not.
+        print(f"  [TILE] Using sampled training (tile workers will extract per-tile features)")
+        # Free the full raster early — tile workers read from disk.
+        if raster_data is not None:
+            _freed_gb = raster_data.nbytes / 1e9
+            del raster_data
+            raster_data = None
+            gc.collect()
+            print(f"  [TILE] Freed {_freed_gb:.1f} GB raster array")
+        _n_samples = int(np.clip(height * width * 0.001, 100_000, 2_000_000))
+        print(f"  [TILE] Adaptive sample budget: {_n_samples:,} px "
+              f"(image {width}×{height} = {height*width/1e6:.1f} MP)")
+        pixel_features = _sample_raster_for_training(str(path), feature_flags, n_samples=_n_samples)
+        _full_features = False
+    elif raster_data is not None:
+        try:
+            pixel_features = _extract_pixel_features(raster_data, feature_flags)
+            _full_features = True
+        except MemoryError as mem_err:
+            print(f"\n  [AUTO] {mem_err}")
+            print(f"  [AUTO] Automatically switching to tile mode...")
+            _cb("Auto-switching to tile mode", 0, 1)
+            return classify_and_export(
+                raster_path=raster_path,
+                classes=classes,
+                smoothing=smoothing,
+                feature_flags=feature_flags,
+                output_path=output_path,
+                tile_mode=True,
+                tile_max_pixels=tile_max_pixels,
+                tile_overlap=tile_overlap,
+                tile_output_dir=tile_output_dir or output_path,
+                tile_workers=tile_workers,
+                detect_shadows=detect_shadows,
+                max_threads=max_threads,
+                pretrained_scaler=pretrained_scaler,
+                pretrained_kmeans=pretrained_kmeans,
+                pretrained_color_table=pretrained_color_table,
+                pretrained_mea_mapping=pretrained_mea_mapping,
+                progress_callback=progress_callback,
+                export_format=export_format,
+            )
     else:
         print(f"  Using spatially-distributed sample (raster too large for full load)")
-        pixel_features    = _sample_raster_for_training(str(path), feature_flags)
-        _full_features    = False
+        _n_samples = int(np.clip(height * width * 0.001, 100_000, 2_000_000))
+        pixel_features = _sample_raster_for_training(str(path), feature_flags, n_samples=_n_samples)
+        _full_features = False
     print(f"  Feature vector shape: {pixel_features.shape}")
     _cb("Feature extraction", 1, 1)
     _ce_stages.append(("Feature extraction", _time.perf_counter() - _t0))
@@ -3279,6 +3370,8 @@ def classify_and_export(
             job_iter = iter(enumerate(jobs))
             _done_count = 0
 
+            _failed_tiles: List[str] = []
+
             def _drain_one():
                 """Wait for one future to complete, collect its result."""
                 nonlocal _done_count
@@ -3287,14 +3380,23 @@ def classify_and_export(
                     done_set.add(f)
                     break
                 for f in done_set:
-                    _res = f.result()
-                    tile_outputs.append(_res[0])
-                    _tile_txs_infos.append(_res)
-                    del pending[f]
+                    tile_idx = pending.pop(f)
                     _done_count += 1
+                    try:
+                        _res = f.result()
+                        tile_outputs.append(_res[0])
+                        _tile_txs_infos.append(_res)
+                    except Exception as _tile_err:
+                        import traceback as _tb
+                        _tname = jobs[tile_idx][-2] if len(jobs[tile_idx]) > 1 else f"tile_{tile_idx}"
+                        print(f"\n  [ERROR] Tile {_tname} failed — skipping and continuing:")
+                        print(f"          {type(_tile_err).__name__}: {_tile_err}")
+                        _tb.print_exc()
+                        _failed_tiles.append(_tname)
                     _cb("Classifying tiles", _done_count, _n_jobs)
                     if _done_count % max(1, _n_jobs // 10) == 0 or _done_count == _n_jobs:
-                        print(f"    tiles: {_done_count}/{_n_jobs} done")
+                        print(f"    tiles: {_done_count}/{_n_jobs} done"
+                              + (f" ({len(_failed_tiles)} failed)" if _failed_tiles else ""))
 
             for idx, job in job_iter:
                 # If we already have max_workers in flight, wait for one
@@ -3310,7 +3412,11 @@ def classify_and_export(
             while pending:
                 _drain_one()
 
-        print(f"  [OK] Wrote {len(tile_outputs)} tiles to {output_dir}")
+        if _failed_tiles:
+            print(f"\n  [WARN] {len(_failed_tiles)}/{_n_jobs} tiles failed:")
+            for _fn in _failed_tiles:
+                print(f"    - {_fn}")
+        print(f"  [OK] Wrote {len(tile_outputs)}/{_n_jobs} tiles to {output_dir}")
 
         # Write all_imgs.txs for the complete tile set.
         if _tile_txs_infos:
@@ -4065,6 +4171,7 @@ def rasterize_vectors_onto_classification(
 
         tile_outputs: List[str] = []
         _rv_txs_infos: List[Tuple] = []
+        _rv_failed: List[str] = []
         _n_rast_jobs = len(jobs)
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             pending_r: dict = {}
@@ -4072,17 +4179,39 @@ def rasterize_vectors_onto_classification(
                 # Throttle: keep at most max_workers futures in flight
                 while len(pending_r) >= max_workers:
                     for f in as_completed(pending_r, timeout=None):
-                        _rv_res = f.result()
-                        tile_outputs.append(_rv_res[0])
-                        _rv_txs_infos.append(_rv_res)
-                        del pending_r[f]
+                        _ridx = pending_r.pop(f)
+                        try:
+                            _rv_res = f.result()
+                            tile_outputs.append(_rv_res[0])
+                            _rv_txs_infos.append(_rv_res)
+                        except Exception as _rv_err:
+                            import traceback as _tb
+                            _rtname = jobs[_ridx][-1] if len(jobs[_ridx]) > 1 else f"tile_{_ridx}"
+                            print(f"\n  [ERROR] Rasterize tile {_rtname} failed — skipping:")
+                            print(f"          {type(_rv_err).__name__}: {_rv_err}")
+                            _tb.print_exc()
+                            _rv_failed.append(_rtname)
                         break
                 pending_r[executor.submit(_rasterize_tile_worker, job)] = idx_r
             # Drain remaining
             for f in as_completed(pending_r):
-                _rv_res = f.result()
-                tile_outputs.append(_rv_res[0])
-                _rv_txs_infos.append(_rv_res)
+                _ridx = pending_r[f]
+                try:
+                    _rv_res = f.result()
+                    tile_outputs.append(_rv_res[0])
+                    _rv_txs_infos.append(_rv_res)
+                except Exception as _rv_err:
+                    import traceback as _tb
+                    _rtname = jobs[_ridx][-1] if len(jobs[_ridx]) > 1 else f"tile_{_ridx}"
+                    print(f"\n  [ERROR] Rasterize tile {_rtname} failed — skipping:")
+                    print(f"          {type(_rv_err).__name__}: {_rv_err}")
+                    _tb.print_exc()
+                    _rv_failed.append(_rtname)
+
+        if _rv_failed:
+            print(f"\n  [WARN] {len(_rv_failed)}/{_n_rast_jobs} rasterize tiles failed:")
+            for _fn in _rv_failed:
+                print(f"    - {_fn}")
 
         # Write all_imgs.txs for the complete vector-rasterized tile set.
         if _rv_txs_infos:
@@ -4539,7 +4668,7 @@ def _extract_pixel_features(
         raise MemoryError(
             f"Image too large for non-tiled processing: feature array would need "
             f"{_feat_bytes / 1e9:.1f} GB but only {_avail / 1e9:.1f} GB is available. "
-            f"Please enable Tile Mode in the settings to process this image in chunks."
+            f"Auto-switching to tile mode."
         )
     features = np.empty((n_pixels, n_features), dtype=np.float32)
     for col_idx, col_data in enumerate(feature_list):
