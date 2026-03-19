@@ -40,6 +40,9 @@ export default function ActionsSection() {
   const [fieldsMasks, setFieldsMasks] = useState<ExtractFeaturesResult | null>(null);
   const [roadConfig, setRoadConfig] = useState<RoadExtractConfig | null>(null);
   const [sam3PathInput, setSam3PathInput] = useState("");
+  // All classification output paths from the last run (one per input image / tile-dir).
+  // Merges iterate over these so every classification file gets its features applied.
+  const [classificationPaths, setClassificationPaths] = useState<string[]>([]);
 
   const handleCancel = useCallback(async () => {
     const tid = activeTaskIdRef.current;
@@ -150,6 +153,8 @@ export default function ActionsSection() {
       // Always add whatever output paths we got (even on partial failure)
       if (paths.length > 0) {
         dispatch({ type: "SET_LAST_RESULT_PATH", path: paths[paths.length - 1] });
+        // Track all per-image classification paths so merges apply to every file.
+        setClassificationPaths(paths);
         addResultsToGroup(label, paths);
       }
     },
@@ -575,10 +580,15 @@ export default function ActionsSection() {
     label: string,
   ) => {
     if (!masks?.maskPaths?.length) return alert(`Run 'Extract ${label}' first.`);
-    if (!state.lastResultPath) return alert("Run classification first to produce an output.");
+    // Use tracked classification paths; fall back to lastResultPath for legacy compat.
+    const clsPaths = classificationPaths.length > 0
+      ? classificationPaths
+      : state.lastResultPath ? [state.lastResultPath] : [];
+    if (!clsPaths.length) return alert("Run classification first to produce an output.");
+
     runStartRef.current = Date.now();
     dispatch({ type: "SET_RUNNING", step: "step2" });
-    dispatch({ type: "SET_STATUS", text: `Merging ${label} masks…` });
+    dispatch({ type: "SET_STATUS", text: `Merging ${label} into ${clsPaths.length} classification file(s)…` });
     dispatch({ type: "SET_PROGRESS", progress: null });
     const taskId = generateTaskId();
     activeTaskIdRef.current = taskId;
@@ -586,23 +596,44 @@ export default function ActionsSection() {
       dispatch({ type: "SET_PROGRESS", progress: evt });
     });
     try {
-      const result = await mergeFeatureMasks({
-        classificationPath: state.lastResultPath,
-        maskPaths: masks.maskPaths,
-        colors: masks.colors!,
-        outputPath: state.outputPath || undefined,
-        taskId,
-      });
+      const newClsPaths: string[] = [];
+      const allDisplayPaths: string[] = [];
+
+      for (let i = 0; i < clsPaths.length; i++) {
+        const clsPath = clsPaths[i];
+        if (clsPaths.length > 1) {
+          dispatch({ type: "SET_STATUS", text: `Merging ${label} (${i + 1}/${clsPaths.length})…` });
+        }
+        const result = await mergeFeatureMasks({
+          classificationPath: clsPath,
+          maskPaths: masks.maskPaths,
+          colors: masks.colors!,
+          outputPath: state.outputPath || undefined,
+          taskId,
+        });
+        if ((result as any).status === "cancelled") {
+          dispatch({ type: "SET_STATUS", text: `${label} merge cancelled` });
+          return;
+        }
+        if (result.status === "ok" && result.outputPath) {
+          // Keep the output path (file or dir) for chaining into the next merge
+          newClsPaths.push(result.outputPath);
+          const tileOutputs = (result as any).tileOutputs as string[] | undefined;
+          allDisplayPaths.push(...(tileOutputs?.length ? tileOutputs : [result.outputPath]));
+        } else {
+          console.warn(`${label} merge failed for ${clsPath}: ${(result as any).message}`);
+        }
+      }
+
       const elapsed = formatElapsed(Date.now() - runStartRef.current);
-      if ((result as any).status === "cancelled") {
-        dispatch({ type: "SET_STATUS", text: `${label} merge cancelled` });
-      } else if (result.status === "ok" && result.outputPath) {
-        dispatch({ type: "SET_LAST_RESULT_PATH", path: result.outputPath });
+      if (allDisplayPaths.length > 0) {
+        // Update classification paths to the merged outputs for chaining
+        setClassificationPaths(newClsPaths);
+        dispatch({ type: "SET_LAST_RESULT_PATH", path: newClsPaths[newClsPaths.length - 1] });
         dispatch({ type: "SET_STATUS", text: `${label} merged (${elapsed})` });
-        const tileOutputs = (result as any).tileOutputs as string[] | undefined;
-        addResultsToGroup(`Classification + ${label}`, tileOutputs?.length ? tileOutputs : [result.outputPath]);
+        addResultsToGroup(`Classification + ${label}`, allDisplayPaths);
       } else {
-        dispatch({ type: "SET_STATUS", text: `${label} merge failed: ${(result as any).message ?? "Unknown"}` });
+        dispatch({ type: "SET_STATUS", text: `${label} merge failed for all files` });
       }
     } catch (e: any) {
       dispatch({ type: "SET_STATUS", text: `${label} merge error: ${e.message}` });
@@ -615,29 +646,22 @@ export default function ActionsSection() {
   };
 
   const handleMergeAll = async () => {
-    if (!state.lastResultPath) return alert("Run classification first.");
+    const clsPaths = classificationPaths.length > 0
+      ? classificationPaths
+      : state.lastResultPath ? [state.lastResultPath] : [];
+    if (!clsPaths.length) return alert("Run classification first.");
+
     const allMaskPaths: string[] = [];
     const allColors: [number, number, number][] = [];
-    if (roadMasks?.maskPaths) {
-      allMaskPaths.push(...roadMasks.maskPaths);
-      allColors.push(...roadMasks.colors!);
-    }
-    if (buildingMasks?.maskPaths) {
-      allMaskPaths.push(...buildingMasks.maskPaths);
-      allColors.push(...buildingMasks.colors!);
-    }
-    if (treeMasks?.maskPaths) {
-      allMaskPaths.push(...treeMasks.maskPaths);
-      allColors.push(...treeMasks.colors!);
-    }
-    if (fieldsMasks?.maskPaths) {
-      allMaskPaths.push(...fieldsMasks.maskPaths);
-      allColors.push(...fieldsMasks.colors!);
-    }
+    if (roadMasks?.maskPaths) { allMaskPaths.push(...roadMasks.maskPaths); allColors.push(...roadMasks.colors!); }
+    if (buildingMasks?.maskPaths) { allMaskPaths.push(...buildingMasks.maskPaths); allColors.push(...buildingMasks.colors!); }
+    if (treeMasks?.maskPaths) { allMaskPaths.push(...treeMasks.maskPaths); allColors.push(...treeMasks.colors!); }
+    if (fieldsMasks?.maskPaths) { allMaskPaths.push(...fieldsMasks.maskPaths); allColors.push(...fieldsMasks.colors!); }
     if (!allMaskPaths.length) return alert("Extract at least one feature first.");
+
     runStartRef.current = Date.now();
     dispatch({ type: "SET_RUNNING", step: "step2" });
-    dispatch({ type: "SET_STATUS", text: "Merging all feature masks…" });
+    dispatch({ type: "SET_STATUS", text: `Merging all features into ${clsPaths.length} classification file(s)…` });
     dispatch({ type: "SET_PROGRESS", progress: null });
     const taskId = generateTaskId();
     activeTaskIdRef.current = taskId;
@@ -645,23 +669,42 @@ export default function ActionsSection() {
       dispatch({ type: "SET_PROGRESS", progress: evt });
     });
     try {
-      const result = await mergeFeatureMasks({
-        classificationPath: state.lastResultPath,
-        maskPaths: allMaskPaths,
-        colors: allColors,
-        outputPath: state.outputPath || undefined,
-        taskId,
-      });
+      const newClsPaths: string[] = [];
+      const allDisplayPaths: string[] = [];
+
+      for (let i = 0; i < clsPaths.length; i++) {
+        const clsPath = clsPaths[i];
+        if (clsPaths.length > 1) {
+          dispatch({ type: "SET_STATUS", text: `Merging all features (${i + 1}/${clsPaths.length})…` });
+        }
+        const result = await mergeFeatureMasks({
+          classificationPath: clsPath,
+          maskPaths: allMaskPaths,
+          colors: allColors,
+          outputPath: state.outputPath || undefined,
+          taskId,
+        });
+        if ((result as any).status === "cancelled") {
+          dispatch({ type: "SET_STATUS", text: "Merge all cancelled" });
+          return;
+        }
+        if (result.status === "ok" && result.outputPath) {
+          newClsPaths.push(result.outputPath);
+          const tileOutputs = (result as any).tileOutputs as string[] | undefined;
+          allDisplayPaths.push(...(tileOutputs?.length ? tileOutputs : [result.outputPath]));
+        } else {
+          console.warn(`Merge all failed for ${clsPath}: ${(result as any).message}`);
+        }
+      }
+
       const elapsed = formatElapsed(Date.now() - runStartRef.current);
-      if ((result as any).status === "cancelled") {
-        dispatch({ type: "SET_STATUS", text: "Merge all cancelled" });
-      } else if (result.status === "ok" && result.outputPath) {
-        dispatch({ type: "SET_LAST_RESULT_PATH", path: result.outputPath });
+      if (allDisplayPaths.length > 0) {
+        setClassificationPaths(newClsPaths);
+        dispatch({ type: "SET_LAST_RESULT_PATH", path: newClsPaths[newClsPaths.length - 1] });
         dispatch({ type: "SET_STATUS", text: `All features merged (${elapsed})` });
-        const tileOutputs = (result as any).tileOutputs as string[] | undefined;
-        addResultsToGroup("Classification + All Features", tileOutputs?.length ? tileOutputs : [result.outputPath]);
+        addResultsToGroup("Classification + All Features", allDisplayPaths);
       } else {
-        dispatch({ type: "SET_STATUS", text: `Merge all failed: ${(result as any).message ?? "Unknown"}` });
+        dispatch({ type: "SET_STATUS", text: `Merge all failed for all files` });
       }
     } catch (e: any) {
       dispatch({ type: "SET_STATUS", text: `Merge all error: ${e.message}` });
@@ -677,20 +720,21 @@ export default function ActionsSection() {
     const elapsed = formatElapsed(Date.now() - runStartRef.current);
     if (result.status === "ok") {
       const path = result.outputPath || result.saved?.[0] || "";
-      const classifiedPath: string = result.classifiedPath || "";
       dispatch({ type: "SET_STATUS", text: `${label} complete ✓ (${elapsed})` });
       if (path) {
         dispatch({ type: "SET_LAST_RESULT_PATH", path });
 
         const tileOutputs: string[] | undefined = result.tileOutputs;
         const outputPaths: string[] = [];
-        // When vectors were used, only show the with_vectors output (path),
-        // not the classified output. When no vectors, path == classifiedPath.
         if (tileOutputs && tileOutputs.length > 0) {
           outputPaths.push(...tileOutputs);
         } else {
           outputPaths.push(path);
         }
+        // Track classification paths for subsequent merges.
+        // Use `path` (directory for tile mode, file for single mode) so the
+        // merge backend receives the right input for geographic alignment.
+        setClassificationPaths([path]);
         addResultsToGroup(label, outputPaths);
       }
     } else {
@@ -747,7 +791,7 @@ export default function ActionsSection() {
           <ActionBtn
             label="Merge Roads"
             onClick={handleMergeRoadMask}
-            disabled={isRunning || !roadMasks?.maskPaths?.length || !state.lastResultPath}
+            disabled={isRunning || !roadMasks?.maskPaths?.length || (classificationPaths.length === 0 && !state.lastResultPath)}
             color="amber"
           />
         </div>
@@ -763,7 +807,7 @@ export default function ActionsSection() {
           <ActionBtn
             label="Merge Buildings"
             onClick={() => handleMergeFeature(buildingMasks, "Buildings")}
-            disabled={isRunning || !buildingMasks || !state.lastResultPath}
+            disabled={isRunning || !buildingMasks || (classificationPaths.length === 0 && !state.lastResultPath)}
             color="amber"
           />
         </div>
@@ -779,7 +823,7 @@ export default function ActionsSection() {
           <ActionBtn
             label="Merge Trees"
             onClick={() => handleMergeFeature(treeMasks, "Trees")}
-            disabled={isRunning || !treeMasks || !state.lastResultPath}
+            disabled={isRunning || !treeMasks || (classificationPaths.length === 0 && !state.lastResultPath)}
             color="amber"
           />
         </div>
@@ -795,7 +839,7 @@ export default function ActionsSection() {
           <ActionBtn
             label="Merge Fields"
             onClick={() => handleMergeFeature(fieldsMasks, "Fields")}
-            disabled={isRunning || !fieldsMasks || !state.lastResultPath}
+            disabled={isRunning || !fieldsMasks || (classificationPaths.length === 0 && !state.lastResultPath)}
             color="amber"
           />
         </div>
@@ -804,7 +848,7 @@ export default function ActionsSection() {
         <ActionBtn
           label="Merge All Features"
           onClick={handleMergeAll}
-          disabled={isRunning || (!roadMasks && !buildingMasks && !treeMasks && !fieldsMasks) || !state.lastResultPath}
+          disabled={isRunning || (!roadMasks && !buildingMasks && !treeMasks && !fieldsMasks) || (classificationPaths.length === 0 && !state.lastResultPath)}
           color="orange"
           full
         />
