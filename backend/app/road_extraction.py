@@ -484,7 +484,7 @@ def extract_roads(
 
                     # --- Run SAM text-prompted segmentation ---
                     try:
-                        mask_tile = _segment_tile(sam, sam_type, tile_rgb, text_prompt)
+                        mask_tile = _segment_tile(sam, sam_type, tile_rgb, text_prompt, threshold=0.08)
                     except Exception as tile_err:
                         print(f"[RoadExtract] Tile {idx+1}/{total_tiles} failed: {tile_err}")
                         mask_tile = np.zeros(tile_rgb.shape[:2], dtype=np.uint8)
@@ -522,11 +522,17 @@ def extract_roads(
     return {"status": "ok", "outputPath": output_path}
 
 
-def _segment_tile(sam, sam_type: str, tile_rgb: np.ndarray, text_prompt: str) -> np.ndarray:
+def _segment_tile(
+    sam,
+    sam_type: str,
+    tile_rgb: np.ndarray,
+    text_prompt: str,
+    threshold: float = 0.08,
+) -> np.ndarray:
     """Run text-prompted segmentation on a single tile.
 
     Supports sam3_local, sam3, langsam, and owlv2sam2.
-    Returns a binary mask (H, W) with 1 = road, 0 = background.
+    Returns a binary mask (H, W) with 1 = feature, 0 = background.
     """
     h, w = tile_rgb.shape[:2]
 
@@ -534,7 +540,7 @@ def _segment_tile(sam, sam_type: str, tile_rgb: np.ndarray, text_prompt: str) ->
         return _segment_tile_sam3_local(sam, tile_rgb, text_prompt)
 
     if sam_type == "owlv2sam2":
-        return _segment_tile_owlv2(sam, tile_rgb, text_prompt)
+        return _segment_tile_owlv2(sam, tile_rgb, text_prompt, threshold=threshold)
 
     # samgeo-based backends need file I/O
     tmp_input = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
@@ -621,7 +627,12 @@ def _segment_tile_sam3_local(sam_bundle: dict, tile_rgb: np.ndarray, text_prompt
     return combined
 
 
-def _segment_tile_owlv2(sam_bundle: dict, tile_rgb: np.ndarray, text_prompt: str) -> np.ndarray:
+def _segment_tile_owlv2(
+    sam_bundle: dict,
+    tile_rgb: np.ndarray,
+    text_prompt: str,
+    threshold: float = 0.08,
+) -> np.ndarray:
     """Segment tile using OWLv2 (detection) + SAM2 (masks) via HuggingFace.
 
     Uses Sam2Processor + Sam2Model with input_boxes for prompted segmentation
@@ -641,9 +652,9 @@ def _segment_tile_owlv2(sam_bundle: dict, tile_rgb: np.ndarray, text_prompt: str
 
     # OWLv2: detect boxes matching the text prompt
     # Split by commas to keep multi-word labels intact
-    # e.g. "road, highway, asphalt path" → ["road", "highway", "asphalt path"]
+    # e.g. "road, street, highway" → ["road", "street", "highway"]
     labels = [p.strip() for p in text_prompt.split(",") if p.strip()]
-    raw_detections = detector(pil_image, candidate_labels=labels, threshold=0.05)
+    raw_detections = detector(pil_image, candidate_labels=labels, threshold=threshold)
 
     # Pipeline may return [[{...}]] (batched) or [{...}] (single image)
     if raw_detections and isinstance(raw_detections[0], list):
@@ -934,18 +945,25 @@ def merge_road_mask_onto_classification(
 # ---------------------------------------------------------------------------
 
 FEATURE_CONFIGS: Dict[str, List[Dict]] = {
+    # threshold: OWLv2 detection confidence threshold (higher = fewer false positives)
     "roads": [
         {
-            "prompt": "road, highway, asphalt path, paved road",
+            # From aerial view roads are dark linear strips — avoid "path/concrete"
+            # which overlap with building vocabulary
+            "prompt": "road, street, highway, road surface, asphalt road",
             "suffix": "roads",
             "color": (45, 45, 48),       # BM_ASPHALT #2D2D30
+            "threshold": 0.08,
         },
     ],
     "buildings": [
         {
-            "prompt": "building, structure, rooftop, house, concrete building",
+            # From aerial view you see ROOFTOPS — be explicit about that
+            # Avoid "structure/concrete" which overlap with road vocabulary
+            "prompt": "rooftop, building roof, house roof, flat roof, roof top",
             "suffix": "buildings",
             "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
+            "threshold": 0.08,
         },
     ],
     # Vegetation is split into two separate feature types:
@@ -956,6 +974,7 @@ FEATURE_CONFIGS: Dict[str, List[Dict]] = {
             "prompt": "trees, forest, forest canopy, woodland, treetops, tree canopy",
             "suffix": "trees",
             "color": (34, 139, 34),       # BM_VEGETATION #228B22
+            "threshold": 0.07,
         },
     ],
     "fields": [
@@ -963,16 +982,19 @@ FEATURE_CONFIGS: Dict[str, List[Dict]] = {
             "prompt": "dense foliage, thick shrubs, bush, undergrowth, dense bushes",
             "suffix": "fields_foliage",
             "color": (0, 100, 0),         # BM_FOLIAGE #006400
+            "threshold": 0.06,
         },
         {
             "prompt": "dry grass, brown grass, dead grass, arid land, straw, dry field",
             "suffix": "fields_dry_grass",
             "color": (189, 183, 107),     # BM_LAND_DRY_GRASS #BDB76B
+            "threshold": 0.06,
         },
         {
             "prompt": "grass, lawn, green grass, green field, meadow, turf",
             "suffix": "fields_grass",
             "color": (124, 252, 0),       # BM_LAND_GRASS #7CFC00
+            "threshold": 0.06,
         },
     ],
 }
@@ -1109,6 +1131,7 @@ def extract_feature_masks(
         suffix = cfg["suffix"]
         color = cfg["color"]
         prompt = cfg["prompt"]
+        thresh = cfg.get("threshold", 0.08)
 
         if output_path is None:
             out = str(inp.with_name(f"{inp.stem}_{suffix}.tif"))
@@ -1133,6 +1156,7 @@ def extract_feature_masks(
             tile_size=tile_size,
             overlap_pct=overlap_pct,
             closing_kernel_size=closing_kernel_size,
+            threshold=thresh,
             progress_callback=_cb,
         )
         if result.get("status") == "ok":
@@ -1159,6 +1183,7 @@ def _run_single_extraction(
     tile_size: int = 1024,
     overlap_pct: float = 0.1,
     closing_kernel_size: int = 15,
+    threshold: float = 0.08,
     progress_callback: Optional[Callable] = None,
 ) -> Dict[str, object]:
     """Run a single SAM text-prompted mask extraction (reuses an already-loaded model)."""
@@ -1183,7 +1208,7 @@ def _run_single_extraction(
                     tile_data = src.read(list(range(1, bands_to_read + 1)), window=read_win)
                     tile_rgb = np.moveaxis(tile_data[:3], 0, -1).astype(np.uint8)
                     try:
-                        mask_tile = _segment_tile(sam, sam_type, tile_rgb, text_prompt)
+                        mask_tile = _segment_tile(sam, sam_type, tile_rgb, text_prompt, threshold=threshold)
                     except Exception as tile_err:
                         print(f"[Extract] Tile {idx+1}/{total_tiles} failed: {tile_err}")
                         mask_tile = np.zeros(tile_rgb.shape[:2], dtype=np.uint8)
