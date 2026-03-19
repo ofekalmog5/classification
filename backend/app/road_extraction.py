@@ -948,13 +948,19 @@ FEATURE_CONFIGS: Dict[str, List[Dict]] = {
     # threshold: OWLv2 detection confidence threshold (higher = fewer false positives)
     "roads": [
         {
-            # From aerial view roads are dark linear strips — avoid "path/concrete"
-            # which overlap with building vocabulary
-            "prompt": "road, street, highway, road surface, asphalt road",
-            "suffix": "roads",
+            # Paved / asphalt roads — dark gray, urban/suburban, highway
+            "prompt": "highway, asphalt road, paved road, urban road, motorway, tarmac road, paved street, road surface",
+            "suffix": "roads_asphalt",
             "color": (45, 45, 48),       # BM_ASPHALT #2D2D30
             "threshold": 0.08,
-            # Extend road mask at image borders so roads connect across adjacent orthophotos
+            "border_extend": 60,
+        },
+        {
+            # Dirt / unpaved roads — brownish-gray, rural tracks, farm roads
+            "prompt": "dirt road, unpaved road, gravel road, rural track, farm track, compacted earth road, sandy path",
+            "suffix": "roads_dirt",
+            "color": (130, 123, 115),    # BM_ROCK #827B73
+            "threshold": 0.07,
             "border_extend": 60,
         },
     ],
@@ -1265,6 +1271,7 @@ def extract_feature_masks(
             closing_kernel_size=closing_kernel_size,
             threshold=thresh,
             extend_borders_px=border_ext,
+            color=color,
             progress_callback=_cb,
         )
         if result.get("status") == "ok":
@@ -1333,6 +1340,34 @@ def _extend_at_borders(mask_path: str, border_px: int = 60, kernel_px: int = 20)
             pass
 
 
+def _colorize_mask(mask_path: str, color: Tuple[int, int, int]) -> None:
+    """Convert a 1-band binary mask GeoTIFF to a 3-band RGB GeoTIFF in-place.
+
+    Feature pixels (value > 0) are painted with *color*; background stays (0,0,0).
+    This makes the mask file directly viewable with the correct material color.
+    """
+    tmp = mask_path + "._rgb_tmp.tif"
+    try:
+        with rasterio.open(mask_path) as src:
+            binary = src.read(1)
+            profile = src.profile.copy()
+        profile.update(count=3, dtype="uint8", nodata=None)
+        with rasterio.open(tmp, "w", **profile) as dst:
+            for band_idx, c in enumerate(color):
+                dst.write(
+                    np.where(binary > 0, np.uint8(c), np.uint8(0)),
+                    band_idx + 1,
+                )
+        import shutil as _shutil
+        _shutil.move(tmp, mask_path)
+    except Exception as e:
+        print(f"[colorize_mask] Failed to colorize {mask_path}: {e}")
+        try:
+            Path(tmp).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _run_single_extraction(
     input_path: str,
     output_path: str,
@@ -1344,6 +1379,7 @@ def _run_single_extraction(
     closing_kernel_size: int = 15,
     threshold: float = 0.08,
     extend_borders_px: int = 0,
+    color: Tuple[int, int, int] = (255, 255, 255),
     progress_callback: Optional[Callable] = None,
 ) -> Dict[str, object]:
     """Run a single SAM text-prompted mask extraction (reuses an already-loaded model)."""
@@ -1388,6 +1424,9 @@ def _run_single_extraction(
     # Extend road pixels at image borders so roads connect across adjacent images
     if extend_borders_px > 0:
         _extend_at_borders(output_path, border_px=extend_borders_px)
+
+    # Convert binary mask to RGB so the file shows the actual material color
+    _colorize_mask(output_path, color)
 
     if progress_callback:
         progress_callback("Done", total_tiles + 1, total_tiles + 1)
@@ -1472,6 +1511,13 @@ def merge_feature_masks_onto_classification(
     strip_h = 2048
     total_strips = math.ceil(height / strip_h)
 
+    def _read_feature_binary(mask_src, window) -> np.ndarray:
+        """Read a mask (1-band binary or 3-band RGB) and return a 2-D bool array."""
+        if mask_src.count >= 3:
+            bands = mask_src.read([1, 2, 3], window=window)
+            return bands.sum(axis=0) > 0
+        return mask_src.read(1, window=window) > 0
+
     # Pre-open all mask files
     mask_srcs = [rasterio.open(mp) for mp in mask_paths]
     try:
@@ -1494,19 +1540,24 @@ def merge_feature_masks_onto_classification(
 
                 for mask_src, color, same_grid in zip(mask_srcs, colors, same_grids):
                     if same_grid:
-                        mask_band = mask_src.read(1, window=cls_win)
+                        feature_pixels = _read_feature_binary(mask_src, cls_win)
                     else:
                         strip_transform = rasterio.windows.transform(cls_win, cls_transform)
                         strip_bounds = rasterio.transform.array_bounds(h, width, strip_transform)
                         try:
                             mask_win = window_from_bounds(*strip_bounds, transform=mask_src.transform)
                             mask_win = mask_win.intersection(Window(0, 0, mask_src.width, mask_src.height))
-                            raw_mask = mask_src.read(1, window=mask_win)
-                            if raw_mask.shape != (h, width):
+                            # Collapse RGB or binary mask to a single binary band for reprojection
+                            if mask_src.count >= 3:
+                                raw_bands = mask_src.read([1, 2, 3], window=mask_win)
+                                raw_binary = (raw_bands.sum(axis=0) > 0).astype(np.uint8)
+                            else:
+                                raw_binary = mask_src.read(1, window=mask_win)
+                            if raw_binary.shape != (h, width):
                                 from rasterio.enums import Resampling
-                                mask_band = np.zeros((h, width), dtype=raw_mask.dtype)
+                                mask_band = np.zeros((h, width), dtype=np.uint8)
                                 rasterio.warp.reproject(
-                                    source=raw_mask,
+                                    source=raw_binary,
                                     destination=mask_band,
                                     src_transform=rasterio.windows.transform(mask_win, mask_src.transform),
                                     src_crs=mask_src.crs,
@@ -1514,12 +1565,12 @@ def merge_feature_masks_onto_classification(
                                     dst_crs=cls_crs,
                                     resampling=Resampling.nearest,
                                 )
+                                feature_pixels = mask_band > 0
                             else:
-                                mask_band = raw_mask
+                                feature_pixels = raw_binary > 0
                         except Exception:
-                            mask_band = np.zeros((h, width), dtype=np.uint8)
+                            feature_pixels = np.zeros((h, width), dtype=bool)
 
-                    feature_pixels = mask_band > 0
                     for band_idx in range(min(rgb.shape[0], 3)):
                         rgb[band_idx][feature_pixels] = color[band_idx]
 

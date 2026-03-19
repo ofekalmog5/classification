@@ -484,25 +484,22 @@ export default function ActionsSection() {
             text: `[${fi + 1}/${toExtract.length}] Extracting ${label}: ${fileName}…`,
           });
 
-          let result: any;
-          if (type === "roads") {
-            result = await extractRoads({ rasterPath: file, outputPath: state.outputPath || undefined, taskId });
-          } else {
-            result = await extractFeatures({ rasterPath: file, featureType: type, outputPath: state.outputPath || undefined, taskId });
-          }
+          const result = await extractFeatures({
+            rasterPath: file,
+            featureType: type,
+            outputPath: state.outputPath || undefined,
+            taskId,
+          });
 
           if (result.status === "cancelled") {
             dispatch({ type: "SET_STATUS", text: "Extraction cancelled" });
             return;
           }
-          if (result.status === "skipped") { skippedCount++; continue; }
+          if ((result as any).status === "skipped") { skippedCount++; continue; }
 
-          if (type === "roads" && result.status === "ok" && result.outputPath) {
-            allMaskPaths.push(result.outputPath);
-            allColors.push([45, 45, 48]);
-          } else if (result.status === "ok" && result.maskPaths?.length) {
+          if (result.status === "ok" && result.maskPaths?.length) {
             allMaskPaths.push(...result.maskPaths);
-            allColors.push(...result.colors);
+            allColors.push(...result.colors!);
           }
         }
 
@@ -551,8 +548,9 @@ export default function ActionsSection() {
       for (const file of rasterFiles) {
         const fileName = file.split(/[\\/]/).pop() || file;
         dispatch({ type: "SET_STATUS", text: `Extracting roads: ${fileName}…` });
-        const result = await extractRoads({
+        const result = await extractFeatures({
           rasterPath: file,
+          featureType: "roads",
           outputPath: state.outputPath || undefined,
           taskId,
         });
@@ -565,9 +563,9 @@ export default function ActionsSection() {
           console.log(`Roads skipped for ${fileName}: ${(result as any).message}`);
           continue;
         }
-        if (result.status === "ok" && result.outputPath) {
-          allMaskPaths.push(result.outputPath);
-          allColors.push([45, 45, 48]);
+        if (result.status === "ok" && result.maskPaths?.length) {
+          allMaskPaths.push(...result.maskPaths);
+          allColors.push(...result.colors!);
         } else {
           console.warn(`Roads failed for ${fileName}: ${(result as any).message}`);
         }
