@@ -956,14 +956,33 @@ FEATURE_CONFIGS: Dict[str, List[Dict]] = {
             "threshold": 0.08,
         },
     ],
+    # Buildings: split by roof type so each SAM run focuses on one roof appearance.
+    # All sub-types map to BM_CONCRETE. Orthophotos show rooftops, not walls —
+    # prompts are tuned for the top-down aerial perspective.
     "buildings": [
         {
-            # From aerial view you see ROOFTOPS — be explicit about that
-            # Avoid "structure/concrete" which overlap with road vocabulary
-            "prompt": "rooftop, building roof, house roof, flat roof, roof top",
-            "suffix": "buildings",
+            "prompt": "flat roof, concrete roof, gravel roof, white rooftop, commercial roof, flat rooftop",
+            "suffix": "bldg_flat",
             "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
-            "threshold": 0.08,
+            "threshold": 0.06,
+        },
+        {
+            "prompt": "tile roof, red roof, orange roof, terracotta roof, clay roof, tiled rooftop",
+            "suffix": "bldg_tile",
+            "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
+            "threshold": 0.06,
+        },
+        {
+            "prompt": "metal roof, corrugated roof, industrial roof, warehouse roof, sheet metal rooftop",
+            "suffix": "bldg_metal",
+            "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
+            "threshold": 0.06,
+        },
+        {
+            "prompt": "house roof, residential roof, shingle roof, dark roof, sloped rooftop",
+            "suffix": "bldg_house",
+            "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
+            "threshold": 0.06,
         },
     ],
     # Vegetation is split into two separate feature types:
@@ -1008,7 +1027,7 @@ def should_extract_feature(raster_path: str, feature_type: str) -> tuple:
 
     Thresholds (fraction of valid pixels matching the feature signature):
       roads     >5 %  gray, moderate brightness, R≈B (rejects sand)
-      buildings >4 %  low-sat, bright, R≈B
+      buildings >3 %  gray roof | red/tile roof (R>>B) | bright metal roof
       trees     >5 %  dark green (G dominates, low brightness)
       fields    >8 %  green or yellowish-green
     """
@@ -1050,11 +1069,17 @@ def should_extract_feature(raster_path: str, feature_type: str) -> tuple:
         return False, f"no roads detected (gray ratio={ratio:.1%}, threshold=5%)"
 
     elif feature_type == "buildings":
-        struct_like = (sat < 35) & (np.abs(r - b) < 25) & (brightness > 50)
+        # Gray/flat/concrete roofs: low saturation, any brightness
+        gray_roof = (sat < 40) & (brightness > 40) & (brightness < 240)
+        # Red/orange tile roofs: R clearly dominates (terracotta, clay — very common in orthophotos)
+        tile_roof = (r > g + 20) & (r > b + 35) & (brightness > 50) & (brightness < 230)
+        # Bright metal/industrial roofs: very bright, low saturation
+        metal_roof = (sat < 25) & (brightness > 160)
+        struct_like = gray_roof | tile_roof | metal_roof
         ratio = float(struct_like.sum()) / n_valid
-        if ratio > 0.04:
+        if ratio > 0.03:
             return True, f"structure pixel ratio={ratio:.1%}"
-        return False, f"no buildings detected (structure ratio={ratio:.1%}, threshold=4%)"
+        return False, f"no buildings detected (structure ratio={ratio:.1%}, threshold=3%)"
 
     elif feature_type == "trees":
         # Dark green — G clearly above R and B, not too bright (canopy shadow)
