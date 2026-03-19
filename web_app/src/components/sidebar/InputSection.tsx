@@ -43,12 +43,23 @@ export default function InputSection() {
           dispatch({ type: "SET_RASTER_PATH", path: result.files[0].path });
         }
 
+        // Ask user whether to render on the map when there are many files
+        const RENDER_WARN_THRESHOLD = 5;
+        let renderOnMap = true;
+        if (result.count > RENDER_WARN_THRESHOLD) {
+          renderOnMap = window.confirm(
+            `Found ${result.count} images in this folder.\n\n` +
+            `Rendering all of them on the map at once may be slow.\n\n` +
+            `Click OK to display them on the map, or Cancel to load them for processing only (you can show/hide layers later).`
+          );
+        }
+
         // Create a group for this folder
         const folderName = path.split(/[\\/]/).pop() || "Input Images";
         const groupId = `group-input-${Date.now()}`;
         dispatch({
           type: "ADD_LAYER_GROUP",
-          group: { id: groupId, name: folderName, visible: true, layerIds: [] },
+          group: { id: groupId, name: folderName, visible: renderOnMap, layerIds: [] },
         });
 
         const layerIds: string[] = [];
@@ -62,7 +73,7 @@ export default function InputSection() {
               name: file.relativePath,
               type: "raster-input",
               filePath: file.path,
-              visible: true,
+              visible: renderOnMap,
               opacity: 1,
             },
           });
