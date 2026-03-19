@@ -43,6 +43,10 @@ export default function ActionsSection() {
   // All classification output paths from the last run (one per input image / tile-dir).
   // Merges iterate over these so every classification file gets its features applied.
   const [classificationPaths, setClassificationPaths] = useState<string[]>([]);
+  // Which feature types to extract when running "Extract Selected Features"
+  const [extractSelected, setExtractSelected] = useState({
+    roads: true, buildings: true, trees: true, fields: true,
+  });
 
   const handleCancel = useCallback(async () => {
     const tid = activeTaskIdRef.current;
@@ -445,6 +449,86 @@ export default function ActionsSection() {
     dispatch({ type: "SET_RUNNING", step: "idle" });
   };
 
+  /** Run all selected feature extractions in one pass (shared running state / task). */
+  const handleExtractSelected = async () => {
+    const rasterFiles = getRasterFiles();
+    if (rasterFiles.length === 0 && state.rasterPath) rasterFiles.push(state.rasterPath);
+    if (rasterFiles.length === 0) return alert("Select a raster image first.");
+
+    const toExtract: Array<{ type: "roads" | "buildings" | "trees" | "fields"; label: string }> = [];
+    if (extractSelected.roads)     toExtract.push({ type: "roads",     label: "Roads" });
+    if (extractSelected.buildings) toExtract.push({ type: "buildings", label: "Buildings" });
+    if (extractSelected.trees)     toExtract.push({ type: "trees",     label: "Trees" });
+    if (extractSelected.fields)    toExtract.push({ type: "fields",    label: "Fields" });
+    if (toExtract.length === 0) return alert("Select at least one feature type.");
+
+    runStartRef.current = Date.now();
+    dispatch({ type: "SET_RUNNING", step: "step1" });
+    dispatch({ type: "SET_PROGRESS", progress: null });
+    const taskId = generateTaskId();
+    activeTaskIdRef.current = taskId;
+    const stopProgress = startProgressStream(taskId, (evt) => {
+      dispatch({ type: "SET_PROGRESS", progress: evt });
+    });
+    try {
+      for (let fi = 0; fi < toExtract.length; fi++) {
+        const { type, label } = toExtract[fi];
+        const allMaskPaths: string[] = [];
+        const allColors: [number, number, number][] = [];
+        let skippedCount = 0;
+
+        for (const file of rasterFiles) {
+          const fileName = file.split(/[\\/]/).pop() || file;
+          dispatch({
+            type: "SET_STATUS",
+            text: `[${fi + 1}/${toExtract.length}] Extracting ${label}: ${fileName}…`,
+          });
+
+          let result: any;
+          if (type === "roads") {
+            result = await extractRoads({ rasterPath: file, outputPath: state.outputPath || undefined, taskId });
+          } else {
+            result = await extractFeatures({ rasterPath: file, featureType: type, outputPath: state.outputPath || undefined, taskId });
+          }
+
+          if (result.status === "cancelled") {
+            dispatch({ type: "SET_STATUS", text: "Extraction cancelled" });
+            return;
+          }
+          if (result.status === "skipped") { skippedCount++; continue; }
+
+          if (type === "roads" && result.status === "ok" && result.outputPath) {
+            allMaskPaths.push(result.outputPath);
+            allColors.push([45, 45, 48]);
+          } else if (result.status === "ok" && result.maskPaths?.length) {
+            allMaskPaths.push(...result.maskPaths);
+            allColors.push(...result.colors);
+          }
+        }
+
+        if (allMaskPaths.length > 0) {
+          const combined: ExtractFeaturesResult = { status: "ok", maskPaths: allMaskPaths, colors: allColors };
+          if (type === "roads")     setRoadMasks(combined);
+          else if (type === "buildings") setBuildingMasks(combined);
+          else if (type === "trees")     setTreeMasks(combined);
+          else                           setFieldsMasks(combined);
+          const skippedMsg = skippedCount > 0 ? ` (${skippedCount} skipped)` : "";
+          addResultsToGroup(`${label} Masks`, allMaskPaths);
+          dispatch({ type: "SET_STATUS", text: `${label}: ${allMaskPaths.length} mask(s)${skippedMsg}` });
+        }
+      }
+      const elapsed = formatElapsed(Date.now() - runStartRef.current);
+      dispatch({ type: "SET_STATUS", text: `Feature extraction complete (${elapsed})` });
+    } catch (e: any) {
+      dispatch({ type: "SET_STATUS", text: `Extraction error: ${e.message}` });
+    } finally {
+      activeTaskIdRef.current = null;
+      stopProgress();
+      dispatch({ type: "SET_PROGRESS", progress: null });
+      dispatch({ type: "SET_RUNNING", step: "idle" });
+    }
+  };
+
   const handleExtractRoads = async () => {
     const rasterFiles = getRasterFiles();
     if (rasterFiles.length === 0) {
@@ -780,28 +864,41 @@ export default function ActionsSection() {
           SAM Feature Extraction
         </div>
 
-        {/* Roads */}
+        {/* Feature type selection */}
+        <div className="grid grid-cols-2 gap-x-3 gap-y-1 px-0.5">
+          {([
+            { key: "roads",     label: "Roads" },
+            { key: "buildings", label: "Buildings" },
+            { key: "trees",     label: "Trees" },
+            { key: "fields",    label: "Fields" },
+          ] as const).map(({ key, label }) => (
+            <label key={key} className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={extractSelected[key]}
+                onChange={(e) => setExtractSelected((prev) => ({ ...prev, [key]: e.target.checked }))}
+                className="accent-amber-500"
+                disabled={isRunning}
+              />
+              <span className={extractSelected[key] ? "text-surface-200" : "text-surface-500"}>{label}</span>
+            </label>
+          ))}
+        </div>
+        <ActionBtn
+          label="Extract Selected Features"
+          onClick={handleExtractSelected}
+          disabled={isRunning}
+          color="amber"
+          full
+        />
+
+        {/* Merge buttons */}
+        <div className="text-[10px] text-surface-500 px-0.5 pt-0.5">Merge into classification:</div>
         <div className="grid grid-cols-2 gap-1.5">
-          <ActionBtn
-            label="Extract Roads"
-            onClick={handleExtractRoads}
-            disabled={isRunning}
-            color="amber"
-          />
           <ActionBtn
             label="Merge Roads"
             onClick={handleMergeRoadMask}
             disabled={isRunning || !roadMasks?.maskPaths?.length || (classificationPaths.length === 0 && !state.lastResultPath)}
-            color="amber"
-          />
-        </div>
-
-        {/* Buildings */}
-        <div className="grid grid-cols-2 gap-1.5">
-          <ActionBtn
-            label="Extract Buildings"
-            onClick={() => handleExtractFeature("buildings", "Buildings")}
-            disabled={isRunning}
             color="amber"
           />
           <ActionBtn
@@ -810,30 +907,10 @@ export default function ActionsSection() {
             disabled={isRunning || !buildingMasks || (classificationPaths.length === 0 && !state.lastResultPath)}
             color="amber"
           />
-        </div>
-
-        {/* Trees */}
-        <div className="grid grid-cols-2 gap-1.5">
-          <ActionBtn
-            label="Extract Trees"
-            onClick={() => handleExtractFeature("trees", "Trees")}
-            disabled={isRunning}
-            color="amber"
-          />
           <ActionBtn
             label="Merge Trees"
             onClick={() => handleMergeFeature(treeMasks, "Trees")}
             disabled={isRunning || !treeMasks || (classificationPaths.length === 0 && !state.lastResultPath)}
-            color="amber"
-          />
-        </div>
-
-        {/* Fields */}
-        <div className="grid grid-cols-2 gap-1.5">
-          <ActionBtn
-            label="Extract Fields"
-            onClick={() => handleExtractFeature("fields", "Fields")}
-            disabled={isRunning}
             color="amber"
           />
           <ActionBtn
