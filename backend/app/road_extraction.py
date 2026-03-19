@@ -964,51 +964,31 @@ FEATURE_CONFIGS: Dict[str, List[Dict]] = {
             "border_extend": 60,
         },
     ],
-    # Buildings: one SAM run per roof-type group, all mapped to BM_CONCRETE.
-    # Orthophotos show rooftops from above — prompts target the aerial perspective.
-    # Six groups cover the full range of roof appearances in urban orthophotos.
+    # Buildings: 3 sub-types using simple terms OWLv2 was trained on.
+    # Specific material terms ("bitumen roof", "tiled rooftop") are rare in CLIP
+    # training data and get near-zero confidence from above. Broad common terms work
+    # much better. Threshold lowered to 0.04 — aerial roof detection is harder.
     "buildings": [
         {
-            # Flat commercial / industrial roofs — gray, gravel, bitumen
-            "prompt": "flat roof, concrete roof, gravel roof, bitumen roof, flat commercial rooftop",
-            "suffix": "bldg_flat",
+            # Houses, homes, general residential — most common OWLv2 vocabulary
+            "prompt": "house, building, rooftop, residential building, home",
+            "suffix": "bldg_residential",
             "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
-            "threshold": 0.06,
+            "threshold": 0.04,
         },
         {
-            # Clay / terracotta tile roofs — most common residential in Mediterranean orthophotos
-            "prompt": "tile roof, red roof, orange roof, terracotta roof, clay roof, tiled rooftop, ceramic roof",
-            "suffix": "bldg_tile",
+            # Warehouses, factories — large flat-roof industrial buildings
+            "prompt": "warehouse, factory, industrial building, commercial building, shed",
+            "suffix": "bldg_industrial",
             "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
-            "threshold": 0.06,
+            "threshold": 0.04,
         },
         {
-            # Metal / industrial — corrugated iron, sheet metal, factory and warehouse roofs
-            "prompt": "metal roof, corrugated roof, industrial roof, warehouse roof, tin roof, sheet metal rooftop",
-            "suffix": "bldg_metal",
+            # Visually distinctive roofs recognisable by color/texture
+            "prompt": "red roof, tile roof, orange roof, solar panels, greenhouse",
+            "suffix": "bldg_distinctive",
             "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
-            "threshold": 0.06,
-        },
-        {
-            # Dark residential — shingle, slate, dark tile, asphalt felt
-            "prompt": "shingle roof, slate roof, dark rooftop, black roof, dark residential roof, asphalt shingle roof",
-            "suffix": "bldg_dark",
-            "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
-            "threshold": 0.06,
-        },
-        {
-            # Light / white / reflective coated roofs
-            "prompt": "white roof, bright rooftop, reflective roof, white painted concrete roof, light colored roof",
-            "suffix": "bldg_white",
-            "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
-            "threshold": 0.06,
-        },
-        {
-            # Modern — solar panels, green / vegetated roofs
-            "prompt": "solar panel roof, green roof, rooftop garden, photovoltaic roof, solar array on roof",
-            "suffix": "bldg_solar",
-            "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
-            "threshold": 0.06,
+            "threshold": 0.04,
         },
     ],
     # Vegetation is split into two separate feature types:
@@ -1159,9 +1139,9 @@ def should_extract_feature(raster_path: str, feature_type: str) -> tuple:
         metal_roof = (sat < 25) & (brightness > 160)
         struct_like = gray_roof | tile_roof | metal_roof
         ratio = float(struct_like.sum()) / n_valid
-        if ratio > 0.03:
+        if ratio > 0.01:
             return True, f"structure pixel ratio={ratio:.1%}"
-        return False, f"no buildings detected (structure ratio={ratio:.1%}, threshold=3%)"
+        return False, f"no buildings detected (structure ratio={ratio:.1%}, threshold=1%)"
 
     elif feature_type == "trees":
         # Dark green — G clearly above R and B, not too bright (canopy shadow)
