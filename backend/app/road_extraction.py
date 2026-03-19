@@ -447,6 +447,13 @@ def extract_roads(
     tiles = _generate_tiles(width, height, tile_size, overlap)
     total_tiles = len(tiles)
 
+    # Quick RGB pre-filter
+    should_run, filter_reason = should_extract_feature(input_path, "roads")
+    print(f"[extract_roads] pre-filter for {Path(input_path).name}: "
+          f"{'RUN' if should_run else 'SKIP'} ({filter_reason})")
+    if not should_run:
+        return {"status": "skipped", "message": filter_reason}
+
     if progress_callback:
         progress_callback("Loading SAM 3 model", 0, total_tiles + 2)
 
@@ -929,7 +936,7 @@ def merge_road_mask_onto_classification(
 FEATURE_CONFIGS: Dict[str, List[Dict]] = {
     "roads": [
         {
-            "prompt": "road, highway, asphalt path",
+            "prompt": "road, highway, asphalt path, paved road",
             "suffix": "roads",
             "color": (45, 45, 48),       # BM_ASPHALT #2D2D30
         },
@@ -941,29 +948,112 @@ FEATURE_CONFIGS: Dict[str, List[Dict]] = {
             "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
         },
     ],
-    "vegetation": [
+    # Vegetation is split into two separate feature types:
+    # "trees"  — tree canopy / forest → BM_VEGETATION (dark green)
+    # "fields" — grass / dry grass / shrubs → BM_LAND_GRASS, BM_LAND_DRY_GRASS, BM_FOLIAGE
+    "trees": [
         {
-            "prompt": "trees, forest, forest canopy, dense foliage, woodland",
-            "suffix": "veg_foliage",
-            "color": (0, 100, 0),         # BM_FOLIAGE #006400
-        },
-        {
-            "prompt": "dry grass, brown grass, arid land, dead grass, straw",
-            "suffix": "veg_dry_grass",
-            "color": (189, 183, 107),     # BM_LAND_DRY_GRASS #BDB76B
-        },
-        {
-            "prompt": "grass, lawn, green grass, green field, turf",
-            "suffix": "veg_grass",
-            "color": (124, 252, 0),       # BM_LAND_GRASS #7CFC00
-        },
-        {
-            "prompt": "vegetation, shrubs, bushes, plants, undergrowth",
-            "suffix": "veg_vegetation",
+            "prompt": "trees, forest, forest canopy, woodland, treetops, tree canopy",
+            "suffix": "trees",
             "color": (34, 139, 34),       # BM_VEGETATION #228B22
         },
     ],
+    "fields": [
+        {
+            "prompt": "dense foliage, thick shrubs, bush, undergrowth, dense bushes",
+            "suffix": "fields_foliage",
+            "color": (0, 100, 0),         # BM_FOLIAGE #006400
+        },
+        {
+            "prompt": "dry grass, brown grass, dead grass, arid land, straw, dry field",
+            "suffix": "fields_dry_grass",
+            "color": (189, 183, 107),     # BM_LAND_DRY_GRASS #BDB76B
+        },
+        {
+            "prompt": "grass, lawn, green grass, green field, meadow, turf",
+            "suffix": "fields_grass",
+            "color": (124, 252, 0),       # BM_LAND_GRASS #7CFC00
+        },
+    ],
 }
+
+
+def should_extract_feature(raster_path: str, feature_type: str) -> tuple:
+    """Quick RGB analysis to decide whether to run SAM extraction on this image.
+
+    Reads a small thumbnail (≤256×256 overview) — fast even on huge rasters.
+    Returns (should_run: bool, reason: str).
+
+    Thresholds (fraction of valid pixels matching the feature signature):
+      roads     >5 %  gray, moderate brightness, R≈B (rejects sand)
+      buildings >4 %  low-sat, bright, R≈B
+      trees     >5 %  dark green (G dominates, low brightness)
+      fields    >8 %  green or yellowish-green
+    """
+    try:
+        from rasterio.enums import Resampling as _R
+        with rasterio.open(raster_path) as src:
+            target = 256
+            scale = max(src.width, src.height) / target
+            out_h = max(1, int(src.height / scale))
+            out_w = max(1, int(src.width / scale))
+            bands = min(src.count, 3)
+            data = src.read(
+                list(range(1, bands + 1)),
+                out_shape=(bands, out_h, out_w),
+                resampling=_R.average,
+            ).astype(float)
+    except Exception as exc:
+        return True, f"pre-filter skipped (read error: {exc})"
+
+    if data.shape[0] < 3:
+        return True, "pre-filter skipped (< 3 bands)"
+
+    r, g, b = data[0], data[1], data[2]
+    valid = (r > 5) | (g > 5) | (b > 5)
+    n_valid = int(valid.sum())
+    if n_valid < 100:
+        return True, "pre-filter skipped (too few valid pixels)"
+
+    r, g, b = r[valid], g[valid], b[valid]
+    brightness = (r + g + b) / 3.0
+    sat = np.maximum(np.maximum(r, g), b) - np.minimum(np.minimum(r, g), b)
+
+    if feature_type == "roads":
+        # True gray: low saturation, moderate brightness, not yellowish (R≈B)
+        road_like = (sat < 30) & (np.abs(r - b) < 20) & (brightness > 30) & (brightness < 175)
+        ratio = float(road_like.sum()) / n_valid
+        if ratio > 0.05:
+            return True, f"gray pixel ratio={ratio:.1%}"
+        return False, f"no roads detected (gray ratio={ratio:.1%}, threshold=5%)"
+
+    elif feature_type == "buildings":
+        struct_like = (sat < 35) & (np.abs(r - b) < 25) & (brightness > 50)
+        ratio = float(struct_like.sum()) / n_valid
+        if ratio > 0.04:
+            return True, f"structure pixel ratio={ratio:.1%}"
+        return False, f"no buildings detected (structure ratio={ratio:.1%}, threshold=4%)"
+
+    elif feature_type == "trees":
+        # Dark green — G clearly above R and B, not too bright (canopy shadow)
+        greenness = g - np.maximum(r, b)
+        tree_like = (greenness > 15) & (brightness < 155)
+        ratio = float(tree_like.sum()) / n_valid
+        if ratio > 0.05:
+            return True, f"tree pixel ratio={ratio:.1%}"
+        return False, f"no trees detected (dark-green ratio={ratio:.1%}, threshold=5%)"
+
+    elif feature_type == "fields":
+        # Green fields: G dominant; dry fields: yellowish (R+G)/2 >> B
+        green_field = (g > r + 5) & (g > b + 10) & (brightness > 40)
+        dry_field = ((r + g) / 2 - b > 20) & (brightness > 40) & (brightness < 210) & (g > b)
+        field_like = green_field | dry_field
+        ratio = float(field_like.sum()) / n_valid
+        if ratio > 0.08:
+            return True, f"field pixel ratio={ratio:.1%}"
+        return False, f"no fields detected (green/yellow ratio={ratio:.1%}, threshold=8%)"
+
+    return True, f"no filter for feature_type={feature_type!r}"
 
 
 def extract_feature_masks(
@@ -997,6 +1087,18 @@ def extract_feature_masks(
     n = len(configs)
     mask_paths: List[str] = []
     colors: List[Tuple[int, int, int]] = []
+
+    # Quick RGB pre-filter — skip SAM entirely if image doesn't contain this feature
+    should_run, filter_reason = should_extract_feature(input_path, feature_type)
+    print(f"[extract_feature_masks] {feature_type} pre-filter for {inp.name}: "
+          f"{'RUN' if should_run else 'SKIP'} ({filter_reason})")
+    if not should_run:
+        return {
+            "status": "skipped",
+            "message": filter_reason,
+            "maskPaths": [],
+            "colors": [],
+        }
 
     # Load SAM model once, reuse for all sub-prompts
     if progress_callback:

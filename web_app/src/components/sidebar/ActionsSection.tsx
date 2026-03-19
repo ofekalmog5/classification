@@ -36,7 +36,8 @@ export default function ActionsSection() {
   const activeTaskIdRef = useRef<string | null>(null);
   const [roadMasks, setRoadMasks] = useState<ExtractFeaturesResult | null>(null);
   const [buildingMasks, setBuildingMasks] = useState<ExtractFeaturesResult | null>(null);
-  const [vegetationMasks, setVegetationMasks] = useState<ExtractFeaturesResult | null>(null);
+  const [treeMasks, setTreeMasks] = useState<ExtractFeaturesResult | null>(null);
+  const [fieldsMasks, setFieldsMasks] = useState<ExtractFeaturesResult | null>(null);
   const [roadConfig, setRoadConfig] = useState<RoadExtractConfig | null>(null);
   const [sam3PathInput, setSam3PathInput] = useState("");
 
@@ -457,6 +458,7 @@ export default function ActionsSection() {
     try {
       const allMaskPaths: string[] = [];
       const allColors: [number, number, number][] = [];
+      let skippedCount = 0;
       for (const file of rasterFiles) {
         const fileName = file.split(/[\\/]/).pop() || file;
         dispatch({ type: "SET_STATUS", text: `Extracting roads: ${fileName}…` });
@@ -469,6 +471,11 @@ export default function ActionsSection() {
           dispatch({ type: "SET_STATUS", text: "Road extraction cancelled" });
           return;
         }
+        if ((result as any).status === "skipped") {
+          skippedCount++;
+          console.log(`Roads skipped for ${fileName}: ${(result as any).message}`);
+          continue;
+        }
         if (result.status === "ok" && result.outputPath) {
           allMaskPaths.push(result.outputPath);
           allColors.push([45, 45, 48]);
@@ -477,12 +484,13 @@ export default function ActionsSection() {
         }
       }
       const elapsed = formatElapsed(Date.now() - runStartRef.current);
+      const skippedMsg = skippedCount > 0 ? ` (${skippedCount} skipped — no roads detected)` : "";
       if (allMaskPaths.length > 0) {
         setRoadMasks({ status: "ok", maskPaths: allMaskPaths, colors: allColors });
-        dispatch({ type: "SET_STATUS", text: `Roads extracted: ${allMaskPaths.length}/${rasterFiles.length} files (${elapsed})` });
+        dispatch({ type: "SET_STATUS", text: `Roads extracted: ${allMaskPaths.length} mask(s) (${elapsed})${skippedMsg}` });
         addResultsToGroup("Road Masks (SAM)", allMaskPaths);
       } else {
-        dispatch({ type: "SET_STATUS", text: "Road extraction failed for all files" });
+        dispatch({ type: "SET_STATUS", text: `Road extraction: no roads found in any file${skippedMsg}` });
       }
     } catch (e: any) {
       dispatch({ type: "SET_STATUS", text: `Road extraction error: ${e.message}` });
@@ -498,7 +506,7 @@ export default function ActionsSection() {
     handleMergeFeature(roadMasks, "Roads");
   };
 
-  const handleExtractFeature = async (featureType: "buildings" | "vegetation", label: string) => {
+  const handleExtractFeature = async (featureType: "buildings" | "trees" | "fields", label: string) => {
     const rasterFiles = getRasterFiles();
     if (rasterFiles.length === 0 && state.rasterPath) rasterFiles.push(state.rasterPath);
     if (rasterFiles.length === 0) return alert("Select a raster image first.");
@@ -514,6 +522,7 @@ export default function ActionsSection() {
     try {
       const allMaskPaths: string[] = [];
       const allColors: [number, number, number][] = [];
+      let skippedCount = 0;
       for (const file of rasterFiles) {
         const fileName = file.split(/[\\/]/).pop() || file;
         dispatch({ type: "SET_STATUS", text: `Extracting ${label}: ${fileName}…` });
@@ -527,6 +536,11 @@ export default function ActionsSection() {
           dispatch({ type: "SET_STATUS", text: `${label} extraction cancelled` });
           return;
         }
+        if ((result as any).status === "skipped") {
+          skippedCount++;
+          console.log(`${label} skipped for ${fileName}: ${result.message}`);
+          continue;
+        }
         if (result.status === "ok" && result.maskPaths?.length) {
           allMaskPaths.push(...result.maskPaths);
           allColors.push(...result.colors!);
@@ -535,14 +549,16 @@ export default function ActionsSection() {
         }
       }
       const elapsed = formatElapsed(Date.now() - runStartRef.current);
+      const skippedMsg = skippedCount > 0 ? ` (${skippedCount} skipped — no ${label.toLowerCase()} detected)` : "";
       if (allMaskPaths.length > 0) {
         const combined: ExtractFeaturesResult = { status: "ok", maskPaths: allMaskPaths, colors: allColors };
         if (featureType === "buildings") setBuildingMasks(combined);
-        else setVegetationMasks(combined);
-        dispatch({ type: "SET_STATUS", text: `${label} extracted: ${rasterFiles.length} file(s) (${elapsed})` });
+        else if (featureType === "trees") setTreeMasks(combined);
+        else setFieldsMasks(combined);
+        dispatch({ type: "SET_STATUS", text: `${label} extracted: ${allMaskPaths.length} mask(s) (${elapsed})${skippedMsg}` });
         addResultsToGroup(`${label} Masks`, allMaskPaths);
       } else {
-        dispatch({ type: "SET_STATUS", text: `${label} extraction failed for all files` });
+        dispatch({ type: "SET_STATUS", text: `${label}: no features found in any file${skippedMsg}` });
       }
     } catch (e: any) {
       dispatch({ type: "SET_STATUS", text: `${label} extraction error: ${e.message}` });
@@ -610,9 +626,13 @@ export default function ActionsSection() {
       allMaskPaths.push(...buildingMasks.maskPaths);
       allColors.push(...buildingMasks.colors!);
     }
-    if (vegetationMasks?.maskPaths) {
-      allMaskPaths.push(...vegetationMasks.maskPaths);
-      allColors.push(...vegetationMasks.colors!);
+    if (treeMasks?.maskPaths) {
+      allMaskPaths.push(...treeMasks.maskPaths);
+      allColors.push(...treeMasks.colors!);
+    }
+    if (fieldsMasks?.maskPaths) {
+      allMaskPaths.push(...fieldsMasks.maskPaths);
+      allColors.push(...fieldsMasks.colors!);
     }
     if (!allMaskPaths.length) return alert("Extract at least one feature first.");
     runStartRef.current = Date.now();
@@ -748,18 +768,34 @@ export default function ActionsSection() {
           />
         </div>
 
-        {/* Vegetation */}
+        {/* Trees */}
         <div className="grid grid-cols-2 gap-1.5">
           <ActionBtn
-            label="Extract Vegetation"
-            onClick={() => handleExtractFeature("vegetation", "Vegetation")}
+            label="Extract Trees"
+            onClick={() => handleExtractFeature("trees", "Trees")}
             disabled={isRunning}
             color="amber"
           />
           <ActionBtn
-            label="Merge Vegetation"
-            onClick={() => handleMergeFeature(vegetationMasks, "Vegetation")}
-            disabled={isRunning || !vegetationMasks || !state.lastResultPath}
+            label="Merge Trees"
+            onClick={() => handleMergeFeature(treeMasks, "Trees")}
+            disabled={isRunning || !treeMasks || !state.lastResultPath}
+            color="amber"
+          />
+        </div>
+
+        {/* Fields */}
+        <div className="grid grid-cols-2 gap-1.5">
+          <ActionBtn
+            label="Extract Fields"
+            onClick={() => handleExtractFeature("fields", "Fields")}
+            disabled={isRunning}
+            color="amber"
+          />
+          <ActionBtn
+            label="Merge Fields"
+            onClick={() => handleMergeFeature(fieldsMasks, "Fields")}
+            disabled={isRunning || !fieldsMasks || !state.lastResultPath}
             color="amber"
           />
         </div>
@@ -768,21 +804,24 @@ export default function ActionsSection() {
         <ActionBtn
           label="Merge All Features"
           onClick={handleMergeAll}
-          disabled={isRunning || (!roadMasks && !buildingMasks && !vegetationMasks) || !state.lastResultPath}
+          disabled={isRunning || (!roadMasks && !buildingMasks && !treeMasks && !fieldsMasks) || !state.lastResultPath}
           color="orange"
           full
         />
 
         {/* Status indicators */}
-        <div className="text-[9px] text-surface-500 flex gap-2 px-0.5">
+        <div className="text-[9px] text-surface-500 flex gap-2 flex-wrap px-0.5">
           <span className={roadMasks ? "text-green-500" : ""}>
             {roadMasks ? `✓ Roads (${roadMasks.maskPaths?.length})` : "· Roads"}
           </span>
           <span className={buildingMasks ? "text-green-500" : ""}>
-            {buildingMasks ? "✓ Buildings" : "· Buildings"}
+            {buildingMasks ? `✓ Buildings (${buildingMasks.maskPaths?.length})` : "· Buildings"}
           </span>
-          <span className={vegetationMasks ? "text-green-500" : ""}>
-            {vegetationMasks ? `✓ Vegetation (${vegetationMasks.maskPaths?.length} masks)` : "· Vegetation"}
+          <span className={treeMasks ? "text-green-500" : ""}>
+            {treeMasks ? `✓ Trees (${treeMasks.maskPaths?.length})` : "· Trees"}
+          </span>
+          <span className={fieldsMasks ? "text-green-500" : ""}>
+            {fieldsMasks ? `✓ Fields (${fieldsMasks.maskPaths?.length})` : "· Fields"}
           </span>
         </div>
 

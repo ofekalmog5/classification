@@ -333,7 +333,7 @@ export async function mergeRoadMask(params: MergeRoadMaskParams): Promise<Classi
 /* ── Generic feature extraction (buildings / vegetation / roads) ──── */
 export interface ExtractFeaturesParams {
   rasterPath: string;
-  featureType: "roads" | "buildings" | "vegetation";
+  featureType: "roads" | "buildings" | "trees" | "fields";
   outputPath?: string;
   tileSize?: number;
   overlapPct?: number;
