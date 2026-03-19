@@ -948,19 +948,19 @@ FEATURE_CONFIGS: Dict[str, List[Dict]] = {
     # threshold: OWLv2 detection confidence threshold (higher = fewer false positives)
     "roads": [
         {
-            # Paved / asphalt roads — dark gray, urban/suburban, highway
-            "prompt": "highway, asphalt road, paved road, urban road, motorway, tarmac road, paved street, road surface",
+            # Paved / asphalt roads — use simple common terms OWLv2 recognises well
+            "prompt": "road, street, highway, road surface, asphalt road, paved road",
             "suffix": "roads_asphalt",
             "color": (45, 45, 48),       # BM_ASPHALT #2D2D30
             "threshold": 0.08,
             "border_extend": 60,
         },
         {
-            # Dirt / unpaved roads — brownish-gray, rural tracks, farm roads
-            "prompt": "dirt road, unpaved road, gravel road, rural track, farm track, compacted earth road, sandy path",
+            # Dirt / unpaved roads — simple terms, lower confidence threshold
+            "prompt": "dirt road, gravel road, unpaved road, path, track",
             "suffix": "roads_dirt",
             "color": (130, 123, 115),    # BM_ROCK #827B73
-            "threshold": 0.07,
+            "threshold": 0.06,
             "border_extend": 60,
         },
     ],
@@ -1139,15 +1139,11 @@ def should_extract_feature(raster_path: str, feature_type: str) -> tuple:
             )
             if lines is None:
                 return False, f"gray pixels ({ratio:.1%}) but no linear road structure — likely open terrain/field"
+            # Any linear structure found — pass. The total-length gate was too
+            # strict and rejected images where roads are narrow or cross a corner.
             total_len = float(sum(
                 np.hypot(l[0][2] - l[0][0], l[0][3] - l[0][1]) for l in lines
             ))
-            # Require accumulated line length ≥ 25% of image dimension
-            if total_len < min_dim * 0.25:
-                return False, (
-                    f"gray pixels ({ratio:.1%}) but lines too sparse/short "
-                    f"({total_len:.0f}px < {min_dim * 0.25:.0f}px) — likely open terrain"
-                )
             return True, f"road lines: {len(lines)} segments, total={total_len:.0f}px, gray={ratio:.1%}"
         except Exception:
             pass  # cv2 unavailable — fall back to ratio-only pass
