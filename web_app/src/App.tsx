@@ -6,6 +6,16 @@ import { fetchGpuInfo } from "./api/client";
 function AppInit() {
   const dispatch = useAppDispatch();
 
+  // Warn before closing/refreshing the window
+  useEffect(() => {
+    const handler = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, []);
+
   useEffect(() => {
     // Fetch acceleration engine info; retry every 5 s until backend responds,
     // then re-check every 30 s in case the backend is restarted.
