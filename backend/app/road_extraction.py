@@ -1105,12 +1105,48 @@ def should_extract_feature(raster_path: str, feature_type: str) -> tuple:
     sat = np.maximum(np.maximum(r, g), b) - np.minimum(np.minimum(r, g), b)
 
     if feature_type == "roads":
-        # True gray: low saturation, moderate brightness, not yellowish (R≈B)
+        # Step 1: Quick gray pixel ratio — roads must have enough neutral gray pixels.
+        # True gray: low saturation, moderate brightness, R≈B (rejects sandy/yellow soil)
         road_like = (sat < 30) & (np.abs(r - b) < 20) & (brightness > 30) & (brightness < 175)
         ratio = float(road_like.sum()) / n_valid
-        if ratio > 0.05:
-            return True, f"gray pixel ratio={ratio:.1%}"
-        return False, f"no roads detected (gray ratio={ratio:.1%}, threshold=5%)"
+        if ratio <= 0.03:
+            return False, f"no roads detected (gray ratio={ratio:.1%}, threshold=3%)"
+
+        # Step 2: Linearity check — roads are thin LINEAR features; plowed fields,
+        # shadows and bare soil are large amorphous blobs.  Build a 2D road-candidate
+        # mask from the original spatial data and run Hough line detection.
+        try:
+            import cv2 as _cv2
+            r2d, g2d, b2d = data[0], data[1], data[2]
+            br2d = (r2d + g2d + b2d) / 3.0
+            sa2d = np.maximum(np.maximum(r2d, g2d), b2d) - np.minimum(np.minimum(r2d, g2d), b2d)
+            road_mask2d = (
+                (sa2d < 30) & (np.abs(r2d - b2d) < 20) & (br2d > 30) & (br2d < 175)
+            ).astype(np.uint8) * 255
+
+            min_dim = min(road_mask2d.shape)
+            # Minimum line segment length: 7% of thumbnail dimension (~18px on 256-px thumb)
+            min_seg = max(8, int(min_dim * 0.07))
+            lines = _cv2.HoughLinesP(
+                road_mask2d, rho=1, theta=np.pi / 180,
+                threshold=12, minLineLength=min_seg, maxLineGap=10,
+            )
+            if lines is None:
+                return False, f"gray pixels ({ratio:.1%}) but no linear road structure — likely open terrain/field"
+            total_len = float(sum(
+                np.hypot(l[0][2] - l[0][0], l[0][3] - l[0][1]) for l in lines
+            ))
+            # Require accumulated line length ≥ 25% of image dimension
+            if total_len < min_dim * 0.25:
+                return False, (
+                    f"gray pixels ({ratio:.1%}) but lines too sparse/short "
+                    f"({total_len:.0f}px < {min_dim * 0.25:.0f}px) — likely open terrain"
+                )
+            return True, f"road lines: {len(lines)} segments, total={total_len:.0f}px, gray={ratio:.1%}"
+        except Exception:
+            pass  # cv2 unavailable — fall back to ratio-only pass
+
+        return True, f"gray pixel ratio={ratio:.1%}"
 
     elif feature_type == "buildings":
         # Gray/flat/concrete roofs: low saturation, any brightness
