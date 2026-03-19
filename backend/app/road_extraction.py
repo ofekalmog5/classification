@@ -1035,24 +1035,29 @@ FEATURE_CONFIGS: Dict[str, List[Dict]] = {
             "threshold": 0.05,
         },
     ],
+    # Fields: flat low vegetation viewed from above in orthophotos.
+    # Prompts describe the aerial appearance — flat uniform patches, not eye-level vegetation.
     "fields": [
         {
-            "prompt": "dense foliage, thick shrubs, bush, undergrowth, dense bushes",
-            "suffix": "fields_foliage",
-            "color": (0, 100, 0),         # BM_FOLIAGE #006400
-            "threshold": 0.06,
-        },
-        {
-            "prompt": "dry grass, brown grass, dead grass, arid land, straw, dry field",
-            "suffix": "fields_dry_grass",
-            "color": (189, 183, 107),     # BM_LAND_DRY_GRASS #BDB76B
-            "threshold": 0.06,
-        },
-        {
-            "prompt": "grass, lawn, green grass, green field, meadow, turf",
+            # Green grass / lawn — flat, bright uniform green from above (parks, sports fields, verges)
+            "prompt": "grass field from above, lawn aerial view, green field top view, park grass aerial, sports field aerial, flat green vegetation, green open area",
             "suffix": "fields_grass",
             "color": (124, 252, 0),       # BM_LAND_GRASS #7CFC00
-            "threshold": 0.06,
+            "threshold": 0.05,
+        },
+        {
+            # Dry / arid grass — flat yellowish-brown patches, no vertical structure
+            "prompt": "dry grass field aerial, yellow field from above, arid land top view, dry vegetation patch, brown field aerial, straw field top view, dry open land",
+            "suffix": "fields_dry_grass",
+            "color": (189, 183, 107),     # BM_LAND_DRY_GRASS #BDB76B
+            "threshold": 0.05,
+        },
+        {
+            # Low shrubs / scrubland — bumpy low green texture, between grass and tree canopy height
+            "prompt": "low shrubs aerial view, scrubland from above, bush patch top view, low vegetation aerial, mediterranean scrub aerial, green scrub patch, low bush field",
+            "suffix": "fields_foliage",
+            "color": (0, 100, 0),         # BM_FOLIAGE #006400
+            "threshold": 0.05,
         },
     ],
 }
@@ -1131,14 +1136,14 @@ def should_extract_feature(raster_path: str, feature_type: str) -> tuple:
         return False, f"no trees detected (dark-green ratio={ratio:.1%}, threshold=5%)"
 
     elif feature_type == "fields":
-        # Green fields: G dominant; dry fields: yellowish (R+G)/2 >> B
+        # Green fields: G dominant over R and B; dry fields: yellowish (R+G)/2 >> B
         green_field = (g > r + 5) & (g > b + 10) & (brightness > 40)
-        dry_field = ((r + g) / 2 - b > 20) & (brightness > 40) & (brightness < 210) & (g > b)
+        dry_field = ((r + g) / 2 - b > 15) & (brightness > 40) & (brightness < 220) & (g > b)
         field_like = green_field | dry_field
         ratio = float(field_like.sum()) / n_valid
-        if ratio > 0.08:
+        if ratio > 0.05:
             return True, f"field pixel ratio={ratio:.1%}"
-        return False, f"no fields detected (green/yellow ratio={ratio:.1%}, threshold=8%)"
+        return False, f"no fields detected (green/yellow ratio={ratio:.1%}, threshold=5%)"
 
     return True, f"no filter for feature_type={feature_type!r}"
 
