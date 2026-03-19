@@ -1008,12 +1008,31 @@ FEATURE_CONFIGS: Dict[str, List[Dict]] = {
     # Vegetation is split into two separate feature types:
     # "trees"  — tree canopy / forest → BM_VEGETATION (dark green)
     # "fields" — grass / dry grass / shrubs → BM_LAND_GRASS, BM_LAND_DRY_GRASS, BM_FOLIAGE
+    #
+    # Trees from orthophotos look like circular/irregular dark-green blobs from above.
+    # OWLv2 was trained on eye-level images, so we split into 3 sub-types with
+    # aerial-perspective phrasing to maximise recall. Threshold is lowered to 0.05.
     "trees": [
         {
-            "prompt": "trees, forest, forest canopy, woodland, treetops, tree canopy",
-            "suffix": "trees",
+            # Isolated urban/suburban trees — distinct circular crowns visible from above
+            "prompt": "tree crown, tree canopy, tree top, circular tree canopy, isolated tree from above, lone tree aerial view, single tree top view",
+            "suffix": "trees_isolated",
             "color": (34, 139, 34),       # BM_VEGETATION #228B22
-            "threshold": 0.07,
+            "threshold": 0.05,
+        },
+        {
+            # Dense forest / grove — large continuous green canopy patches
+            "prompt": "forest canopy, dense forest, woodland canopy, grove of trees, treetops aerial, forest from above, wooded area top view",
+            "suffix": "trees_forest",
+            "color": (34, 139, 34),       # BM_VEGETATION #228B22
+            "threshold": 0.05,
+        },
+        {
+            # Orchards and planted tree rows — common in Mediterranean/agricultural orthophotos
+            "prompt": "orchard aerial view, olive grove, fruit trees from above, tree rows, agricultural trees, row trees top view, planted trees",
+            "suffix": "trees_orchard",
+            "color": (34, 139, 34),       # BM_VEGETATION #228B22
+            "threshold": 0.05,
         },
     ],
     "fields": [
@@ -1103,10 +1122,11 @@ def should_extract_feature(raster_path: str, feature_type: str) -> tuple:
 
     elif feature_type == "trees":
         # Dark green — G clearly above R and B, not too bright (canopy shadow)
+        # Also catch medium-green canopy (greenness>8) for sparse tree coverage
         greenness = g - np.maximum(r, b)
-        tree_like = (greenness > 15) & (brightness < 155)
+        tree_like = (greenness > 8) & (brightness < 170)
         ratio = float(tree_like.sum()) / n_valid
-        if ratio > 0.05:
+        if ratio > 0.03:
             return True, f"tree pixel ratio={ratio:.1%}"
         return False, f"no trees detected (dark-green ratio={ratio:.1%}, threshold=5%)"
 
