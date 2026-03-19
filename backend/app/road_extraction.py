@@ -954,33 +954,53 @@ FEATURE_CONFIGS: Dict[str, List[Dict]] = {
             "suffix": "roads",
             "color": (45, 45, 48),       # BM_ASPHALT #2D2D30
             "threshold": 0.08,
+            # Extend road mask at image borders so roads connect across adjacent orthophotos
+            "border_extend": 60,
         },
     ],
-    # Buildings: split by roof type so each SAM run focuses on one roof appearance.
-    # All sub-types map to BM_CONCRETE. Orthophotos show rooftops, not walls —
-    # prompts are tuned for the top-down aerial perspective.
+    # Buildings: one SAM run per roof-type group, all mapped to BM_CONCRETE.
+    # Orthophotos show rooftops from above — prompts target the aerial perspective.
+    # Six groups cover the full range of roof appearances in urban orthophotos.
     "buildings": [
         {
-            "prompt": "flat roof, concrete roof, gravel roof, white rooftop, commercial roof, flat rooftop",
+            # Flat commercial / industrial roofs — gray, gravel, bitumen
+            "prompt": "flat roof, concrete roof, gravel roof, bitumen roof, flat commercial rooftop",
             "suffix": "bldg_flat",
             "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
             "threshold": 0.06,
         },
         {
-            "prompt": "tile roof, red roof, orange roof, terracotta roof, clay roof, tiled rooftop",
+            # Clay / terracotta tile roofs — most common residential in Mediterranean orthophotos
+            "prompt": "tile roof, red roof, orange roof, terracotta roof, clay roof, tiled rooftop, ceramic roof",
             "suffix": "bldg_tile",
             "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
             "threshold": 0.06,
         },
         {
-            "prompt": "metal roof, corrugated roof, industrial roof, warehouse roof, sheet metal rooftop",
+            # Metal / industrial — corrugated iron, sheet metal, factory and warehouse roofs
+            "prompt": "metal roof, corrugated roof, industrial roof, warehouse roof, tin roof, sheet metal rooftop",
             "suffix": "bldg_metal",
             "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
             "threshold": 0.06,
         },
         {
-            "prompt": "house roof, residential roof, shingle roof, dark roof, sloped rooftop",
-            "suffix": "bldg_house",
+            # Dark residential — shingle, slate, dark tile, asphalt felt
+            "prompt": "shingle roof, slate roof, dark rooftop, black roof, dark residential roof, asphalt shingle roof",
+            "suffix": "bldg_dark",
+            "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
+            "threshold": 0.06,
+        },
+        {
+            # Light / white / reflective coated roofs
+            "prompt": "white roof, bright rooftop, reflective roof, white painted concrete roof, light colored roof",
+            "suffix": "bldg_white",
+            "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
+            "threshold": 0.06,
+        },
+        {
+            # Modern — solar panels, green / vegetated roofs
+            "prompt": "solar panel roof, green roof, rooftop garden, photovoltaic roof, solar array on roof",
+            "suffix": "bldg_solar",
             "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
             "threshold": 0.06,
         },
@@ -1157,6 +1177,7 @@ def extract_feature_masks(
         color = cfg["color"]
         prompt = cfg["prompt"]
         thresh = cfg.get("threshold", 0.08)
+        border_ext = cfg.get("border_extend", 0)
 
         if output_path is None:
             out = str(inp.with_name(f"{inp.stem}_{suffix}.tif"))
@@ -1182,6 +1203,7 @@ def extract_feature_masks(
             overlap_pct=overlap_pct,
             closing_kernel_size=closing_kernel_size,
             threshold=thresh,
+            extend_borders_px=border_ext,
             progress_callback=_cb,
         )
         if result.get("status") == "ok":
@@ -1199,6 +1221,57 @@ def extract_feature_masks(
     return {"status": "ok", "maskPaths": mask_paths, "colors": colors}
 
 
+def _extend_at_borders(mask_path: str, border_px: int = 60, kernel_px: int = 20) -> None:
+    """Dilate road pixels within the image border zone to bridge cross-image gaps.
+
+    When a road crosses from one orthophoto tile to an adjacent one, SAM may
+    detect it right up to the edge in both images but leave a visual gap because
+    detection doesn't reach the very last pixels.  This function dilates the
+    road mask ONLY inside the border region so that detected roads always reach
+    the image edge — without creating false roads in the image interior.
+    """
+    with rasterio.open(mask_path) as src:
+        data = src.read(1)  # (H, W) uint8
+        profile = src.profile.copy()
+
+    h, w = data.shape
+    b = min(border_px, min(h, w) // 6)  # cap so we don't eat into small images
+
+    # Border zone mask (all four edges)
+    border_zone = np.zeros((h, w), dtype=bool)
+    border_zone[:b, :]  = True
+    border_zone[-b:, :] = True
+    border_zone[:, :b]  = True
+    border_zone[:, -b:] = True
+
+    # Only bother if roads exist near a border
+    if not np.any(data[border_zone] > 0):
+        return
+
+    # Dilate the full mask, then keep interior pixels unchanged
+    if _CV2_AVAILABLE:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_px, kernel_px))
+        dilated = cv2.dilate(data, kernel)
+    else:
+        from scipy.ndimage import binary_dilation as _bd
+        dilated = _bd(data > 0, iterations=kernel_px // 2).astype(np.uint8)
+
+    result = data.copy()
+    result[border_zone] = np.maximum(data[border_zone], dilated[border_zone])
+
+    tmp = mask_path + "._bext.tif"
+    try:
+        with rasterio.open(tmp, "w", **profile) as dst:
+            dst.write(result[np.newaxis, :, :])
+        import shutil as _shutil
+        _shutil.move(tmp, mask_path)
+    except Exception:
+        try:
+            Path(tmp).unlink()
+        except OSError:
+            pass
+
+
 def _run_single_extraction(
     input_path: str,
     output_path: str,
@@ -1209,6 +1282,7 @@ def _run_single_extraction(
     overlap_pct: float = 0.1,
     closing_kernel_size: int = 15,
     threshold: float = 0.08,
+    extend_borders_px: int = 0,
     progress_callback: Optional[Callable] = None,
 ) -> Dict[str, object]:
     """Run a single SAM text-prompted mask extraction (reuses an already-loaded model)."""
@@ -1249,6 +1323,10 @@ def _run_single_extraction(
         tmp = Path(tmp_mask_path)
         if tmp.exists():
             tmp.unlink()
+
+    # Extend road pixels at image borders so roads connect across adjacent images
+    if extend_borders_px > 0:
+        _extend_at_borders(output_path, border_px=extend_borders_px)
 
     if progress_callback:
         progress_callback("Done", total_tiles + 1, total_tiles + 1)

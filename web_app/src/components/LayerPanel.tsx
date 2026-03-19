@@ -321,7 +321,7 @@ function GroupCard({
         <button
           className="text-surface-600 hover:text-red-400 text-[10px]"
           onClick={() => dispatch({ type: "REMOVE_LAYER_GROUP", id: group.id })}
-          title="Delete group"
+          title="Delete group and all its layers"
         >
           ✕
         </button>

@@ -210,11 +210,15 @@ function reducer(state: AppState, action: Action): AppState {
     case "ADD_LAYER_GROUP":
       return { ...state, layerGroups: [...state.layerGroups, action.group] };
 
-    case "REMOVE_LAYER_GROUP":
+    case "REMOVE_LAYER_GROUP": {
+      const grp = state.layerGroups.find((g) => g.id === action.id);
+      const memberIds = new Set(grp ? grp.layerIds : []);
       return {
         ...state,
+        mapLayers: state.mapLayers.filter((l) => !memberIds.has(l.id)),
         layerGroups: state.layerGroups.filter((g) => g.id !== action.id),
       };
+    }
 
     case "TOGGLE_LAYER_GROUP": {
       const grp = state.layerGroups.find((g) => g.id === action.id);

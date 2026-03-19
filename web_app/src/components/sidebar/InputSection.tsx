@@ -6,7 +6,7 @@ import FileBrowserModal from "../FileBrowserModal";
 type BrowserMode = null | { mode: "file" | "folder" | "save"; target: "input" | "output" };
 
 export default function InputSection() {
-  const { rasterPath, outputPath, lastResultPath, imageryMode } = useAppState();
+  const { rasterPath, outputPath, lastResultPath, imageryMode, layerGroups } = useAppState();
   const dispatch = useAppDispatch();
   const [scanning, setScanning] = useState(false);
   const [browser, setBrowser] = useState<BrowserMode>(null);
@@ -43,11 +43,22 @@ export default function InputSection() {
           dispatch({ type: "SET_RASTER_PATH", path: result.files[0].path });
         }
 
-        for (const file of result.files) {
+        // Create a group for this folder
+        const folderName = path.split(/[\\/]/).pop() || "Input Images";
+        const groupId = `group-input-${Date.now()}`;
+        dispatch({
+          type: "ADD_LAYER_GROUP",
+          group: { id: groupId, name: folderName, visible: true, layerIds: [] },
+        });
+
+        const layerIds: string[] = [];
+        for (let i = 0; i < result.files.length; i++) {
+          const file = result.files[i];
+          const layerId = `input-${Date.now()}-${i}`;
           dispatch({
             type: "ADD_MAP_LAYER",
             layer: {
-              id: `input-${Date.now()}-${file.name}`,
+              id: layerId,
               name: file.relativePath,
               type: "raster-input",
               filePath: file.path,
@@ -55,7 +66,10 @@ export default function InputSection() {
               opacity: 1,
             },
           });
+          layerIds.push(layerId);
         }
+        dispatch({ type: "ADD_MANY_TO_GROUP", layerIds, groupId });
+
         const firstName = result.files[0]?.name || "";
         dispatch({
           type: "SET_STATUS",
@@ -69,11 +83,12 @@ export default function InputSection() {
       }
       setScanning(false);
     } else {
-      // Single file — add to map
+      // Single file — add to map and place in "Input Images" group
+      const layerId = `input-${Date.now()}`;
       dispatch({
         type: "ADD_MAP_LAYER",
         layer: {
-          id: `input-${Date.now()}`,
+          id: layerId,
           name: path.split(/[\\/]/).pop() || path,
           type: "raster-input",
           filePath: path,
@@ -81,6 +96,18 @@ export default function InputSection() {
           opacity: 1,
         },
       });
+      // Find or create the shared input group
+      const existingGroup = layerGroups.find((g) => g.name === "Input Images");
+      if (existingGroup) {
+        dispatch({ type: "ADD_TO_GROUP", layerId, groupId: existingGroup.id });
+      } else {
+        const groupId = `group-input-${Date.now()}`;
+        dispatch({
+          type: "ADD_LAYER_GROUP",
+          group: { id: groupId, name: "Input Images", visible: true, layerIds: [] },
+        });
+        dispatch({ type: "ADD_TO_GROUP", layerId, groupId });
+      }
     }
   };
 

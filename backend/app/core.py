@@ -5386,6 +5386,19 @@ def _build_mea_cluster_mapping(
                 # BM_ASPHALT bonus when cluster is gray AND closer to asphalt.
                 if material_names[j] == "BM_ASPHALT" and _closer_to_asphalt and _neutrality >= 0.35:
                     base = max(0.0, base - 25000.0)
+                # Brightness-based disambiguation between BM_ASPHALT (dark, ~46) and
+                # BM_CONCRETE (light, ~180).  In orthophotos both roads and building
+                # rooftops can be either dark or light — the cluster brightness is the
+                # strongest signal we have without spatial context.
+                _brightness = (rgb[0] + rgb[1] + rgb[2]) / 3.0
+                if material_names[j] == "BM_ASPHALT" and _neutrality >= 0.25:
+                    # Penalise bright clusters as asphalt: bright gray → concrete
+                    if _brightness > 120:
+                        base += (_brightness - 120) * 120.0   # up to +16 200 at pure white
+                if material_names[j] == "BM_CONCRETE" and _neutrality >= 0.25:
+                    # Penalise very dark clusters as concrete: dark gray → asphalt
+                    if _brightness < 100:
+                        base += (100 - _brightness) * 100.0   # up to +10 000 at pure black
                 # Penalise road for warm clusters (earthy surface, not pavement).
                 if _is_warm_cluster:
                     base += 15000.0
