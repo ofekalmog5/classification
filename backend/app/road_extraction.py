@@ -1035,40 +1035,211 @@ def _color_detect_trees(tile_rgb: np.ndarray) -> np.ndarray:
 
 
 def _color_detect_water(tile_rgb: np.ndarray) -> np.ndarray:
-    """Detect water bodies by blue-dominant / dark-blue color.
+    """Detect water bodies using multi-strategy color + texture analysis.
 
-    Water from above: lakes, fish pools, sea, rivers look dark blue or
-    greenish-blue.  Returns binary mask (H, W) uint8 {0, 1}.
+    Water from orthophoto nadir view comes in many appearances:
+      - Deep blue (sea, deep lakes)
+      - Dark blue-green (fish ponds, reservoirs)
+      - Turquoise / cyan (treated pools, shallow coastal)
+      - Green-tinted (algae, stagnant water, fish pools)
+      - Dark / near-black (deep shadow on water, deep reservoirs)
+      - Muddy brown-gray (rivers after rain, turbid ponds)
+      - Gray-silver (reflective surfaces, overcast sky reflection)
+      - Teal / muted blue-green (estuaries, irrigation channels)
+
+    Uses a combination of:
+      1) HSV color ranges for different water types
+      2) RGB ratio analysis for blue/green dominance
+      3) Local texture smoothness (water is uniformly smooth from above)
+      4) Adaptive thresholding to catch low-contrast water
+
+    Returns binary mask (H, W) uint8 {0, 1}.
     """
     if not _CV2_AVAILABLE:
         return np.zeros(tile_rgb.shape[:2], dtype=np.uint8)
     h, w = tile_rgb.shape[:2]
+
+    # ---- Convert to useful color spaces ----
+    hsv = cv2.cvtColor(tile_rgb, cv2.COLOR_RGB2HSV)
+    H, S, V = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
     r = tile_rgb[:, :, 0].astype(np.int16)
     g = tile_rgb[:, :, 1].astype(np.int16)
     b = tile_rgb[:, :, 2].astype(np.int16)
+    brightness = (r + g + b) // 3
 
-    # Blue-dominant: B > R and B > G (or B close to G for greenish water)
-    blue_dom = (b > r + 15) & (b > g - 10) & (b > 40)
-    # Also detect dark water: low brightness, slight blue
-    dark_water = ((r + g + b) < 180) & (b >= r) & (b > 30)
-    # Turquoise pools: high G+B, low R
-    turquoise = (g > 80) & (b > 80) & (r < g - 15)
+    # =========================================================
+    # Strategy 1: HSV-based color detection (wide coverage)
+    # =========================================================
+    # OpenCV HSV: H 0-179, S 0-255, V 0-255
 
-    water = (blue_dom | dark_water | turquoise).astype(np.uint8)
+    # 1a) Blue water — classic lake/sea/pool (H ~100-130)
+    blue_water = (H > 90) & (H < 135) & (S > 25) & (V > 20) & (V < 230)
 
-    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    water = cv2.morphologyEx(water, cv2.MORPH_OPEN, k_open)
-    water = cv2.morphologyEx(water, cv2.MORPH_CLOSE, k_close)
+    # 1b) Deep blue water — darker, more saturated (deep sea/reservoir)
+    deep_blue = (H > 95) & (H < 140) & (S > 50) & (V > 15) & (V < 160)
 
-    # Keep only substantial water bodies
-    contours, _ = cv2.findContours(water, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # 1c) Cyan / turquoise — treated pools, shallow tropical water
+    cyan_water = (H > 75) & (H < 100) & (S > 30) & (V > 60) & (V < 230)
+
+    # 1d) Green-blue water — algae-rich ponds, fish pools, eutrophic lakes
+    #     Distinguish from vegetation: water has B closer to G (muted green-blue),
+    #     vegetation has G >> B (pure saturated green).
+    green_water = (H > 55) & (H < 95) & (S > 20) & (V > 25) & (V < 180) & \
+                  (b > g * 3 // 10)   # B >= 30% of G → rules out pure green vegetation
+
+    # 1e) Dark teal — irrigation channels, wastewater, shaded water
+    dark_teal = (H > 70) & (H < 120) & (S > 15) & (V > 10) & (V < 90)
+
+    # 1f) Muddy/turbid water — brownish (rivers, ponds after rain)
+    #     Low hue (brown-yellow), low saturation, medium-low brightness
+    muddy = (H > 8) & (H < 30) & (S > 15) & (S < 100) & (V > 30) & (V < 140)
+
+    # 1g) Gray reflective water — overcast sky reflection, silvery surface
+    #     Requires slight blue tint (b >= r) to avoid matching gray asphalt/concrete.
+    #     Water reflection always has slight blue shift compared to neutral gray surfaces.
+    gray_water = (S < 25) & (V > 50) & (V < 170) & (b > r)
+
+    hsv_mask = (blue_water | deep_blue | cyan_water | green_water |
+                dark_teal).astype(np.uint8)
+
+    # =========================================================
+    # Strategy 2: RGB ratio-based detection
+    # =========================================================
+
+    # 2a) Blue-dominant: B channel is strongest
+    blue_dom = (b > r + 8) & (b > g - 15) & (b > 30)
+
+    # 2b) Green-blue dominant: B and G both exceed R → water (not vegetation)
+    #     Require B > R to ensure actual blue component (rejects pure green plants)
+    gb_dom = (b > r) & (g > r) & ((g + b) > (r * 2 + 30)) & (b > 30)
+
+    # 2c) Dark water: low total brightness, blue slightly exceeds red
+    #     Require B > R (not just >=) to reject neutral-gray dark asphalt/shadow
+    dark_water = (brightness < 70) & (b > r + 2) & (b > 15)
+
+    # 2d) Medium-dark water (wider catch): moderate brightness, not red-ish
+    med_dark_water = (brightness > 30) & (brightness < 110) & (b >= r - 10) & \
+                     (b > g - 20) & (S > 10)
+
+    # 2e) Turquoise / aquamarine pools: high G+B, low R
+    turquoise = (g > 70) & (b > 60) & (r < g - 8) & (r < b + 10)
+
+    rgb_mask = (blue_dom | gb_dom | dark_water | turquoise).astype(np.uint8)
+
+    # =========================================================
+    # Strategy 3: Texture smoothness (water is uniform from above)
+    # =========================================================
+    # Convert to grayscale and measure local standard deviation
+    gray = cv2.cvtColor(tile_rgb, cv2.COLOR_RGB2GRAY)
+
+    # Valid-pixel mask — exclude black/nodata background (R+G+B < 15)
+    valid_pixels = (brightness > 5).astype(np.uint8)
+
+    # Local std dev over 11×11 window — water will have very low variance
+    blur = cv2.GaussianBlur(gray.astype(np.float32), (11, 11), 0)
+    blur_sq = cv2.GaussianBlur((gray.astype(np.float32)) ** 2, (11, 11), 0)
+    local_std = np.sqrt(np.maximum(blur_sq - blur ** 2, 0))
+
+    # Smooth regions: std dev < 12 (water is very uniform)
+    smooth_mask = (local_std < 12).astype(np.uint8)
+    # Exclude nodata/black from smooth mask
+    smooth_mask = cv2.bitwise_and(smooth_mask, valid_pixels)
+
+    # Texture-assisted water: smooth AND has clear blue dominance
+    # (strict — prevents false positives on smooth concrete/asphalt/vegetation)
+    water_color_hint = (
+        # Blue must actually exceed red (not just close) + not too bright
+        (b > r + 5) & (b > 30) & (brightness > 10) & (brightness < 200)
+    ).astype(np.uint8)
+    texture_water = cv2.bitwise_and(smooth_mask, water_color_hint)
+
+    # =========================================================
+    # Strategy 4: Combined muddy/gray water with texture confirmation
+    # =========================================================
+    # Gray and muddy water are ambiguous — only accept them when texture
+    # confirms smoothness (avoids false positives on roads/buildings)
+    ambiguous_color = (muddy | gray_water | med_dark_water).astype(np.uint8)
+    ambiguous_color = cv2.bitwise_and(ambiguous_color, valid_pixels)
+    # Require stronger smoothness for ambiguous colors
+    strong_smooth = (local_std < 8).astype(np.uint8)
+    strong_smooth = cv2.bitwise_and(strong_smooth, valid_pixels)
+    confirmed_ambiguous = cv2.bitwise_and(ambiguous_color, strong_smooth)
+
+    # =========================================================
+    # Combine all strategies
+    # =========================================================
+    combined = np.maximum(hsv_mask, rgb_mask)
+    combined = np.maximum(combined, texture_water)
+    combined = np.maximum(combined, confirmed_ambiguous)
+
+    # Mask out nodata/black background pixels
+    combined = cv2.bitwise_and(combined, valid_pixels)
+
+    # =========================================================
+    # Morphological cleanup
+    # =========================================================
+    # Open: remove small noise (3×3)
+    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, k_open)
+
+    # Close: fill small gaps within water bodies (21×21 — water bodies are large)
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, k_close)
+
+    # Re-mask after closing to prevent bleeding into nodata
+    combined = cv2.bitwise_and(combined, valid_pixels)
+
+    # Dilate slightly to capture edges where water meets land
+    k_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    combined = cv2.dilate(combined, k_dilate, iterations=1)
+
+    # Final nodata mask
+    combined = cv2.bitwise_and(combined, valid_pixels)
+
+    # =========================================================
+    # Contour filtering — keep only genuine water bodies
+    # =========================================================
+    contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
     result = np.zeros((h, w), dtype=np.uint8)
-    min_area = max(500, h * w * 0.003)
+    # Lower min area to catch small pools and narrow channels
+    min_area = max(200, h * w * 0.001)    # 0.1% of tile (was 0.3%)
+    max_area = h * w * 0.95               # almost entire tile is OK for sea/lake
 
     for cnt in contours:
-        if cv2.contourArea(cnt) >= min_area:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+        if area > max_area:
+            continue
+        # For medium-sized blobs, verify they have water-like color distribution
+        # (reject false positives from roads / gray buildings)
+        if area < h * w * 0.01:
+            # Small blob — check that average color is water-like
+            blob_mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.drawContours(blob_mask, [cnt], -1, 255, cv2.FILLED)
+            mean_r = np.mean(tile_rgb[:, :, 0][blob_mask > 0])
+            mean_g = np.mean(tile_rgb[:, :, 1][blob_mask > 0])
+            mean_b = np.mean(tile_rgb[:, :, 2][blob_mask > 0])
+            # Reject if clearly red/orange dominant (rust, roof)
+            if mean_r > mean_b + 30 and mean_r > mean_g + 20:
+                continue
+            # Reject if very bright and unsaturated (white roof/concrete)
+            if mean_r > 200 and mean_g > 200 and mean_b > 200:
+                continue
+        cv2.drawContours(result, [cnt], -1, 1, cv2.FILLED)
+
+    # =========================================================
+    # Fill holes inside detected water bodies (islands are rare
+    # at tile scale; holes are usually noise)
+    # =========================================================
+    if result.any():
+        flood = result.copy()
+        contours_fill, _ = cv2.findContours(flood, cv2.RETR_CCOMP,
+                                            cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours_fill:
             cv2.drawContours(result, [cnt], -1, 1, cv2.FILLED)
+
     return result
 
 
@@ -1154,9 +1325,24 @@ FEATURE_CONFIGS: Dict[str, List[Dict]] = {
     ],
     "water": [
         {
-            "prompt": "water, lake, river, pond, pool, sea",
-            "suffix": "water",
+            "prompt": "water, lake, pond, reservoir, pool",
+            "suffix": "water_bodies",
             "color": (28, 107, 160),      # BM_WATER #1C6BA0
+            "threshold": 0.03,            # lower threshold — water is hard for OWLv2
+            "color_detect": _color_detect_water,
+        },
+        {
+            "prompt": "river, stream, canal, waterway, channel",
+            "suffix": "water_channels",
+            "color": (28, 107, 160),      # BM_WATER #1C6BA0
+            "threshold": 0.03,
+            "color_detect": _color_detect_water,
+        },
+        {
+            "prompt": "sea, ocean, fish pond, swimming pool",
+            "suffix": "water_other",
+            "color": (28, 107, 160),      # BM_WATER #1C6BA0
+            "threshold": 0.03,
             "color_detect": _color_detect_water,
         },
     ],
@@ -1276,6 +1462,20 @@ def should_extract_feature(raster_path: str, feature_type: str) -> tuple:
         if ratio > 0.05:
             return True, f"field pixel ratio={ratio:.1%}"
         return False, f"no fields detected (green/yellow ratio={ratio:.1%}, threshold=5%)"
+
+    elif feature_type == "water":
+        # Water signature: blue-dominant, dark-blue, green-blue, or dark/low-brightness
+        # Very low threshold — we want to run extraction even if only a small portion is water
+        blue_dom = (b > r + 5) & (b > g - 15) & (b > 20)
+        dark_blue = (b >= r) & (brightness < 90) & (b > 15)
+        green_blue = (g > r) & (b > r) & (brightness < 150)
+        # Also catch very dark areas (deep water can appear almost black)
+        very_dark = (brightness < 40)
+        water_like = blue_dom | dark_blue | green_blue | very_dark
+        ratio = float(water_like.sum()) / n_valid
+        if ratio > 0.005:   # only 0.5% — very permissive, let color_detect decide
+            return True, f"water pixel ratio={ratio:.1%}"
+        return False, f"no water detected (water ratio={ratio:.1%}, threshold=0.5%)"
 
     return True, f"no filter for feature_type={feature_type!r}"
 
