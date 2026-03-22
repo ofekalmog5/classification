@@ -447,13 +447,6 @@ def extract_roads(
     tiles = _generate_tiles(width, height, tile_size, overlap)
     total_tiles = len(tiles)
 
-    # Quick RGB pre-filter
-    should_run, filter_reason = should_extract_feature(input_path, "roads")
-    print(f"[extract_roads] pre-filter for {Path(input_path).name}: "
-          f"{'RUN' if should_run else 'SKIP'} ({filter_reason})")
-    if not should_run:
-        return {"status": "skipped", "message": filter_reason}
-
     if progress_callback:
         progress_callback("Loading SAM 3 model", 0, total_tiles + 2)
 
@@ -484,7 +477,7 @@ def extract_roads(
 
                     # --- Run SAM text-prompted segmentation ---
                     try:
-                        mask_tile = _segment_tile(sam, sam_type, tile_rgb, text_prompt, threshold=0.08)
+                        mask_tile = _segment_tile(sam, sam_type, tile_rgb, text_prompt)
                     except Exception as tile_err:
                         print(f"[RoadExtract] Tile {idx+1}/{total_tiles} failed: {tile_err}")
                         mask_tile = np.zeros(tile_rgb.shape[:2], dtype=np.uint8)
@@ -527,7 +520,7 @@ def _segment_tile(
     sam_type: str,
     tile_rgb: np.ndarray,
     text_prompt: str,
-    threshold: float = 0.08,
+    threshold: float = 0.05,
 ) -> np.ndarray:
     """Run text-prompted segmentation on a single tile.
 
@@ -631,7 +624,7 @@ def _segment_tile_owlv2(
     sam_bundle: dict,
     tile_rgb: np.ndarray,
     text_prompt: str,
-    threshold: float = 0.08,
+    threshold: float = 0.05,
 ) -> np.ndarray:
     """Segment tile using OWLv2 (detection) + SAM2 (masks) via HuggingFace.
 
@@ -859,7 +852,12 @@ def merge_road_mask_onto_classification(
         cls_crs = cls_src.crs
         cls_bounds = cls_src.bounds
 
-    profile.update(driver="GTiff", compress="deflate")
+    # Force clean 3-band uint8 RGB — strip inherited photometric/predictor
+    profile.update(
+        driver="GTiff", dtype="uint8", count=3,
+        compress="deflate", photometric="rgb",
+    )
+    profile.pop("predictor", None)
 
     strip_h = 2048
     total_strips = math.ceil(height / strip_h)
@@ -884,8 +882,14 @@ def merge_road_mask_onto_classification(
             h = min(strip_h, height - row_start)
             cls_win = Window(0, row_start, width, h)
 
-            # Read RGB classification strip (C, H, W)
-            rgb = cls_src.read(window=cls_win)
+            # Read exactly 3 RGB bands from classification strip
+            src_bands = min(cls_src.count, 3)
+            raw = cls_src.read(list(range(1, src_bands + 1)), window=cls_win)
+            if src_bands < 3:
+                rgb = np.zeros((3, h, width), dtype=np.uint8)
+                rgb[:src_bands] = raw
+            else:
+                rgb = raw[:3].astype(np.uint8)
 
             if _same_grid:
                 # Same dimensions — read mask with same pixel window
@@ -927,11 +931,11 @@ def merge_road_mask_onto_classification(
 
             road_pixels = mask_band > 0
 
-            # Apply asphalt color where mask is 1
-            for band_idx in range(min(rgb.shape[0], 3)):
-                rgb[band_idx][road_pixels] = asphalt_color[band_idx]
+            # Apply exact asphalt color where mask is 1
+            for band_idx in range(3):
+                rgb[band_idx][road_pixels] = np.uint8(asphalt_color[band_idx])
 
-            dst.write(rgb, window=cls_win)
+            dst.write(rgb[:3], window=cls_win)
 
     if progress_callback:
         progress_callback("Done", total_strips, total_strips)
@@ -943,107 +947,226 @@ def merge_road_mask_onto_classification(
 # Feature extraction configs (prompt + merge color per sub-type)
 # Colors are RGB tuples matching MEA class hex codes
 # ---------------------------------------------------------------------------
+# Color + geometry based detectors (complement OWLv2 which struggles overhead)
+# ---------------------------------------------------------------------------
+
+def _color_detect_buildings(tile_rgb: np.ndarray) -> np.ndarray:
+    """Detect building roofs by color ranges + rectangular geometry.
+
+    OWLv2 struggles to recognise rooftops from orthophoto nadir view.
+    This function catches concrete, tile, greenhouse, and metal roofs
+    that the text-prompted model misses.
+
+    Returns binary mask (H, W) uint8 {0, 1}.
+    """
+    if not _CV2_AVAILABLE:
+        return np.zeros(tile_rgb.shape[:2], dtype=np.uint8)
+    h, w = tile_rgb.shape[:2]
+    hsv = cv2.cvtColor(tile_rgb, cv2.COLOR_RGB2HSV)
+    H, S, V = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+
+    # --- Roof color masks (HSV, OpenCV ranges: H 0-179, S 0-255, V 0-255) ---
+    # Concrete / gray roofs: low saturation, moderate brightness
+    concrete = (S < 40) & (V > 90) & (V < 215)
+    # Orange / red tile roofs: warm hue, saturated
+    tile = ((H < 15) | (H > 170)) & (S > 50) & (V > 80)
+    # White / bright roofs (greenhouses, painted): very bright, low sat
+    white = (V > 210) & (S < 35)
+    # Metal roofs: slight blue-gray, moderate brightness
+    metal = (S < 35) & (V > 120) & (V < 200)
+
+    candidates = (concrete | tile | white | metal).astype(np.uint8)
+
+    # Morphological clean-up
+    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    candidates = cv2.morphologyEx(candidates, cv2.MORPH_OPEN, k_open)
+    candidates = cv2.morphologyEx(candidates, cv2.MORPH_CLOSE, k_close)
+
+    contours, _ = cv2.findContours(candidates, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    result = np.zeros((h, w), dtype=np.uint8)
+    min_area = max(300, h * w * 0.0015)   # ~0.15 % of tile
+    max_area = h * w * 0.35               # not more than 35 % of tile
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area or area > max_area:
+            continue
+        hull = cv2.convexHull(cnt)
+        hull_area = cv2.contourArea(hull)
+        if hull_area == 0:
+            continue
+        solidity = area / hull_area
+        if solidity < 0.55:         # buildings are compact
+            continue
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        aspect = max(bw, bh) / max(min(bw, bh), 1)
+        if aspect > 7:              # too elongated → road / fence
+            continue
+        extent = area / max(bw * bh, 1)
+        if extent < 0.35:           # buildings fill their bounding box
+            continue
+        cv2.drawContours(result, [cnt], -1, 1, cv2.FILLED)
+    return result
+
+
+def _color_detect_trees(tile_rgb: np.ndarray) -> np.ndarray:
+    """Detect tree canopy regions by dark-green color.
+
+    Trees from above appear as dark-to-medium green blobs.
+    Returns binary mask (H, W) uint8 {0, 1}.
+    """
+    if not _CV2_AVAILABLE:
+        return np.zeros(tile_rgb.shape[:2], dtype=np.uint8)
+    h, w = tile_rgb.shape[:2]
+    hsv = cv2.cvtColor(tile_rgb, cv2.COLOR_RGB2HSV)
+    H, S, V = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+
+    # Dark-to-medium green (tree canopy, not bright lawn)
+    green_mask = (H > 25) & (H < 90) & (S > 30) & (V > 25) & (V < 170)
+    green = green_mask.astype(np.uint8)
+
+    # Clean-up: open to remove speckle, close to merge canopy
+    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    green = cv2.morphologyEx(green, cv2.MORPH_OPEN, k_open)
+    green = cv2.morphologyEx(green, cv2.MORPH_CLOSE, k_close)
+
+    # Keep only clusters (≥ a few trees together)
+    contours, _ = cv2.findContours(green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    result = np.zeros((h, w), dtype=np.uint8)
+    min_area = max(400, h * w * 0.002)    # cluster of trees, not a single bush
+
+    for cnt in contours:
+        if cv2.contourArea(cnt) >= min_area:
+            cv2.drawContours(result, [cnt], -1, 1, cv2.FILLED)
+    return result
+
+
+def _color_detect_water(tile_rgb: np.ndarray) -> np.ndarray:
+    """Detect water bodies by blue-dominant / dark-blue color.
+
+    Water from above: lakes, fish pools, sea, rivers look dark blue or
+    greenish-blue.  Returns binary mask (H, W) uint8 {0, 1}.
+    """
+    if not _CV2_AVAILABLE:
+        return np.zeros(tile_rgb.shape[:2], dtype=np.uint8)
+    h, w = tile_rgb.shape[:2]
+    r = tile_rgb[:, :, 0].astype(np.int16)
+    g = tile_rgb[:, :, 1].astype(np.int16)
+    b = tile_rgb[:, :, 2].astype(np.int16)
+
+    # Blue-dominant: B > R and B > G (or B close to G for greenish water)
+    blue_dom = (b > r + 15) & (b > g - 10) & (b > 40)
+    # Also detect dark water: low brightness, slight blue
+    dark_water = ((r + g + b) < 180) & (b >= r) & (b > 30)
+    # Turquoise pools: high G+B, low R
+    turquoise = (g > 80) & (b > 80) & (r < g - 15)
+
+    water = (blue_dom | dark_water | turquoise).astype(np.uint8)
+
+    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    water = cv2.morphologyEx(water, cv2.MORPH_OPEN, k_open)
+    water = cv2.morphologyEx(water, cv2.MORPH_CLOSE, k_close)
+
+    # Keep only substantial water bodies
+    contours, _ = cv2.findContours(water, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    result = np.zeros((h, w), dtype=np.uint8)
+    min_area = max(500, h * w * 0.003)
+
+    for cnt in contours:
+        if cv2.contourArea(cnt) >= min_area:
+            cv2.drawContours(result, [cnt], -1, 1, cv2.FILLED)
+    return result
+
+
+def _color_detect_fields(tile_rgb: np.ndarray) -> np.ndarray:
+    """Detect green fields / agriculture by bright-green color + large uniform area.
+
+    Fields from above: bright green (grass, lawn, crops) or yellow-green
+    (dry/ripe crops).  Returns binary mask (H, W) uint8 {0, 1}.
+    """
+    if not _CV2_AVAILABLE:
+        return np.zeros(tile_rgb.shape[:2], dtype=np.uint8)
+    h, w = tile_rgb.shape[:2]
+    hsv = cv2.cvtColor(tile_rgb, cv2.COLOR_RGB2HSV)
+    H, S, V = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+
+    # Bright-to-medium green (lawn, crop, pasture) — brighter than tree canopy
+    green = (H > 25) & (H < 85) & (S > 20) & (V > 60) & (V < 240)
+    # Yellow-green (dry grass, ripe crop)
+    yellow_green = (H > 18) & (H < 35) & (S > 25) & (V > 80)
+
+    fields = (green | yellow_green).astype(np.uint8)
+
+    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    fields = cv2.morphologyEx(fields, cv2.MORPH_OPEN, k_open)
+    fields = cv2.morphologyEx(fields, cv2.MORPH_CLOSE, k_close)
+
+    # Keep only large areas (fields are big, not bushes)
+    contours, _ = cv2.findContours(fields, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    result = np.zeros((h, w), dtype=np.uint8)
+    min_area = max(800, h * w * 0.005)    # at least 0.5 % of tile
+
+    for cnt in contours:
+        if cv2.contourArea(cnt) >= min_area:
+            cv2.drawContours(result, [cnt], -1, 1, cv2.FILLED)
+    return result
+
+
+# ---------------------------------------------------------------------------
 
 FEATURE_CONFIGS: Dict[str, List[Dict]] = {
-    # threshold: OWLv2 detection confidence threshold (higher = fewer false positives)
+    # Two detection strategies per feature:
+    #   1) OWLv2+SAM text-prompted segmentation (prompt)
+    #   2) Color+geometry CV detection (color_detect) — catches what OWLv2 misses
+    # Results are unioned (OR) per tile.
     "roads": [
         {
-            # Paved / asphalt roads — use simple common terms OWLv2 recognises well
-            "prompt": "road, street, highway, road surface, asphalt road, paved road",
-            "suffix": "roads_asphalt",
+            "prompt": "road, highway, asphalt path",
+            "suffix": "roads",
             "color": (45, 45, 48),       # BM_ASPHALT #2D2D30
-            "threshold": 0.08,
-            "border_extend": 60,
-        },
-        {
-            # Dirt / unpaved roads — simple terms, lower confidence threshold
-            "prompt": "dirt road, gravel road, unpaved road, path, track",
-            "suffix": "roads_dirt",
-            "color": (130, 123, 115),    # BM_ROCK #827B73
-            "threshold": 0.06,
-            "border_extend": 60,
         },
     ],
-    # Buildings: 3 sub-types using simple terms OWLv2 was trained on.
-    # Specific material terms ("bitumen roof", "tiled rooftop") are rare in CLIP
-    # training data and get near-zero confidence from above. Broad common terms work
-    # much better. Threshold lowered to 0.04 — aerial roof detection is harder.
     "buildings": [
         {
-            # Houses, homes, general residential — most common OWLv2 vocabulary
-            "prompt": "house, building, rooftop, residential building, home",
-            "suffix": "bldg_residential",
+            "prompt": "building, house, roof, rooftop, structure",
+            "suffix": "buildings",
             "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
-            "threshold": 0.04,
-        },
-        {
-            # Warehouses, factories — large flat-roof industrial buildings
-            "prompt": "warehouse, factory, industrial building, commercial building, shed",
-            "suffix": "bldg_industrial",
-            "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
-            "threshold": 0.04,
-        },
-        {
-            # Visually distinctive roofs recognisable by color/texture
-            "prompt": "red roof, tile roof, orange roof, solar panels, greenhouse",
-            "suffix": "bldg_distinctive",
-            "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
-            "threshold": 0.04,
+            "threshold": 0.02,
+            "color_detect": _color_detect_buildings,
         },
     ],
-    # Vegetation is split into two separate feature types:
-    # "trees"  — tree canopy / forest → BM_VEGETATION (dark green)
-    # "fields" — grass / dry grass / shrubs → BM_LAND_GRASS, BM_LAND_DRY_GRASS, BM_FOLIAGE
-    #
-    # Trees from orthophotos look like circular/irregular dark-green blobs from above.
-    # OWLv2 was trained on eye-level images, so we split into 3 sub-types with
-    # aerial-perspective phrasing to maximise recall. Threshold is lowered to 0.05.
     "trees": [
         {
-            # Isolated urban/suburban trees — distinct circular crowns visible from above
-            "prompt": "tree crown, tree canopy, tree top, circular tree canopy, isolated tree from above, lone tree aerial view, single tree top view",
-            "suffix": "trees_isolated",
+            "prompt": "tree, trees, forest, woodland, grove",
+            "suffix": "trees",
             "color": (34, 139, 34),       # BM_VEGETATION #228B22
-            "threshold": 0.05,
-        },
-        {
-            # Dense forest / grove — large continuous green canopy patches
-            "prompt": "forest canopy, dense forest, woodland canopy, grove of trees, treetops aerial, forest from above, wooded area top view",
-            "suffix": "trees_forest",
-            "color": (34, 139, 34),       # BM_VEGETATION #228B22
-            "threshold": 0.05,
-        },
-        {
-            # Orchards and planted tree rows — common in Mediterranean/agricultural orthophotos
-            "prompt": "orchard aerial view, olive grove, fruit trees from above, tree rows, agricultural trees, row trees top view, planted trees",
-            "suffix": "trees_orchard",
-            "color": (34, 139, 34),       # BM_VEGETATION #228B22
-            "threshold": 0.05,
+            "color_detect": _color_detect_trees,
         },
     ],
-    # Fields: flat low vegetation viewed from above in orthophotos.
-    # Prompts describe the aerial appearance — flat uniform patches, not eye-level vegetation.
     "fields": [
         {
-            # Green grass / lawn — flat, bright uniform green from above (parks, sports fields, verges)
-            "prompt": "grass field from above, lawn aerial view, green field top view, park grass aerial, sports field aerial, flat green vegetation, green open area",
+            "prompt": "grass, lawn, field, meadow, pasture",
             "suffix": "fields_grass",
             "color": (124, 252, 0),       # BM_LAND_GRASS #7CFC00
-            "threshold": 0.05,
+            "color_detect": _color_detect_fields,
         },
         {
-            # Dry / arid grass — flat yellowish-brown patches, no vertical structure
-            "prompt": "dry grass field aerial, yellow field from above, arid land top view, dry vegetation patch, brown field aerial, straw field top view, dry open land",
-            "suffix": "fields_dry_grass",
+            "prompt": "crop, farmland, agriculture, cultivated field",
+            "suffix": "fields_agriculture",
             "color": (189, 183, 107),     # BM_LAND_DRY_GRASS #BDB76B
-            "threshold": 0.05,
+            "color_detect": _color_detect_fields,
         },
+    ],
+    "water": [
         {
-            # Low shrubs / scrubland — bumpy low green texture, between grass and tree canopy height
-            "prompt": "low shrubs aerial view, scrubland from above, bush patch top view, low vegetation aerial, mediterranean scrub aerial, green scrub patch, low bush field",
-            "suffix": "fields_foliage",
-            "color": (0, 100, 0),         # BM_FOLIAGE #006400
-            "threshold": 0.05,
+            "prompt": "water, lake, river, pond, pool, sea",
+            "suffix": "water",
+            "color": (28, 107, 160),      # BM_WATER #1C6BA0
+            "color_detect": _color_detect_water,
         },
     ],
 }
@@ -1198,18 +1321,6 @@ def extract_feature_masks(
     mask_paths: List[str] = []
     colors: List[Tuple[int, int, int]] = []
 
-    # Quick RGB pre-filter — skip SAM entirely if image doesn't contain this feature
-    should_run, filter_reason = should_extract_feature(input_path, feature_type)
-    print(f"[extract_feature_masks] {feature_type} pre-filter for {inp.name}: "
-          f"{'RUN' if should_run else 'SKIP'} ({filter_reason})")
-    if not should_run:
-        return {
-            "status": "skipped",
-            "message": filter_reason,
-            "maskPaths": [],
-            "colors": [],
-        }
-
     # Load SAM model once, reuse for all sub-prompts
     if progress_callback:
         progress_callback("Loading SAM model", 0, n * 100 + 2)
@@ -1219,8 +1330,9 @@ def extract_feature_masks(
         suffix = cfg["suffix"]
         color = cfg["color"]
         prompt = cfg["prompt"]
-        thresh = cfg.get("threshold", 0.08)
+        thresh = cfg.get("threshold", 0.05)
         border_ext = cfg.get("border_extend", 0)
+        color_detect_fn = cfg.get("color_detect", None)
 
         if output_path is None:
             out = str(inp.with_name(f"{inp.stem}_{suffix}.tif"))
@@ -1249,10 +1361,13 @@ def extract_feature_masks(
             extend_borders_px=border_ext,
             color=color,
             progress_callback=_cb,
+            color_detect_fn=color_detect_fn,
         )
         if result.get("status") == "ok":
             mask_paths.append(result["outputPath"])
             colors.append(color)
+        elif result.get("status") == "empty":
+            print(f"[extract_feature_masks] {suffix}: no features found — no raster exported")
         else:
             print(f"[extract_feature_masks] Sub-extraction {suffix} failed: {result.get('message')}")
 
@@ -1327,7 +1442,10 @@ def _colorize_mask(mask_path: str, color: Tuple[int, int, int]) -> None:
         with rasterio.open(mask_path) as src:
             binary = src.read(1)
             profile = src.profile.copy()
-        profile.update(count=3, dtype="uint8", nodata=None)
+        # Force clean RGB profile — no inherited photometric/predictor
+        # that could alter pixel values on write.
+        profile.update(count=3, dtype="uint8", nodata=None, photometric="rgb")
+        profile.pop("predictor", None)
         with rasterio.open(tmp, "w", **profile) as dst:
             for band_idx, c in enumerate(color):
                 dst.write(
@@ -1353,12 +1471,20 @@ def _run_single_extraction(
     tile_size: int = 1024,
     overlap_pct: float = 0.1,
     closing_kernel_size: int = 15,
-    threshold: float = 0.08,
+    threshold: float = 0.05,
     extend_borders_px: int = 0,
     color: Tuple[int, int, int] = (255, 255, 255),
     progress_callback: Optional[Callable] = None,
+    color_detect_fn: Optional[Callable] = None,
 ) -> Dict[str, object]:
-    """Run a single SAM text-prompted mask extraction (reuses an already-loaded model)."""
+    """Run a single SAM text-prompted mask extraction (reuses an already-loaded model).
+
+    If *color_detect_fn* is provided, it runs on each tile and its result is
+    unioned (OR) with the SAM mask — this catches features that OWLv2 misses.
+
+    Returns ``{"status": "ok", "outputPath": ...}`` when features are found,
+    or ``{"status": "empty"}`` when the mask is entirely blank (no raster written).
+    """
     with rasterio.open(input_path) as src:
         profile = src.profile.copy()
         width = src.width
@@ -1369,6 +1495,7 @@ def _run_single_extraction(
     tiles = _generate_tiles(width, height, tile_size, overlap)
     total_tiles = len(tiles)
 
+    has_any_feature = False
     tmp_mask_path = output_path + ".tmp_raw.tif"
     try:
         with rasterio.open(tmp_mask_path, "w", **profile) as dst:
@@ -1384,10 +1511,26 @@ def _run_single_extraction(
                     except Exception as tile_err:
                         print(f"[Extract] Tile {idx+1}/{total_tiles} failed: {tile_err}")
                         mask_tile = np.zeros(tile_rgb.shape[:2], dtype=np.uint8)
+
+                    # Union with color+geometry detection (catches what OWLv2 misses)
+                    if color_detect_fn is not None:
+                        try:
+                            color_mask = color_detect_fn(tile_rgb)
+                            mask_tile = np.logical_or(mask_tile > 0, color_mask > 0).astype(np.uint8)
+                        except Exception as cd_err:
+                            print(f"[Extract] Color detect tile {idx+1} failed: {cd_err}")
+
+                    if mask_tile.any():
+                        has_any_feature = True
                     w_h = write_win.height
                     w_w = write_win.width
                     inner_mask = mask_tile[inner_row: inner_row + w_h, inner_col: inner_col + w_w]
                     dst.write(inner_mask.astype(np.uint8)[np.newaxis, :, :], window=write_win)
+
+        # No features detected anywhere — skip raster export
+        if not has_any_feature:
+            print(f"[Extract] No features found for prompt={text_prompt!r} — skipping raster export")
+            return {"status": "empty", "message": f"No features found for: {text_prompt}"}
 
         if progress_callback:
             progress_callback("Closing", total_tiles, total_tiles + 1)
@@ -1482,7 +1625,12 @@ def merge_feature_masks_onto_classification(
         cls_transform = cls_src.transform
         cls_crs = cls_src.crs
 
-    profile.update(driver="GTiff", compress="deflate")
+    # Force clean 3-band uint8 RGB output — strip inherited photometric/predictor
+    profile.update(
+        driver="GTiff", dtype="uint8", count=3,
+        compress="deflate", photometric="rgb",
+    )
+    profile.pop("predictor", None)
 
     strip_h = 2048
     total_strips = math.ceil(height / strip_h)
@@ -1512,7 +1660,14 @@ def merge_feature_masks_onto_classification(
                 row_start = strip_idx * strip_h
                 h = min(strip_h, height - row_start)
                 cls_win = Window(0, row_start, width, h)
-                rgb = cls_src.read(window=cls_win)
+                # Read exactly 3 RGB bands
+                src_bands = min(cls_src.count, 3)
+                raw = cls_src.read(list(range(1, src_bands + 1)), window=cls_win)
+                if src_bands < 3:
+                    rgb = np.zeros((3, h, width), dtype=np.uint8)
+                    rgb[:src_bands] = raw
+                else:
+                    rgb = raw[:3].astype(np.uint8)
 
                 for mask_src, color, same_grid in zip(mask_srcs, colors, same_grids):
                     if same_grid:
@@ -1547,10 +1702,10 @@ def merge_feature_masks_onto_classification(
                         except Exception:
                             feature_pixels = np.zeros((h, width), dtype=bool)
 
-                    for band_idx in range(min(rgb.shape[0], 3)):
-                        rgb[band_idx][feature_pixels] = color[band_idx]
+                    for band_idx in range(3):
+                        rgb[band_idx][feature_pixels] = np.uint8(color[band_idx])
 
-                dst.write(rgb, window=cls_win)
+                dst.write(rgb[:3], window=cls_win)
     finally:
         for ms in mask_srcs:
             ms.close()

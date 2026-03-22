@@ -70,12 +70,12 @@ if not exist "web_app\dist\index.html" (
 )
 
 REM ================================================================
-REM  2. Copy backend source
+REM  2. Copy backend source (skip __pycache__)
 REM ================================================================
 set /a STEP+=1
 echo.
 echo [%STEP%] Copying backend source...
-robocopy "backend" "%DEST%\backend" /MIR /NFL /NDL /NJH /NJS /nc /ns /np
+robocopy "backend" "%DEST%\backend" /MIR /XD __pycache__ /NFL /NDL /NJH /NJS /nc /ns /np
 echo     Done.
 
 REM ================================================================
@@ -88,12 +88,25 @@ robocopy "web_app\dist" "%DEST%\web_app\dist" /MIR /NFL /NDL /NJH /NJS /nc /ns /
 echo     Done.
 
 REM ================================================================
-REM  4. Copy .venv
+REM  3b. Copy shared/ contracts
+REM ================================================================
+set /a STEP+=1
+echo.
+echo [%STEP%] Copying shared contracts...
+if exist "shared" (
+    robocopy "shared" "%DEST%\shared" /MIR /XD __pycache__ /NFL /NDL /NJH /NJS /nc /ns /np
+    echo     Done.
+) else (
+    echo     No shared/ folder - skipping.
+)
+
+REM ================================================================
+REM  4. Copy .venv (skip __pycache__)
 REM ================================================================
 set /a STEP+=1
 echo.
 echo [%STEP%] Copying Python venv (~1.5 GB, this may take a while)...
-robocopy ".venv" "%DEST%\.venv" /MIR /NFL /NDL /NJH /NJS /nc /ns /np
+robocopy ".venv" "%DEST%\.venv" /MIR /XD __pycache__ /NFL /NDL /NJH /NJS /nc /ns /np
 echo     Done.
 
 REM ================================================================
@@ -122,7 +135,7 @@ echo [%STEP%] Checking for SAM3 local repo...
 set SAM3_SRC=%~dp0..\sam3-main
 if exist "%SAM3_SRC%\sam3" (
     echo     Found sam3-main - copying...
-    robocopy "%SAM3_SRC%" "%DEST%\sam3-main" /MIR /NFL /NDL /NJH /NJS /nc /ns /np
+    robocopy "%SAM3_SRC%" "%DEST%\sam3-main" /MIR /XD __pycache__ /NFL /NDL /NJH /NJS /nc /ns /np
     echo     Done.
 ) else (
     echo     sam3-main not found next to project - skipping.
@@ -137,7 +150,12 @@ echo.
 echo [%STEP%] Copying launchers and config files...
 for %%F in (
     start.bat
+    start_webapp.bat
     launcher.py
+    server_launcher.py
+    setup_and_validate.py
+    app_config.json
+    copy_to_station.bat
     build_exe.bat
     STANDALONE_DEPLOYMENT.md
 ) do (
@@ -151,6 +169,16 @@ REM Copy exe if it was already built
 if exist "ClassificationWebApp.exe" (
     copy /Y "ClassificationWebApp.exe" "%DEST%\ClassificationWebApp.exe" >nul
     echo     Copied ClassificationWebApp.exe
+)
+REM Copy .spec files for PyInstaller builds on station
+for %%S in (*.spec) do (
+    copy /Y "%%S" "%DEST%\%%S" >nul
+    echo     Copied %%S
+)
+REM Copy pyinstaller hooks if present
+if exist "pyinstaller_hooks" (
+    robocopy "pyinstaller_hooks" "%DEST%\pyinstaller_hooks" /MIR /XD __pycache__ /NFL /NDL /NJH /NJS /nc /ns /np
+    echo     Copied pyinstaller_hooks\
 )
 
 REM ================================================================
@@ -172,19 +200,19 @@ if exist "Resources" (
 )
 
 REM ================================================================
-REM  9. Write a quick HF cache path config so server finds models
+REM  9. Write app_config.json at project root (where config.py reads it)
 REM ================================================================
 set /a STEP+=1
 echo.
 echo [%STEP%] Writing app config for offline model path...
-if not exist "%DEST%\backend\app" mkdir "%DEST%\backend\app"
 (
 echo {
+echo   "sam3_local_dir": "sam3-main",
 echo   "hf_cache_dir": "models/hf_cache",
 echo   "offline_mode": true
 echo }
-) > "%DEST%\backend\app\app_config.json"
-echo     Written backend\app\app_config.json
+) > "%DEST%\app_config.json"
+echo     Written app_config.json (project root)
 
 REM ================================================================
 REM  Done

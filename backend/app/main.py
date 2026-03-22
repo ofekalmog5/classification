@@ -687,7 +687,7 @@ def merge_road_mask(request: MergeRoadMaskRequest) -> dict:
 
 class ExtractFeaturesRequest(BaseModel):
     rasterPath: str
-    featureType: str  # "roads" | "buildings" | "vegetation"
+    featureType: str  # "roads" | "buildings" | "trees" | "fields" | "water"
     outputPath: str | None = None
     tileSize: int = 1024
     overlapPct: float = 0.1

@@ -38,6 +38,7 @@ export default function ActionsSection() {
   const [buildingMasks, setBuildingMasks] = useState<ExtractFeaturesResult | null>(null);
   const [treeMasks, setTreeMasks] = useState<ExtractFeaturesResult | null>(null);
   const [fieldsMasks, setFieldsMasks] = useState<ExtractFeaturesResult | null>(null);
+  const [waterMasks, setWaterMasks] = useState<ExtractFeaturesResult | null>(null);
   const [roadConfig, setRoadConfig] = useState<RoadExtractConfig | null>(null);
   const [sam3PathInput, setSam3PathInput] = useState("");
   // All classification output paths from the last run (one per input image / tile-dir).
@@ -45,7 +46,7 @@ export default function ActionsSection() {
   const [classificationPaths, setClassificationPaths] = useState<string[]>([]);
   // Which feature types to extract when running "Extract Selected Features"
   const [extractSelected, setExtractSelected] = useState({
-    roads: true, buildings: true, trees: true, fields: true,
+    roads: true, buildings: true, trees: true, fields: true, water: true,
   });
 
   const handleCancel = useCallback(async () => {
@@ -455,11 +456,12 @@ export default function ActionsSection() {
     if (rasterFiles.length === 0 && state.rasterPath) rasterFiles.push(state.rasterPath);
     if (rasterFiles.length === 0) return alert("Select a raster image first.");
 
-    const toExtract: Array<{ type: "roads" | "buildings" | "trees" | "fields"; label: string }> = [];
+    const toExtract: Array<{ type: "roads" | "buildings" | "trees" | "fields" | "water"; label: string }> = [];
     if (extractSelected.roads)     toExtract.push({ type: "roads",     label: "Roads" });
     if (extractSelected.buildings) toExtract.push({ type: "buildings", label: "Buildings" });
     if (extractSelected.trees)     toExtract.push({ type: "trees",     label: "Trees" });
     if (extractSelected.fields)    toExtract.push({ type: "fields",    label: "Fields" });
+    if (extractSelected.water)     toExtract.push({ type: "water",     label: "Water" });
     if (toExtract.length === 0) return alert("Select at least one feature type.");
 
     runStartRef.current = Date.now();
@@ -505,10 +507,11 @@ export default function ActionsSection() {
 
         if (allMaskPaths.length > 0) {
           const combined: ExtractFeaturesResult = { status: "ok", maskPaths: allMaskPaths, colors: allColors };
-          if (type === "roads")     setRoadMasks(combined);
+          if (type === "roads")          setRoadMasks(combined);
           else if (type === "buildings") setBuildingMasks(combined);
           else if (type === "trees")     setTreeMasks(combined);
-          else                           setFieldsMasks(combined);
+          else if (type === "fields")    setFieldsMasks(combined);
+          else if (type === "water")     setWaterMasks(combined);
           const skippedMsg = skippedCount > 0 ? ` (${skippedCount} skipped)` : "";
           addResultsToGroup(`${label} Masks`, allMaskPaths);
           dispatch({ type: "SET_STATUS", text: `${label}: ${allMaskPaths.length} mask(s)${skippedMsg}` });
@@ -593,7 +596,7 @@ export default function ActionsSection() {
     handleMergeFeature(roadMasks, "Roads");
   };
 
-  const handleExtractFeature = async (featureType: "buildings" | "trees" | "fields", label: string) => {
+  const handleExtractFeature = async (featureType: "buildings" | "trees" | "fields" | "water", label: string) => {
     const rasterFiles = getRasterFiles();
     if (rasterFiles.length === 0 && state.rasterPath) rasterFiles.push(state.rasterPath);
     if (rasterFiles.length === 0) return alert("Select a raster image first.");
@@ -641,7 +644,8 @@ export default function ActionsSection() {
         const combined: ExtractFeaturesResult = { status: "ok", maskPaths: allMaskPaths, colors: allColors };
         if (featureType === "buildings") setBuildingMasks(combined);
         else if (featureType === "trees") setTreeMasks(combined);
-        else setFieldsMasks(combined);
+        else if (featureType === "fields") setFieldsMasks(combined);
+        else if (featureType === "water") setWaterMasks(combined);
         dispatch({ type: "SET_STATUS", text: `${label} extracted: ${allMaskPaths.length} mask(s) (${elapsed})${skippedMsg}` });
         addResultsToGroup(`${label} Masks`, allMaskPaths);
       } else {
@@ -739,6 +743,7 @@ export default function ActionsSection() {
     if (buildingMasks?.maskPaths) { allMaskPaths.push(...buildingMasks.maskPaths); allColors.push(...buildingMasks.colors!); }
     if (treeMasks?.maskPaths) { allMaskPaths.push(...treeMasks.maskPaths); allColors.push(...treeMasks.colors!); }
     if (fieldsMasks?.maskPaths) { allMaskPaths.push(...fieldsMasks.maskPaths); allColors.push(...fieldsMasks.colors!); }
+    if (waterMasks?.maskPaths) { allMaskPaths.push(...waterMasks.maskPaths); allColors.push(...waterMasks.colors!); }
     if (!allMaskPaths.length) return alert("Extract at least one feature first.");
 
     runStartRef.current = Date.now();
@@ -869,6 +874,7 @@ export default function ActionsSection() {
             { key: "buildings", label: "Buildings" },
             { key: "trees",     label: "Trees" },
             { key: "fields",    label: "Fields" },
+            { key: "water",     label: "Water" },
           ] as const).map(({ key, label }) => (
             <label key={key} className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
               <input
@@ -917,13 +923,19 @@ export default function ActionsSection() {
             disabled={isRunning || !fieldsMasks || (classificationPaths.length === 0 && !state.lastResultPath)}
             color="amber"
           />
+          <ActionBtn
+            label="Merge Water"
+            onClick={() => handleMergeFeature(waterMasks, "Water")}
+            disabled={isRunning || !waterMasks || (classificationPaths.length === 0 && !state.lastResultPath)}
+            color="amber"
+          />
         </div>
 
         {/* Merge All */}
         <ActionBtn
           label="Merge All Features"
           onClick={handleMergeAll}
-          disabled={isRunning || (!roadMasks && !buildingMasks && !treeMasks && !fieldsMasks) || (classificationPaths.length === 0 && !state.lastResultPath)}
+          disabled={isRunning || (!roadMasks && !buildingMasks && !treeMasks && !fieldsMasks && !waterMasks) || (classificationPaths.length === 0 && !state.lastResultPath)}
           color="orange"
           full
         />
@@ -941,6 +953,9 @@ export default function ActionsSection() {
           </span>
           <span className={fieldsMasks ? "text-green-500" : ""}>
             {fieldsMasks ? `✓ Fields (${fieldsMasks.maskPaths?.length})` : "· Fields"}
+          </span>
+          <span className={waterMasks ? "text-green-500" : ""}>
+            {waterMasks ? `✓ Water (${waterMasks.maskPaths?.length})` : "· Water"}
           </span>
         </div>
 
