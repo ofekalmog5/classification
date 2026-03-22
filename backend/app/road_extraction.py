@@ -412,19 +412,14 @@ def extract_roads(
     input_path = str(input_path)
     inp = Path(input_path)
 
-    # Handle output path - ensure it's a valid .tif file path
+    # Output goes into a _roads/ subfolder
     if output_path is None:
-        output_path = str(inp.with_name(f"{inp.stem}_roads.tif"))
+        road_dir = inp.parent / "_roads"
     else:
         outp = Path(output_path)
-        if outp.is_dir():
-            # Directory provided - create filename inside it
-            output_path = str(outp / f"{inp.stem}_roads.tif")
-        elif not outp.suffix or outp.suffix.lower() not in ['.tif', '.tiff']:
-            # No extension or wrong extension - add .tif
-            output_path = str(outp.with_suffix('.tif'))
-        else:
-            output_path = str(outp)
+        road_dir = (outp if outp.is_dir() else outp.parent) / "_roads"
+    road_dir.mkdir(parents=True, exist_ok=True)
+    output_path = str(road_dir / f"{inp.stem}_roads.tif")
 
     # --- open source raster metadata ---
     with rasterio.open(input_path) as src:
@@ -820,26 +815,22 @@ def merge_road_mask_onto_classification(
                 print(f"  [warn] Tile {tf.name} merge failed: {tile_result.get('message')}")
         if progress_callback:
             progress_callback("Merging road mask", len(tile_files), len(tile_files))
+        merged_dir = cls_path / "_merged"
         return {
             "status": "ok",
-            "outputPath": str(cls_path),
+            "outputPath": str(merged_dir),
             "tileOutputs": merged_outputs,
             "message": f"Road mask merged onto {len(merged_outputs)}/{len(tile_files)} tiles",
         }
 
-    # Handle output path - ensure it's a valid .tif file path
+    # Output goes into a _merged/ subfolder
     if output_path is None:
-        output_path = str(cls_path.with_name(f"{cls_path.stem}_roads_merged.tif"))
+        merge_dir = cls_path.parent / "_merged"
     else:
         outp = Path(output_path)
-        if outp.is_dir():
-            # Directory provided - create filename inside it
-            output_path = str(outp / f"{cls_path.stem}_roads_merged.tif")
-        elif not outp.suffix or outp.suffix.lower() not in ['.tif', '.tiff']:
-            # No extension or wrong extension - add .tif
-            output_path = str(outp.with_suffix('.tif'))
-        else:
-            output_path = str(outp)
+        merge_dir = (outp if outp.is_dir() else outp.parent) / "_merged"
+    merge_dir.mkdir(parents=True, exist_ok=True)
+    output_path = str(merge_dir / f"{cls_path.stem}_roads_merged.tif")
 
     from rasterio.windows import from_bounds as window_from_bounds
     import numpy as np
@@ -1334,15 +1325,14 @@ def extract_feature_masks(
         border_ext = cfg.get("border_extend", 0)
         color_detect_fn = cfg.get("color_detect", None)
 
+        # Output goes into a _<feature_type>/ subfolder
         if output_path is None:
-            out = str(inp.with_name(f"{inp.stem}_{suffix}.tif"))
+            feature_dir = inp.parent / f"_{feature_type}"
         else:
             outp = Path(output_path)
-            if outp.is_dir():
-                out = str(outp / f"{inp.stem}_{suffix}.tif")
-            else:
-                # Use stem of provided path + suffix
-                out = str(outp.with_name(f"{outp.stem}_{suffix}.tif"))
+            feature_dir = (outp if outp.is_dir() else outp.parent) / f"_{feature_type}"
+        feature_dir.mkdir(parents=True, exist_ok=True)
+        out = str(feature_dir / f"{inp.stem}_{suffix}.tif")
 
         def _cb(phase: str, done: int, total: int, _i: int = i, _n: int = n) -> None:
             if progress_callback:
@@ -1603,17 +1593,17 @@ def merge_feature_masks_onto_classification(
                 print(f"  [warn] Tile {tf.name} failed: {r.get('message')}")
         if progress_callback:
             progress_callback("Done", len(tile_files), len(tile_files))
-        return {"status": "ok", "outputPath": str(cls_path), "tileOutputs": merged_outputs}
+        merged_dir = cls_path / "_merged"
+        return {"status": "ok", "outputPath": str(merged_dir), "tileOutputs": merged_outputs}
 
-    # Resolve output path
+    # Output goes into a _merged/ subfolder
     if output_path is None:
-        output_path = str(cls_path.with_name(f"{cls_path.stem}_features_merged.tif"))
+        merge_dir = cls_path.parent / "_merged"
     else:
         outp = Path(output_path)
-        if outp.is_dir():
-            output_path = str(outp / f"{cls_path.stem}_features_merged.tif")
-        elif not outp.suffix or outp.suffix.lower() not in (".tif", ".tiff"):
-            output_path = str(outp.with_suffix(".tif"))
+        merge_dir = (outp if outp.is_dir() else outp.parent) / "_merged"
+    merge_dir.mkdir(parents=True, exist_ok=True)
+    output_path = str(merge_dir / f"{cls_path.stem}_features_merged.tif")
 
     from rasterio.windows import from_bounds as window_from_bounds
     import numpy as np
