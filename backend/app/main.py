@@ -216,6 +216,23 @@ app.add_middleware(
 )
 
 
+# ─── /api prefix middleware (standalone production mode) ──────────────────
+# In development, Vite's proxy strips "/api" before forwarding to FastAPI.
+# In production (uvicorn serving static files directly), the browser calls
+# /api/xxx so we strip the prefix here instead.
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class _StripApiPrefix(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        if request.scope.get("path", "").startswith("/api"):
+            stripped = request.scope["path"][4:] or "/"
+            request.scope["path"] = stripped
+            request.scope["raw_path"] = stripped.encode()
+        return await call_next(request)
+
+app.add_middleware(_StripApiPrefix)
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
