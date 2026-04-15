@@ -1,0 +1,6 @@
+;!@Install@!UTF-8!
+Title="Classification Web App Setup"
+BeginPrompt="Classification Web App Installer\nClick OK to launch the installation wizard."
+RunProgram="ClassificationInstaller.exe"
+GUIFlags="8"
+;!@InstallEnd@!

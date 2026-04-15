@@ -1,157 +1,168 @@
 # Standalone Station Deployment Guide
 
-This guide explains exactly what to copy and how to set up the Classification Web App on a standalone (offline) station.
+Deploy Classification Web App to a machine with **no internet, no Python, no Node.js**.
 
 ---
 
-## What You Need to Copy
+## Method A — Installer Wizard  *(recommended)*
 
-### Total size: ~13 GB — use a USB 3.0 drive with at least 16 GB free
+A proper GUI installer (`Setup.bat`) guides you through the process.
+It uses an **embedded Python** — no system Python installation needed.
 
-| Item | Source path (dev machine) | Size | Required |
-|------|--------------------------|------|----------|
-| Project folder | `C:\...\classification-master\` | ~200 MB | ✅ Yes |
-| Python venv | Inside project: `.venv\` | **7.5 GB** | ✅ Yes |
-| HuggingFace model cache | `C:\Users\B\.cache\huggingface\hub\` | ~5.1 GB | ✅ Yes (for SAM road/building/vegetation extraction) |
-| SAM3 local repo *(optional)* | `C:\Users\B\Desktop\ofek\sam3-main\` | ~50 MB | ⚠️ Only if you have the `sam3.pt` checkpoint |
+### On the Dev Machine (has internet)
 
-> **Note:** If you skip the SAM3 repo, the system falls back to OWLv2+SAM2 (already in the HF cache) which works fine.
-
----
-
-## Step-by-Step Instructions
-
-### On the Development Machine (before copying)
-
-#### 1. Build the frontend
-Open a terminal in the project folder and run:
 ```bat
-cd web_app
-npm run build
-```
-This creates `web_app\dist\` (~5 MB). It only needs to be done once (or after UI changes).
-
-#### 2. Build the launcher exe *(optional — or just use start.bat)*
-```bat
-build_exe.bat
-```
-This produces `ClassificationWebApp.exe` at the project root (~10 MB).
-Alternatively, skip this — `start.bat` works without building.
-
-#### 3. Copy the HuggingFace model cache
-Copy the **entire** folder:
-```
-C:\Users\B\.cache\huggingface\hub\
-```
-into the project folder as:
-```
-<project root>\models\hf_cache\hub\
+prepare_offline.bat
 ```
 
-So the final structure inside the project is:
+Prompts for PyTorch variant (CPU / CUDA) and GPU packages, then creates:
+
 ```
-classification-master\
-└── models\
-    └── hf_cache\
-        └── hub\
-            ├── models--google--owlv2-base-patch16-ensemble\   (593 MB)
-            ├── models--facebook--sam2-hiera-large\            (857 MB)
-            ├── models--facebook--sam3\                        (3.3 GB)
-            └── models--ShilongLiu--GroundingDINO\             (~300 MB)
+offline_installer\
+  Setup.bat                    ← double-click this on the target
+  Setup.ps1                    ← wizard code
+  prerequisites\
+    python-3.11.9-embed-amd64.zip
+    get-pip.py
+  offline_packages\            ← core pip wheels + (optional) CPU torch
+  offline_packages_torch\      ← CUDA torch override  (if chosen)
+  offline_packages_gpu\        ← CuPy / nvidia-cuda-* (if chosen)
+  app\                         ← pre-built application files
+  README.txt
 ```
+
+Copy the entire `offline_installer\` folder to USB (16 GB+ recommended).
+
+### On the Target Machine (no internet)
+
+1. Double-click **`Setup.bat`**
+2. The wizard asks for:
+   - Install folder (e.g. `C:\ClassificationApp`)
+   - Feature pack (Full AI / Core only)
+   - PyTorch variant and GPU options
+3. Click **Install** — takes 10–30 minutes
+4. Shortcuts are created on Desktop and/or Start Menu
+
+### Copy AI Model Weights After Install
+
+AI extraction features need model weights (~5 GB) that are too large to bundle.
+
+On the **dev machine**:
+```
+C:\Users\<name>\.cache\huggingface\hub\
+```
+
+Copy that `hub\` folder to the **target machine** at:
+```
+<install dir>\models\hf_cache\hub\
+```
+
+Expected content inside `hub\`:
+```
+hub\
+  models--google--owlv2-base-patch16-ensemble\   (593 MB)
+  models--facebook--sam2-hiera-large\            (857 MB)
+  models--facebook--sam3\                        (3.3 GB)
+  models--ShilongLiu--GroundingDINO\             (~300 MB)
+```
+
+### Installed Layout
+
+```
+<install dir>\
+  python\              — embedded Python 3.11.9 (self-contained)
+    python.exe
+    python311.zip      — standard library
+    Lib\site-packages\ — all installed packages
+  backend\             — FastAPI backend
+  web_app\dist\        — pre-built frontend
+  shared\
+  models\hf_cache\hub\ — AI model weights (copy manually, see above)
+  start.bat            — launch script  (uses python\python.exe)
+```
+
+### Running the App
+
+Use the Desktop/Start Menu shortcut, or:
+```
+<install dir>\start.bat
+```
+
+Browser opens automatically at `http://127.0.0.1:8000`.
 
 ---
 
-### What to Copy to the Target Machine
+## Method B — Manual Copy  *(no installer needed)*
 
-Copy the **entire project folder** to any location on the target machine, for example:
-```
-C:\ClassificationApp\
-```
+Copy the project folder + venv from the dev machine directly.
 
-The folder must contain:
+### What to Copy
+
+| Item | Source (dev machine) | Size | Required |
+|------|---------------------|------|----------|
+| Project folder | `classification-master\` | ~200 MB | Yes |
+| Python venv | Inside project: `.venv\` | **7.5 GB** | Yes |
+| HF model cache | `C:\Users\<name>\.cache\huggingface\hub\` | ~5.1 GB | For AI features |
+
+Total: **~13 GB** — use USB 3.0 (16 GB+).
+
+### Prepare on the Dev Machine
+
+1. **Build the frontend** (once, or after UI changes):
+   ```bat
+   cd web_app
+   npm run build
+   ```
+2. **Copy model cache** into the project:
+   ```
+   C:\Users\<name>\.cache\huggingface\hub\  →  <project>\models\hf_cache\hub\
+   ```
+
+### Copy to Target Machine
+
+Place the entire project folder anywhere, e.g. `C:\ClassificationApp\`.
+The `.venv\` must remain inside the project folder.
+
 ```
 ClassificationApp\
-├── ClassificationWebApp.exe     ← launcher (if built)
-├── start.bat                    ← alternative launcher (no build needed)
-├── backend\                     ← Python API server
-├── web_app\
-│   └── dist\                    ← compiled frontend (must be built first)
-├── .venv\                       ← Python + all packages (~1.5 GB)
-├── models\
-│   └── hf_cache\
-│       └── hub\                 ← AI model weights (~5.1 GB)
-└── Resources\                   ← user data / raster files
+  start.bat
+  backend\
+  web_app\dist\
+  .venv\                ← 7.5 GB — Python + all packages
+  models\hf_cache\hub\  ← 5.1 GB — AI model weights
 ```
 
-> **.venv must stay inside the project folder.** Do not move it separately.
+### Run on the Target Machine
 
----
-
-### On the Target (Standalone) Machine
-
-#### Prerequisites
-- **Windows 10 or 11** (64-bit)
-- **No internet required** after setup
-- **GPU (NVIDIA):** Optional but recommended for faster classification. CUDA drivers must be installed if you want GPU support.
-- **RAM:** Minimum 8 GB. 16 GB+ recommended for large images.
-- **No Python installation needed** — the `.venv` folder contains everything.
-
-#### To Run the App
-
-**Option A — Double-click the exe:**
-```
-ClassificationWebApp.exe
-```
-
-**Option B — Double-click the bat file:**
 ```
 start.bat
 ```
 
-Both will:
-1. Start the backend server at `http://127.0.0.1:8000`
-2. Open the browser automatically after ~3 seconds
-
-> If the browser doesn't open automatically, go to: **http://127.0.0.1:8000**
-
----
-
-## SAM3 Local Path (Optional)
-
-If you have the `sam3.pt` checkpoint and the `sam3-main` folder, copy it to the target machine and configure the path in the app:
-
-1. Copy `sam3-main\` folder anywhere on the target machine
-2. Open the app → expand **SAM backend** section → enter the path to `sam3-main\` → click **Set**
-
-The path is saved and remembered between sessions.
+No Python installation needed — `.venv\Scripts\python.exe` is used.
 
 ---
 
 ## Troubleshooting
 
-| Problem | Cause | Fix |
-|---------|-------|-----|
-| Browser opens but page is blank | Frontend not built | Run `npm run build` in `web_app\`, then restart |
-| Server doesn't start | `.venv` missing or wrong path | Make sure `.venv\` is inside the project folder |
-| Road/building/vegetation extraction fails | HF model cache missing or wrong path | Check `models\hf_cache\hub\` exists and contains the model folders |
-| GPU not used | CUDA drivers not installed | Install NVIDIA drivers; app works on CPU too (slower) |
-| Classification very slow on large images | Image too large for RAM | Enable **Tile Processing** in the Performance section |
-| `Permission denied` on output path | Output path is a directory | Set a specific output file path or leave blank for auto |
+| Problem | Fix |
+|---------|-----|
+| Blank page in browser | Frontend not built — run `npm run build` in `web_app\` |
+| Server won't start | `.venv\` missing or not inside the project folder |
+| AI extraction fails | Model weights not in `models\hf_cache\hub\` |
+| GPU not used | Install NVIDIA drivers on target; app works on CPU (slower) |
+| Very slow on large images | Enable **Tile Processing** in the app UI |
+| `ModuleNotFoundError: uvicorn` (Method A) | Package install failed — re-run Setup, check installer log |
 
 ---
 
-## Folder Size Reference
+## Size Reference
 
-| Folder | Size |
-|--------|------|
-| `.venv\` | **7.5 GB** |
-| `models\hf_cache\hub\models--google--owlv2-base-patch16-ensemble\` | 593 MB |
-| `models\hf_cache\hub\models--facebook--sam2-hiera-large\` | 857 MB |
-| `models\hf_cache\hub\models--facebook--sam3\` | 3.3 GB |
-| `models\hf_cache\hub\models--ShilongLiu--GroundingDINO\` | ~300 MB |
+| Item | Size |
+|------|------|
+| `.venv\` (Method B) | 7.5 GB |
+| `python\` embedded (Method A) | ~1.5 GB |
+| `models\hf_cache\hub\` | ~5.1 GB |
 | `web_app\dist\` | ~400 KB |
-| `backend\` source code | ~1.2 MB |
-| **Total** | **~13 GB** |
-
-> Use a USB 3.0 drive with at least 16 GB free space.
+| `backend\` source | ~1.2 MB |
+| **Total (Method A — full)** | **~8 GB install dir** |
+| **Total (Method B)** | **~13 GB** |

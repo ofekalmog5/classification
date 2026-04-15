@@ -1,0 +1,36 @@
+fastapi
+uvicorn[standard]
+pydantic
+numpy
+scikit-learn
+scikit-image
+scipy
+rasterio
+geopandas
+shapely
+aiofiles
+faiss-cpu        # Fast CPU KMeans (3-8x sklearn). For faiss-gpu: conda install -c pytorch faiss-gpu cudatoolkit=11.8
+
+# ── GPU KMeans via CuPy (no conda, no CUDA Toolkit install needed) ──────────
+# Install all five lines below to enable GPU KMeans on Windows:
+#   cupy-cuda12x          ← CuPy GPU arrays (CUDA 12.x/13.x drivers, RTX 30xx/40xx)
+#   cupy-cuda11x          ← use this instead for CUDA 11.x drivers
+#   nvidia-cuda-runtime-cu12
+#   nvidia-cublas-cu12
+#   nvidia-cuda-nvrtc-cu12
+#   nvidia-curand-cu12
+# The nvidia-* packages supply the CUDA runtime DLLs via pip (no system CUDA Toolkit).
+# If not installed, the app automatically falls back to faiss-cpu.
+
+pynvml           # GPU detection (optional, gracefully skipped if missing)
+psutil           # System memory info (used by suggest_tile_size + samgeo)
+
+# ── Road extraction via SAM 3 (Segment Anything Model 3) ─────────────────
+# PyTorch + torchvision must be installed MANUALLY (too large for auto-install):
+#   GPU (CUDA 12.x, RTX 30xx/40xx):
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#   CPU only:
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+segment-geospatial[samgeo3]   # samgeo: SAM 3 text-prompted geospatial segmentation
+triton-windows            # Windows port of triton — required for SAM3 on Windows
+opencv-python-headless  # cv2 for morphological post-processing (optional, falls back to scipy)

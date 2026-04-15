@@ -1,0 +1,44 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ClassificationRequest",
+  "type": "object",
+  "properties": {
+    "rasterPath": { "type": "string" },
+    "classes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "color": { "type": "string" }
+        },
+        "required": ["id", "name", "color"]
+      }
+    },
+    "vectorLayers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "filePath": { "type": "string" },
+          "classId": { "type": "string" }
+        },
+        "required": ["id", "name", "filePath", "classId"]
+      }
+    },
+    "smoothing": { "type": "string", "enum": ["superpixels", "median"] },
+    "featureFlags": {
+      "type": "object",
+      "properties": {
+        "spectral": { "type": "boolean" },
+        "texture": { "type": "boolean" },
+        "indices": { "type": "boolean" }
+      },
+      "required": ["spectral", "texture", "indices"]
+    }
+  },
+  "required": ["rasterPath", "classes", "vectorLayers", "smoothing", "featureFlags"]
+}

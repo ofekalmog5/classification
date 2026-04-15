@@ -369,7 +369,7 @@ def main():
     parser.add_argument(
         "--mea",
         action="store_true",
-        help="Use MEA preset materials (15 classes). Makes --classes optional.",
+        help="Use MEA preset materials (13 classes). Makes --classes optional.",
     )
     parser.add_argument(
         "--vector-class",
@@ -379,9 +379,9 @@ def main():
         dest="vector_class",
         help="MEA class name for the nth --vector layer (in order).\n"
              "Example: BM_CONCRETE. Only meaningful with --mea.\n"
-             "Valid names: BM_ASPHALT, BM_CONCRETE, BM_EARTHEN, BM_FOLIAGE,\n"
+             "Valid names: BM_ASPHALT, BM_CONCRETE, BM_FOLIAGE,\n"
              "  BM_LAND_DRY_GRASS, BM_LAND_GRASS, BM_METAL, BM_METAL_STEEL,\n"
-             "  BM_PAINT_ASPHALT, BM_ROCK, BM_SAND, BM_SHINGLE, BM_SOIL,\n"
+             "  BM_PAINT_ASPHALT, BM_ROCK, BM_SAND, BM_SOIL,\n"
              "  BM_VEGETATION, BM_WATER",
     )
 
