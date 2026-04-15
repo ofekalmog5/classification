@@ -5939,6 +5939,45 @@ def _build_mea_cluster_mapping(
             "colorRGB": assigned_rgb,
         }
 
+    # Diversity enforcement: prevent degenerate assignments where almost all
+    # clusters map to the same 2-3 materials.  If fewer than half the possible
+    # unique materials are represented, reassign some clusters to fill gaps.
+    n_clusters = len(cluster_rgbs)
+    n_materials = len(material_colors)
+    unique_assigned = set(int(j) for j in col_ind)
+    min_diversity = max(2, min(n_clusters, n_materials) // 2)
+    if len(unique_assigned) < min_diversity:
+        missing_mats = [j for j in range(n_materials) if j not in unique_assigned]
+        # For each missing material, find the cluster that has the lowest cost
+        # for it — but only steal from materials that have 2+ clusters assigned.
+        mat_cluster_count: Dict[int, int] = {}
+        cluster_mat = list(int(j) for j in col_ind)
+        for m in cluster_mat:
+            mat_cluster_count[m] = mat_cluster_count.get(m, 0) + 1
+        for missing_j in missing_mats:
+            if len(unique_assigned) >= min_diversity:
+                break
+            # Candidate clusters: those whose current material has >1 cluster
+            candidates = [
+                i for i in range(n_clusters)
+                if mat_cluster_count.get(cluster_mat[i], 0) > 1
+            ]
+            if not candidates:
+                break
+            best_i = min(candidates, key=lambda i: float(cost[i, missing_j]))
+            old_mat = cluster_mat[best_i]
+            mat_cluster_count[old_mat] -= 1
+            cluster_mat[best_i] = missing_j
+            mat_cluster_count[missing_j] = mat_cluster_count.get(missing_j, 0) + 1
+            unique_assigned.add(missing_j)
+            assigned[best_i] = material_colors[missing_j]
+            mapping[best_i] = {
+                "cluster": best_i + 1,
+                "material": material_names[missing_j],
+                "colorHex": material_hex[missing_j],
+                "colorRGB": material_colors[missing_j],
+            }
+
     # Final semantic guardrails to reduce severe confusions.
     if cluster_semantics is not None and len(cluster_semantics) == len(cluster_rgbs):
         vegetation_materials = {"BM_LAND_GRASS", "BM_LAND_DRY_GRASS", "BM_VEGETATION", "BM_FOLIAGE"}

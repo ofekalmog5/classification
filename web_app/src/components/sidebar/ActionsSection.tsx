@@ -363,7 +363,6 @@ export default function ActionsSection() {
     }
     dispatch({ type: "SET_CLASSES", classes: MEA_CLASSES });
     dispatch({ type: "SET_CLASS_COUNT", count: MEA_CLASSES.length });
-    dispatch({ type: "SET_CLASSIFICATION", settings: { exportFormat: "img" } });
     runStartRef.current = Date.now();
     dispatch({ type: "SET_RUNNING", step: "mea" });
     dispatch({ type: "SET_PROGRESS", progress: null });
@@ -385,7 +384,7 @@ export default function ActionsSection() {
           vectorLayers: state.vectorLayers,
           featureFlags: state.featureFlags,
           outputPath: state.outputPath || undefined,
-          exportFormat: "img",
+          exportFormat: state.classification.exportFormat,
           tileMode: state.performance.useTiling,
           tileMaxPixels: tileSizeToPixels(state.performance.tileSize, state.performance.suggestedTileSide),
           tileWorkers: state.performance.tileWorkers,
@@ -421,7 +420,7 @@ export default function ActionsSection() {
           vectorLayers: state.vectorLayers,
           featureFlags: state.featureFlags,
           outputPath: state.outputPath || undefined,
-          exportFormat: "img" as const,
+          exportFormat: state.classification.exportFormat,
           taskId,
           tileMode: state.performance.useTiling,
           tileMaxPixels: tileSizeToPixels(state.performance.tileSize, state.performance.suggestedTileSide),
