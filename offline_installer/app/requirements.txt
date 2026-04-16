@@ -33,4 +33,8 @@ psutil           # System memory info (used by suggest_tile_size + samgeo)
 #     pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 segment-geospatial[samgeo3]   # samgeo: SAM 3 text-prompted geospatial segmentation
 triton-windows            # Windows port of triton — required for SAM3 on Windows
+transformers              # HuggingFace transformers (OWLv2 + SAM2 extraction backend)
+huggingface-hub           # Model download + caching
+tokenizers                # Fast tokenizers (transformers dep)
+safetensors               # Safe model weight format (transformers dep)
 opencv-python-headless  # cv2 for morphological post-processing (optional, falls back to scipy)

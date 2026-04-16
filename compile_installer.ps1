@@ -584,11 +584,17 @@ namespace CWAInstaller
 
 Write-Host "Compiling ClassificationInstaller.exe..."
 
+$cp = New-Object System.CodeDom.Compiler.CompilerParameters
+$cp.OutputAssembly    = $OUT
+$cp.CompilerOptions   = "/platform:anycpu /target:winexe"
+$cp.ReferencedAssemblies.AddRange(@(
+    "System.Windows.Forms.dll",
+    "System.Drawing.dll",
+    "System.dll"
+))
 Add-Type `
     -TypeDefinition $code `
-    -ReferencedAssemblies "System.Windows.Forms","System.Drawing","System" `
-    -OutputAssembly $OUT `
-    -OutputType WindowsApplication
+    -CompilerParameters $cp
 
 if (Test-Path $OUT) {
     Write-Host ""

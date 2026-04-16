@@ -289,18 +289,37 @@ def _load_sam3(device: str = "auto"):
     # NOTE: We use Sam2Processor + Sam2Model (not the mask-generation pipeline)
     # because the pipeline doesn't accept input_boxes for prompted segmentation.
     try:
+        import os as _os
+        from pathlib import Path as _Path
         import torch as _torch
         from transformers import pipeline as _hf_pipeline
         from transformers import Sam2Processor, Sam2Model
 
+        def _resolve_hf_model(model_id: str) -> str:
+            """Return local snapshot path when it exists (works with old or new HF cache
+            format).  Falls back to the hub model ID for online download."""
+            hf_home = _Path(_os.environ.get("HF_HOME", _Path.home() / ".cache" / "huggingface"))
+            cache_name = "models--" + model_id.replace("/", "--")
+            snap_dir = hf_home / "hub" / cache_name / "snapshots"
+            if snap_dir.exists():
+                snaps = sorted(snap_dir.iterdir())
+                if snaps:
+                    local_path = str(snaps[-1])
+                    print(f"[RoadExtract] Using local snapshot for {model_id}: {local_path}")
+                    return local_path
+            return model_id
+
+        _owlv2_path = _resolve_hf_model("google/owlv2-base-patch16-ensemble")
+        _sam2_path  = _resolve_hf_model("facebook/sam2-hiera-large")
+
         _dev = 0 if device == "cuda" else -1
         detector = _hf_pipeline(
             "zero-shot-object-detection",
-            model="google/owlv2-base-patch16-ensemble",
+            model=_owlv2_path,
             device=_dev,
         )
-        sam2_processor = Sam2Processor.from_pretrained("facebook/sam2-hiera-large")
-        sam2_model = Sam2Model.from_pretrained("facebook/sam2-hiera-large")
+        sam2_processor = Sam2Processor.from_pretrained(_sam2_path)
+        sam2_model = Sam2Model.from_pretrained(_sam2_path)
         sam2_model.to(device)
         sam2_model.eval()
         _sam_model = {
