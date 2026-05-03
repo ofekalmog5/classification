@@ -1,5 +1,17 @@
 # Shadow Detection & Material Inference Feature
 
+> **Status:** *Active.* Both features documented here are still implemented in the
+> production codebase:
+> - `_detect_structures_mask()` and `_detect_shadows_and_infer()` live in
+>   [backend/app/core.py](backend/app/core.py).
+> - `detect_shadows: bool` and `max_threads: Optional[int]` parameters flow through
+>   `classify_and_export()`, `classify()`, and the tile worker `_classify_tile_worker()`.
+> - The web app exposes both controls in `web_app/src/components/sidebar/PerformanceSection.tsx`
+>   and `ClassificationSection.tsx`.
+>
+> The original Tkinter-only UI references in this doc are out of date — the same
+> controls now exist in the React sidebar with the same parameter names.
+
 ## Overview
 This implementation adds two major features to the classification pipeline:
 

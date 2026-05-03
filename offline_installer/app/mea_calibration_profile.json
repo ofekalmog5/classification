@@ -1,0 +1,208 @@
+{
+  "name": "Calibration Profile",
+  "raster_path": "C:/Users/B/Desktop/Tests/0.5m-After/OrthoSample_A2.tif",
+  "material_overrides": {
+    "BM_ASPHALT": {
+      "reference_color": "#84877D",
+      "reference_rgb": [
+        132,
+        135,
+        125
+      ],
+      "anchors": [
+        [
+          132,
+          135,
+          125
+        ]
+      ],
+      "sample_count": 504,
+      "sample_std_rgb": [
+        5.56,
+        5.74,
+        7.09
+      ],
+      "tolerance_radius": 30
+    },
+    "BM_CONCRETE": {
+      "reference_color": "#747972",
+      "reference_rgb": [
+        116,
+        121,
+        114
+      ],
+      "anchors": [
+        [
+          116,
+          121,
+          114
+        ]
+      ],
+      "sample_count": 957,
+      "sample_std_rgb": [
+        36.84,
+        36.9,
+        33.9
+      ],
+      "tolerance_radius": 74
+    },
+    "BM_FOLIAGE": {
+      "reference_color": "#333C29",
+      "reference_rgb": [
+        51,
+        60,
+        41
+      ],
+      "anchors": [
+        [
+          51,
+          60,
+          41
+        ]
+      ],
+      "sample_count": 2401,
+      "sample_std_rgb": [
+        9.11,
+        8.26,
+        8.91
+      ],
+      "tolerance_radius": 30
+    },
+    "BM_LAND_DRY_GRASS": {
+      "reference_color": "#57574A",
+      "reference_rgb": [
+        87,
+        87,
+        74
+      ],
+      "anchors": [
+        [
+          87,
+          87,
+          74
+        ]
+      ],
+      "sample_count": 640,
+      "sample_std_rgb": [
+        10.62,
+        9.73,
+        10.45
+      ],
+      "tolerance_radius": 30
+    },
+    "BM_LAND_GRASS": {
+      "reference_color": "#30402A",
+      "reference_rgb": [
+        48,
+        64,
+        42
+      ],
+      "anchors": [
+        [
+          48,
+          64,
+          42
+        ]
+      ],
+      "sample_count": 255,
+      "sample_std_rgb": [
+        9.14,
+        8.22,
+        7.02
+      ],
+      "tolerance_radius": 30
+    },
+    "BM_ROCK": {
+      "reference_color": "#77776D",
+      "reference_rgb": [
+        119,
+        119,
+        109
+      ],
+      "anchors": [
+        [
+          119,
+          119,
+          109
+        ]
+      ],
+      "sample_count": 330,
+      "sample_std_rgb": [
+        8.1,
+        7.59,
+        7.33
+      ],
+      "tolerance_radius": 30
+    },
+    "BM_SAND": {
+      "reference_color": "#857A69",
+      "reference_rgb": [
+        133,
+        122,
+        105
+      ],
+      "anchors": [
+        [
+          133,
+          122,
+          105
+        ]
+      ],
+      "sample_count": 324,
+      "sample_std_rgb": [
+        9.97,
+        10.78,
+        9.67
+      ],
+      "tolerance_radius": 30
+    },
+    "BM_SOIL": {
+      "reference_color": "#6B6455",
+      "reference_rgb": [
+        107,
+        100,
+        85
+      ],
+      "anchors": [
+        [
+          107,
+          100,
+          85
+        ]
+      ],
+      "sample_count": 3905,
+      "sample_std_rgb": [
+        10.48,
+        8,
+        7.91
+      ],
+      "tolerance_radius": 30
+    },
+    "BM_VEGETATION": {
+      "reference_color": "#525A46",
+      "reference_rgb": [
+        82,
+        90,
+        70
+      ],
+      "anchors": [
+        [
+          82,
+          90,
+          70
+        ]
+      ],
+      "sample_count": 6944,
+      "sample_std_rgb": [
+        29.95,
+        24.18,
+        28.22
+      ],
+      "tolerance_radius": 60
+    }
+  },
+  "bias_overrides": null,
+  "frequency_prior_overrides": null,
+  "version": 2,
+  "created_at": "2026-04-24T07:46:15.176753+00:00"
+}

@@ -1,0 +1,15 @@
+[
+  {"id": "class-1",  "name": "BM_ASPHALT",        "composite_name": "ASPHALT"},
+  {"id": "class-2",  "name": "BM_CONCRETE",        "composite_name": "CONCRETE"},
+  {"id": "class-3",  "name": "BM_FOLIAGE",         "composite_name": "FOLIAGE"},
+  {"id": "class-4",  "name": "BM_LAND_DRY_GRASS",  "composite_name": "DRY_GRASS"},
+  {"id": "class-5",  "name": "BM_LAND_GRASS",       "composite_name": "LAND_GRASS"},
+  {"id": "class-6",  "name": "BM_METAL",            "composite_name": "METAL"},
+  {"id": "class-7",  "name": "BM_METAL_STEEL",      "composite_name": "METAL_STEEL"},
+  {"id": "class-8",  "name": "BM_PAINT_ASPHALT",    "composite_name": "PAINT_ASPHALT"},
+  {"id": "class-9",  "name": "BM_ROCK",             "composite_name": "ROCK"},
+  {"id": "class-10", "name": "BM_SAND",             "composite_name": "SAND"},
+  {"id": "class-11", "name": "BM_SOIL",             "composite_name": "SOIL"},
+  {"id": "class-12", "name": "BM_VEGETATION",       "composite_name": "GENVEGETATION"},
+  {"id": "class-13", "name": "BM_WATER",            "composite_name": "WATER"}
+]

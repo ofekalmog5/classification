@@ -1,4 +1,14 @@
-# בעיית RASTERIZATION: 0 PIXELS
+# Rasterization Debug Notes — 0 Pixels Issue (Historical)
+
+> **Status:** *Historical debugging notes (Hebrew).* Kept as a checklist for
+> diagnosing CRS / transform mismatches when vector overlays produce zero
+> output pixels. The current code in
+> [backend/app/core.py:rasterize_vectors_onto_classification](backend/app/core.py)
+> calls `gdf.to_crs(raster_crs)` (not just `set_crs`) before rasterising, so
+> this should rarely fire — but the Hebrew checklist below remains useful when
+> the bug recurs from upstream data with a malformed CRS.
+
+
 
 ## הבעיה
 - ✓ 26,997 גיאומטריות חוקיות

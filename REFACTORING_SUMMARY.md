@@ -1,4 +1,13 @@
-# Refactoring Summary: Classification Pipeline Architecture
+# Refactoring Summary — Classification Pipeline Architecture (Historical)
+
+> **Status:** *Historical record.* The two-step split documented here is now the
+> production architecture. Live entry points are still `classify_and_export()` and
+> `rasterize_vectors_onto_classification()` in [backend/app/core.py](backend/app/core.py)
+> and the matching `/classify-step1` and `/classify-step2` endpoints in
+> [backend/app/main.py](backend/app/main.py). Subsequent additions
+> (batch shared model, AI feature extraction, MEA calibration profile, GPU acceleration,
+> tile mode) layered on top of this foundation — see [README.md](README.md) and
+> [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the current picture.
 
 ## Overview
 Successfully refactored the classification pipeline from a monolithic 200+ line function into a modular, multi-step architecture with independent endpoints.
@@ -101,14 +110,19 @@ def classify(
 - ✓ New endpoints properly defined
 - ✓ Request models properly typed
 
-## Next Steps
+## Next Steps (at the time of writing)
 
 1. Test the refactored code with real data
 2. Verify API endpoints are accessible
 3. Test Step 1 independent execution
 4. Test Step 2 independent execution
 5. Test full pipeline (both steps)
-6. Consider updating Electron app UI to expose new endpoints (optional)
+6. Consider updating the desktop UI to expose new endpoints (optional)
+
+> *Outcome:* all of the above shipped. The web app's `ActionsSection` exposes
+> *Step 1*, *Step 2*, *Full*, *MEA*, and *Batch* as separate buttons; Tkinter has
+> the same three-button layout. The Electron front-end was deprecated in favour
+> of the React/Vite web app.
 
 ## Usage Examples
 

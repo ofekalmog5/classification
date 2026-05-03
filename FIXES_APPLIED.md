@@ -1,4 +1,20 @@
-# FIXES APPLIED
+# Fixes Applied — March 2026 (Historical)
+
+> **Status:** *Historical record.* These three fixes (PROJ.db lookup, GeoSeries CRS
+> conflicts, dead code after `return`) are still in effect today. `_setup_proj_lib()`
+> still runs at the top of [backend/app/core.py](backend/app/core.py); every
+> `set_crs(...)` call uses `allow_override=True`; the dead-code block after `classify()`
+> was deleted in the same pass that introduced `classify_and_export()` and
+> `rasterize_vectors_onto_classification()` (see
+> [REFACTORING_SUMMARY.md](REFACTORING_SUMMARY.md)).
+>
+> The original Anaconda-specific PROJ paths in this file are no longer relevant —
+> the project ships its own embedded Python (offline installer) or runs from a
+> venv that contains `pyproj`'s data files. `_setup_proj_lib()` now also checks
+> the venv's `Lib\site-packages\pyproj\proj_dir\share\proj`. If you ever see a
+> PROJ error again, reinstall `pyproj` rather than editing this list.
+
+
 
 ## Problem 1: PROJ.db Not Found
 **Error:** `ERROR 1: PROJ: proj_identify: Cannot find proj.db`
