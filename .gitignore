@@ -25,3 +25,16 @@ data/
 .DS_Store
 Resources/
 Resources.zip
+
+# Large binaries (offline installer assets, model weights, build payloads)
+_build_tools/payload.7z
+_build_tools/7zextra.7z
+offline_installer/offline_packages/
+offline_installer/offline_packages_gpu/
+offline_installer/offline_packages_torch/
+offline_installer/app/models/
+offline_installer/prerequisites/
+*.whl
+*.safetensors
+*.pt
+*.blend
