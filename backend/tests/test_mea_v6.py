@@ -243,3 +243,57 @@ def test_migrate_v2_without_legacy_keys_just_bumps_version():
     migrated = _migrate_legacy_profile(v2)
     assert migrated["version"] == 3
     assert migrated["material_overrides"] == {"BM_VEGETATION": {"anchors": []}}
+
+
+def test_migrate_v2_handles_malformed_legacy_entry():
+    """A v2 profile where a legacy material override is None or non-dict
+    must not crash the migration."""
+    v2 = {
+        "version": 2,
+        "material_overrides": {
+            "BM_VEGETATION": {"anchors": [[34, 139, 34]]},
+            "BM_FOLIAGE": None,        # malformed: explicit null
+            "BM_LAND_GRASS": 42,        # malformed: not a dict
+        },
+    }
+    migrated = _migrate_legacy_profile(v2)
+    assert migrated["version"] == 3
+    assert "BM_FOLIAGE" not in migrated["material_overrides"]
+    assert "BM_LAND_GRASS" not in migrated["material_overrides"]
+    # Existing veg anchors preserved.
+    assert migrated["material_overrides"]["BM_VEGETATION"]["anchors"] == [[34, 139, 34]]
+
+
+# ─── Phase 2 — pipeline.classify_v6 splitting ────────────────────────────────
+
+@requires_core
+def test_split_classes_by_source_uses_source_field():
+    """Classes carrying their source field route correctly."""
+    from app.pipeline import _split_classes_by_source
+    classes = list(MEA_CLASSES)  # full 6 entries with source
+    kmeans, masks = _split_classes_by_source(classes)
+    assert {c["name"] for c in masks} == {"BM_ASPHALT", "BM_CONCRETE"}
+    assert {c["name"] for c in kmeans} == {"BM_VEGETATION", "BM_WATER", "BM_SAND", "BM_SOIL"}
+
+
+@requires_core
+def test_split_classes_by_source_falls_back_to_canonical_lookup():
+    """When the request omits source (raw network ClassItem), look it up by name."""
+    from app.pipeline import _split_classes_by_source
+    bare = [
+        {"id": "class-1", "name": "BM_ASPHALT",    "color": "#2D2D30"},
+        {"id": "class-3", "name": "BM_VEGETATION", "color": "#228B22"},
+    ]
+    kmeans, masks = _split_classes_by_source(bare)
+    assert [c["name"] for c in masks] == ["BM_ASPHALT"]
+    assert [c["name"] for c in kmeans] == ["BM_VEGETATION"]
+
+
+@requires_core
+def test_split_classes_by_source_unknown_name_defaults_to_kmeans():
+    """A custom (non-MEA) name with no source field should default to kmeans."""
+    from app.pipeline import _split_classes_by_source
+    custom = [{"id": "x", "name": "CUSTOM_FOO", "color": "#abcdef"}]
+    kmeans, masks = _split_classes_by_source(custom)
+    assert kmeans == custom
+    assert masks == []

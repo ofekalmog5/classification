@@ -81,6 +81,7 @@ export default function ActionsSection() {
       tileWorkers: state.performance.tileWorkers,
       detectShadows: state.classification.detectShadows,
       maxThreads,
+      sam3Enabled: state.classification.sam3Enabled,
     };
   }, [state]);
 
@@ -391,6 +392,7 @@ export default function ActionsSection() {
           detectShadows: state.classification.detectShadows,
           maxThreads,
           taskId,
+          sam3Enabled: state.classification.sam3Enabled,
         });
         if ((result as any).status === "cancelled") {
           dispatch({ type: "SET_STATUS", text: "MEA cancelled" });
@@ -429,6 +431,7 @@ export default function ActionsSection() {
           maxThreads: state.performance.useMaxThreads
             ? navigator.hardwareConcurrency ?? null
             : null,
+          sam3Enabled: state.classification.sam3Enabled,
         };
         const result = state.vectorLayers.length
           ? await runFullPipeline(params)

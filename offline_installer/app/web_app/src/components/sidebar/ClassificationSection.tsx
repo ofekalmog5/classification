@@ -15,6 +15,11 @@ export default function ClassificationSection() {
         checked={classification.shareModel}
         onChange={(v) => set({ shareModel: v })}
       />
+      <ToggleRow
+        label="SAM3 roads/buildings (MEA)"
+        checked={classification.sam3Enabled}
+        onChange={(v) => set({ sam3Enabled: v })}
+      />
       <div className="flex items-center gap-2 mt-1">
         <span className="text-xs text-surface-400 w-20">Export format</span>
         <div className="flex gap-3">

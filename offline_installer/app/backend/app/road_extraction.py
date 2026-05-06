@@ -84,17 +84,21 @@ def _resolve_sam3_dir() -> Optional[Path]:
         if p.exists():
             return p
 
-    # Default paths to search (portable — works on any station)
+    # Default paths to search (portable — works on any station).
+    # Each candidate is a directory expected to contain a `sam3/` subdir
+    # holding the HuggingFace snapshot (config.json, sam3.pt, etc.).
     _project_root = Path(__file__).resolve().parent.parent.parent
     candidates = [
-        _project_root / "sam3-main",   # sibling of project root
-        _project_root / "sam3",        # sibling of project root
+        _project_root / "models",      # bundled with project (offline installer)
+        _project_root / "sam3-main",   # cloned Meta source repo
+        _project_root / "sam3",        # cloned Meta source repo, alt name
     ]
     # When frozen, also check next to the exe
     if getattr(sys, "frozen", False):
         _exe_dir = Path(sys.executable).parent
-        candidates.insert(0, _exe_dir / "sam3-main")
-        candidates.insert(1, _exe_dir / "sam3")
+        candidates.insert(0, _exe_dir / "models")
+        candidates.insert(1, _exe_dir / "sam3-main")
+        candidates.insert(2, _exe_dir / "sam3")
 
     for c in candidates:
         if c.exists() and (c / "sam3").is_dir():

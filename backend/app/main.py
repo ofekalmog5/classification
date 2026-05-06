@@ -30,6 +30,8 @@ from .core import classify_and_export as run_classify_and_export
 from .core import rasterize_vectors_onto_classification as run_rasterize_vectors
 from .core import train_kmeans_model, build_shared_color_table, suggest_tile_size
 from .core import _ACCEL_ENGINE, _ACCEL_GPU, _ACCEL_GPU_INFO
+from .core import _is_mea_classes, MEA_CLASSES
+from .pipeline import classify_v6 as run_classify_v6
 from .road_extraction import extract_roads as run_extract_roads
 from .road_extraction import merge_road_mask_onto_classification as run_merge_road_mask
 from .road_extraction import extract_feature_masks as run_extract_feature_masks
@@ -77,6 +79,9 @@ _PIPELINE_TOTALS: Dict[str, float] = {
     "step2": 80,
     "road_extract": 100,
     "road_merge": 100,
+    # v6: 2x SAM3 (~80 each) + KMeans step1 (100) + mask fusion (80)
+    "v6_step1": 340,
+    "v6_full": 420,  # v6_step1 + step2 vector rasterisation
 }
 
 
@@ -104,7 +109,15 @@ class _ProgressTracker:
             if self.current_phase is not None:
                 self.completed_weight += self.current_weight
             self.current_phase = phase
-            self.current_weight = _PHASE_WEIGHTS.get(phase, 5)
+            # The v6 pipeline prefixes phase names with a label
+            # (e.g. "Roads (SAM3): Loading SAM 3 model").  Strip the prefix
+            # before looking up the canonical weight.
+            weight_key = phase.split(": ", 1)[1] if ": " in phase else phase
+            self.current_weight = (
+                _PHASE_WEIGHTS.get(phase)
+                or _PHASE_WEIGHTS.get(weight_key)
+                or 5
+            )
 
         frac = done / total if total > 0 else 0.0
         pct = min(99.0, (self.completed_weight + self.current_weight * frac)
@@ -166,6 +179,12 @@ class ClassifyRequest(BaseModel):
     detectShadows: bool = False
     maxThreads: int | None = None
     taskId: str | None = None
+    # 6-material SAM3-first pipeline controls (v6).  When the request's classes
+    # match the 6-material MEA schema, these fields decide how road/building
+    # pixels are produced.
+    sam3Enabled: bool = True
+    roadShapefile: str | None = None
+    buildingShapefile: str | None = None
 
 
 class ClassifyStep1Request(BaseModel):
@@ -184,6 +203,9 @@ class ClassifyStep1Request(BaseModel):
     detectShadows: bool = False
     maxThreads: int | None = None
     taskId: str | None = None
+    sam3Enabled: bool = True
+    roadShapefile: str | None = None
+    buildingShapefile: str | None = None
 
 
 class ClassifyStep2Request(BaseModel):
@@ -300,16 +322,80 @@ async def cancel_task(task_id: str):
 
 # ─── Classify endpoints ──────────────────────────────────────────────────
 
+def _route_to_v6(classes_dict: list, sam3_enabled: bool) -> bool:
+    """Decide whether the new SAM3-first 6-material pipeline should handle
+    this request.  True only when the request carries ALL 6 canonical MEA
+    classes AND the caller hasn't disabled SAM3.  Partial-MEA payloads (1–5
+    of the canonical names) fall through to the legacy KMeans path."""
+    return (
+        bool(sam3_enabled)
+        and len(classes_dict) == len(MEA_CLASSES)
+        and _is_mea_classes(classes_dict)
+    )
+
+
 @app.post("/classify")
 def classify(request: ClassifyRequest) -> dict:
-    """Complete pipeline: Classify + Rasterize vectors (if provided)"""
+    """Complete pipeline: Classify + Rasterize vectors (if provided).
+
+    When the request's classes match the 6-material MEA schema and
+    ``sam3Enabled`` is True (default), the new SAM3-first pipeline runs first
+    to produce road and building masks, then KMeans handles the remaining
+    natural materials, then user vectors are rasterised on top.
+    """
     print(f"[API /classify] outputPath={request.outputPath!r} exportFormat={request.exportFormat!r}")
-    tracker = _ProgressTracker(request.taskId, "full") if request.taskId else None
+    classes_dict = [item.model_dump() for item in request.classes]
+    vector_layers = [layer.model_dump() for layer in request.vectorLayers]
+    use_v6 = _route_to_v6(classes_dict, request.sam3Enabled)
+    pipeline_kind = "v6_full" if use_v6 else "full"
+    tracker = _ProgressTracker(request.taskId, pipeline_kind) if request.taskId else None
     try:
+        if use_v6:
+            print("[API /classify] routing -> classify_v6 (SAM3-first 6-material pipeline)")
+            result = run_classify_v6(
+                raster_path=request.rasterPath,
+                classes=classes_dict,
+                smoothing=request.smoothing,
+                feature_flags=request.featureFlags.model_dump(),
+                output_path=request.outputPath,
+                sam3_enabled=request.sam3Enabled,
+                road_shapefile=request.roadShapefile,
+                building_shapefile=request.buildingShapefile,
+                tile_mode=request.tileMode,
+                tile_max_pixels=request.tileMaxPixels or 512 * 512,
+                tile_overlap=request.tileOverlap,
+                tile_output_dir=request.tileOutputDir,
+                tile_workers=request.tileWorkers,
+                detect_shadows=request.detectShadows,
+                max_threads=request.maxThreads,
+                export_format=request.exportFormat,
+                progress_callback=tracker,
+            )
+            # Rasterize user-supplied vector layers on top of the v6 output.
+            if result.get("status") == "ok" and vector_layers:
+                cls_path = result.get("outputPath")
+                if cls_path:
+                    rasterize_result = run_rasterize_vectors(
+                        classification_path=cls_path,
+                        vector_layers=vector_layers,
+                        classes=classes_dict,
+                        output_path=request.outputPath,
+                        tile_mode=request.tileMode,
+                        tile_max_pixels=request.tileMaxPixels or 512 * 512,
+                        tile_overlap=request.tileOverlap,
+                        tile_output_dir=request.tileOutputDir,
+                        tile_workers=request.tileWorkers,
+                        max_threads=request.maxThreads,
+                        progress_callback=tracker,
+                    )
+                    if rasterize_result.get("status") == "ok":
+                        result["outputPath"] = rasterize_result.get("outputPath", cls_path)
+            return result
+
         result = run_classify(
             raster_path=request.rasterPath,
-            classes=[item.model_dump() for item in request.classes],
-            vector_layers=[layer.model_dump() for layer in request.vectorLayers],
+            classes=classes_dict,
+            vector_layers=vector_layers,
             smoothing=request.smoothing,
             feature_flags=request.featureFlags.model_dump(),
             output_path=request.outputPath,
@@ -335,13 +421,43 @@ def classify(request: ClassifyRequest) -> dict:
 
 @app.post("/classify-step1")
 def classify_step1(request: ClassifyStep1Request) -> dict:
-    """Step 1: KMeans classification and export to RGB (no vectors)"""
+    """Step 1: KMeans classification and export to RGB (no vectors).
+
+    Routes to ``classify_v6`` when the request matches the 6-material MEA
+    schema and SAM3 is enabled (default) — same behaviour as ``/classify``
+    minus the vector-rasterisation step."""
     print(f"[API /classify-step1] outputPath={request.outputPath!r} exportFormat={request.exportFormat!r}")
-    tracker = _ProgressTracker(request.taskId, "step1") if request.taskId else None
+    classes_dict = [item.model_dump() for item in request.classes]
+    use_v6 = _route_to_v6(classes_dict, request.sam3Enabled)
+    pipeline_kind = "v6_step1" if use_v6 else "step1"
+    tracker = _ProgressTracker(request.taskId, pipeline_kind) if request.taskId else None
     try:
+        if use_v6:
+            print("[API /classify-step1] routing -> classify_v6 (SAM3-first 6-material pipeline)")
+            result = run_classify_v6(
+                raster_path=request.rasterPath,
+                classes=classes_dict,
+                smoothing=request.smoothing,
+                feature_flags=request.featureFlags.model_dump(),
+                output_path=request.outputPath,
+                sam3_enabled=request.sam3Enabled,
+                road_shapefile=request.roadShapefile,
+                building_shapefile=request.buildingShapefile,
+                tile_mode=request.tileMode,
+                tile_max_pixels=request.tileMaxPixels or 512 * 512,
+                tile_overlap=request.tileOverlap,
+                tile_output_dir=request.tileOutputDir or request.outputPath,
+                tile_workers=request.tileWorkers,
+                detect_shadows=request.detectShadows,
+                max_threads=request.maxThreads,
+                export_format=request.exportFormat,
+                progress_callback=tracker,
+            )
+            return result
+
         result = run_classify_and_export(
             raster_path=request.rasterPath,
-            classes=[item.model_dump() for item in request.classes],
+            classes=classes_dict,
             smoothing=request.smoothing,
             feature_flags=request.featureFlags.model_dump(),
             output_path=request.outputPath,

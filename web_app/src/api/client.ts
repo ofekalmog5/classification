@@ -64,6 +64,10 @@ export interface Step1Params {
   detectShadows?: boolean;
   maxThreads?: number | null;
   taskId?: string;
+  // 6-material SAM3-first pipeline controls (v6).
+  sam3Enabled?: boolean;
+  roadShapefile?: string | null;
+  buildingShapefile?: string | null;
 }
 
 export async function runStep1(params: Step1Params): Promise<ClassifyResult> {
@@ -81,6 +85,9 @@ export async function runStep1(params: Step1Params): Promise<ClassifyResult> {
     detectShadows: params.detectShadows ?? false,
     maxThreads: params.maxThreads ?? null,
     taskId: params.taskId ?? null,
+    sam3Enabled: params.sam3Enabled ?? true,
+    roadShapefile: params.roadShapefile ?? null,
+    buildingShapefile: params.buildingShapefile ?? null,
   };
   const r = await fetch(`${BASE}/classify-step1`, {
     method: "POST",
@@ -138,6 +145,9 @@ export interface FullPipelineParams {
   detectShadows?: boolean;
   maxThreads?: number | null;
   taskId?: string;
+  sam3Enabled?: boolean;
+  roadShapefile?: string | null;
+  buildingShapefile?: string | null;
 }
 
 export async function runFullPipeline(
@@ -158,6 +168,9 @@ export async function runFullPipeline(
     detectShadows: params.detectShadows ?? false,
     maxThreads: params.maxThreads ?? null,
     taskId: params.taskId ?? null,
+    sam3Enabled: params.sam3Enabled ?? true,
+    roadShapefile: params.roadShapefile ?? null,
+    buildingShapefile: params.buildingShapefile ?? null,
   };
   const r = await fetch(`${BASE}/classify`, {
     method: "POST",

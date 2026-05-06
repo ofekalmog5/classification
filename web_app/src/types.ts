@@ -46,6 +46,10 @@ export interface ClassificationSettings {
   detectShadows: boolean;
   shareModel: boolean;
   exportFormat: ExportFormat;
+  /** When enabled, road and building masks are produced by SAM3 (or by an
+   *  uploaded shapefile) at the start of the run, before KMeans.  Only takes
+   *  effect when classes match the 6-material MEA schema. */
+  sam3Enabled: boolean;
 }
 
 /* ── Map layer types ────────────────────────────────────────────── */

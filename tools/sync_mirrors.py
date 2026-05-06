@@ -35,6 +35,9 @@ SYNC_PAIRS: List[Tuple[str, List[str]]] = [
     ("backend/app/road_extraction.py", [
         "offline_installer/app/backend/app/road_extraction.py",
     ]),
+    ("backend/app/pipeline.py", [
+        "offline_installer/app/backend/app/pipeline.py",
+    ]),
     # Shared MEA defaults
     ("shared/mea_defaults.json", [
         "offline_installer/app/shared/mea_defaults.json",
@@ -47,6 +50,18 @@ SYNC_PAIRS: List[Tuple[str, List[str]]] = [
     ]),
     ("web_app/src/types.ts", [
         "offline_installer/app/web_app/src/types.ts",
+    ]),
+    ("web_app/src/api/client.ts", [
+        "offline_installer/app/web_app/src/api/client.ts",
+    ]),
+    ("web_app/src/store/index.tsx", [
+        "offline_installer/app/web_app/src/store/index.tsx",
+    ]),
+    ("web_app/src/components/sidebar/ClassificationSection.tsx", [
+        "offline_installer/app/web_app/src/components/sidebar/ClassificationSection.tsx",
+    ]),
+    ("web_app/src/components/sidebar/ActionsSection.tsx", [
+        "offline_installer/app/web_app/src/components/sidebar/ActionsSection.tsx",
     ]),
     # Calibration tool's types.ts has its own schema BUT mirrors to its own
     # offline copy.  We sync calibration -> calibration-offline (not from

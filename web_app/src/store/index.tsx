@@ -39,6 +39,7 @@ export const initialState: AppState = {
     detectShadows: false,
     shareModel: true,
     exportFormat: "tif",
+    sam3Enabled: true,
   },
   mapLayers: [],
   layerGroups: [],
