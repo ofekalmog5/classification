@@ -1,23 +1,32 @@
-import type { ClassItem } from "../types";
+import type { ClassItem, MeaClassEntry } from "../types";
 
 /**
- * MEA predefined material classes matching backend/app/core.py MEA_CLASSES.
+ * MEA 6-material schema. Each entry carries metadata used by the calibration UI
+ * and the SAM3-first pipeline (see backend/app/core.py MEA_CLASSES).
+ *
+ *   - source:        "mask" pixels come from SAM3/shapefile, "kmeans" from RGB clustering
+ *   - subAbsorbs:    legacy 13-material names that this class now covers
+ *   - compositeName: display name in the Composite_Material_Table XML output
  */
-export const MEA_CLASSES: ClassItem[] = [
-  { id: "class-1",  name: "BM_ASPHALT",        color: "#2D2D30" },
-  { id: "class-2",  name: "BM_CONCRETE",       color: "#B4B4B4" },
-  { id: "class-3",  name: "BM_FOLIAGE",        color: "#006400" },
-  { id: "class-4",  name: "BM_LAND_DRY_GRASS", color: "#BDB76B" },
-  { id: "class-5",  name: "BM_LAND_GRASS",     color: "#7CFC00" },
-  { id: "class-6",  name: "BM_METAL",          color: "#A9ABB0" },
-  { id: "class-7",  name: "BM_METAL_STEEL",    color: "#708090" },
-  { id: "class-8",  name: "BM_PAINT_ASPHALT",  color: "#3C3F41" },
-  { id: "class-9",  name: "BM_ROCK",           color: "#827B73" },
-  { id: "class-10", name: "BM_SAND",           color: "#EDC9AF" },
-  { id: "class-11", name: "BM_SOIL",           color: "#654321" },
-  { id: "class-12", name: "BM_VEGETATION",     color: "#228B22" },
-  { id: "class-13", name: "BM_WATER",          color: "#1C6BA0" },
+export const MEA_CLASS_ENTRIES: MeaClassEntry[] = [
+  { id: "class-1", name: "BM_ASPHALT",    color: "#2D2D30", compositeName: "ASPHALT",       source: "mask",   subAbsorbs: ["BM_PAINT_ASPHALT"] },
+  { id: "class-2", name: "BM_CONCRETE",   color: "#B4B4B4", compositeName: "CONCRETE",      source: "mask",   subAbsorbs: ["BM_ROCK", "BM_METAL", "BM_METAL_STEEL"] },
+  { id: "class-3", name: "BM_VEGETATION", color: "#228B22", compositeName: "GENVEGETATION", source: "kmeans", subAbsorbs: ["BM_FOLIAGE", "BM_LAND_GRASS", "BM_LAND_DRY_GRASS"] },
+  { id: "class-4", name: "BM_WATER",      color: "#1C6BA0", compositeName: "WATER",         source: "kmeans", subAbsorbs: [] },
+  { id: "class-5", name: "BM_SAND",       color: "#EDC9AF", compositeName: "SAND",          source: "kmeans", subAbsorbs: [] },
+  { id: "class-6", name: "BM_SOIL",       color: "#654321", compositeName: "SOIL",          source: "kmeans", subAbsorbs: [] },
 ];
+
+/**
+ * Network-payload view of MEA_CLASS_ENTRIES — what gets sent to /classify.
+ * The backend's ClassItem Pydantic model only needs id, name, color.
+ */
+export const MEA_CLASSES: ClassItem[] = MEA_CLASS_ENTRIES.map(({ id, name, color }) => ({ id, name, color }));
+
+/** Factory hex color per BM_* name — used by the calibration tool sidebar. */
+export const FACTORY_COLORS: Record<string, string> = Object.fromEntries(
+  MEA_CLASS_ENTRIES.map(({ name, color }) => [name, color])
+);
 
 /** Default palette for N custom classes */
 const BASE_PALETTE = [

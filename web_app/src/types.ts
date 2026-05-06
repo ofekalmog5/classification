@@ -6,6 +6,13 @@ export interface ClassItem {
   color: string; // hex e.g. "#B4B4B4"
 }
 
+/** Extended MEA class entry — UI/display metadata layered on top of ClassItem. */
+export interface MeaClassEntry extends ClassItem {
+  compositeName: string;
+  source: "mask" | "kmeans";
+  subAbsorbs: string[];
+}
+
 export interface VectorLayer {
   id: string;
   name: string;

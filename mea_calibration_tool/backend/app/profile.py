@@ -51,9 +51,9 @@ def load_factory_defaults() -> Dict[str, Any]:
 
 
 def save_profile(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Persist *data* as the active calibration profile (v2 schema)."""
+    """Persist *data* as the active calibration profile (v3 6-material schema)."""
     profile = dict(data)
-    profile["version"] = 2
+    profile["version"] = 3
     profile.setdefault("created_at", datetime.now(timezone.utc).isoformat())
 
     # Compute tolerance_radius for each material that has std_rgb

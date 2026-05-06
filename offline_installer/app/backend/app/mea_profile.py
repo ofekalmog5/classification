@@ -2,11 +2,15 @@
 MEA material calibration profile — read-only consumer for the main app.
 
 Profiles are written by the standalone MEA Calibration Tool and stored at:
-  %ProgramData%\MaterialClassification\mea_calibration_profile.json
+  %ProgramData%\\MaterialClassification\\mea_calibration_profile.json
 
 The main app only reads the active profile. All write operations live in the
 calibration tool.  When no user profile exists, the factory defaults bundled
 with the app are used (shared/mea_defaults.json).
+
+A v2→v3 migration shim absorbs legacy 13-material profiles into the new
+6-material schema in-memory on load.  The on-disk profile is left untouched
+until the calibration tool saves a fresh one.
 """
 from __future__ import annotations
 
@@ -23,6 +27,18 @@ _SHARED_PROFILE_PATH = (
 
 _FACTORY_DEFAULT_PATH = Path(__file__).parent.parent.parent / "shared" / "mea_defaults.json"
 
+# Maps each legacy 13-material name to its 6-material parent.
+# Mirrors core.py _MEA_LEGACY_TO_PARENT to keep this module standalone.
+_LEGACY_TO_PARENT: Dict[str, str] = {
+    "BM_PAINT_ASPHALT":  "BM_ASPHALT",
+    "BM_ROCK":           "BM_CONCRETE",
+    "BM_METAL":          "BM_CONCRETE",
+    "BM_METAL_STEEL":    "BM_CONCRETE",
+    "BM_FOLIAGE":        "BM_VEGETATION",
+    "BM_LAND_GRASS":     "BM_VEGETATION",
+    "BM_LAND_DRY_GRASS": "BM_VEGETATION",
+}
+
 
 def _load_factory_defaults() -> Dict[str, Any]:
     try:
@@ -32,14 +48,50 @@ def _load_factory_defaults() -> Dict[str, Any]:
         return {}
 
 
+def _migrate_legacy_profile(user: Dict[str, Any]) -> Dict[str, Any]:
+    """Migrate a v2 (13-material) user profile to v3 (6-material) in-memory.
+
+    Legacy materials' anchor RGBs are folded into their new parent's anchor
+    list so the parent material absorbs the calibrated color samples. The
+    legacy keys are then removed.  No-op if profile is already v3+.
+    """
+    if int(user.get("version", 1)) >= 3:
+        return user
+
+    user_mats: Dict[str, Any] = dict(user.get("material_overrides", {}))
+    if not any(name in user_mats for name in _LEGACY_TO_PARENT):
+        # v2 profile but no legacy keys — just bump version.
+        out = dict(user)
+        out["version"] = 3
+        return out
+
+    print("[mea_profile] Migrating v2 profile -> v3 (absorbing legacy materials)")
+    for legacy_name, parent_name in _LEGACY_TO_PARENT.items():
+        legacy_mat = user_mats.pop(legacy_name, None)
+        if not isinstance(legacy_mat, dict):
+            continue   # missing, malformed (None / int), or non-dict — skip
+        parent_mat = user_mats.setdefault(parent_name, {"anchors": []})
+        parent_anchors = list(parent_mat.get("anchors", []))
+        for anchor in legacy_mat.get("anchors", []) or []:
+            if anchor not in parent_anchors:
+                parent_anchors.append(anchor)
+        parent_mat["anchors"] = parent_anchors
+
+    out = dict(user)
+    out["material_overrides"] = user_mats
+    out["version"] = 3
+    return out
+
+
 def load_active_profile() -> Dict[str, Any]:
     """Return the active profile, merging user overrides onto factory defaults.
 
-    Returns (profile_dict, source) where source is 'user' or 'factory'.
+    Legacy v2 user profiles are migrated to v3 in-memory before merging.
     """
     if _SHARED_PROFILE_PATH.exists():
         try:
             user = json.loads(_SHARED_PROFILE_PATH.read_text(encoding="utf-8"))
+            user = _migrate_legacy_profile(user)
             factory = _load_factory_defaults()
             merged = _merge_profile(factory, user)
             merged["_source"] = "user"
@@ -57,6 +109,7 @@ def profile_status() -> Dict[str, Any]:
     if _SHARED_PROFILE_PATH.exists():
         try:
             user = json.loads(_SHARED_PROFILE_PATH.read_text(encoding="utf-8"))
+            user = _migrate_legacy_profile(user)
             mat_count = len(user.get("material_overrides", {}))
             return {
                 "active": True,

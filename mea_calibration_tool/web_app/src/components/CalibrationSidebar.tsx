@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useAppState, useAppDispatch } from "../store";
-import { MEA_CLASSES, FACTORY_COLORS } from "../constants/mea";
+import { MEA_CLASS_ENTRIES, FACTORY_COLORS } from "../constants/mea";
 import {
   samplePixels,
   saveProfile,
@@ -228,7 +228,7 @@ export default function CalibrationSidebar() {
           </div>
 
           <div style={{ flex: 1, overflowY: "auto" }}>
-            {MEA_CLASSES.map((cls) => {
+            {MEA_CLASS_ENTRIES.map((cls) => {
               const swatch = calibration.swatches[cls.name];
               const isActive = calibration.activeMaterial === cls.name;
               const regionCount = swatch?.regions.length ?? 0;
@@ -236,6 +236,9 @@ export default function CalibrationSidebar() {
               const color = sampled
                 ? `rgb(${sampled.join(",")})`
                 : (profileColors[cls.name] ?? FACTORY_COLORS[cls.name] ?? "#aaa");
+              const absorbsHint = cls.subAbsorbs.length
+                ? `absorbs ${cls.subAbsorbs.map((n) => n.replace("BM_", "")).join(", ")}`
+                : "";
 
               return (
                 <div
@@ -244,11 +247,17 @@ export default function CalibrationSidebar() {
                     dispatch({ type: "CAL_SET_ACTIVE_MATERIAL", material: isActive ? null : cls.name })
                   }
                   style={{ ...S.matRow, ...(isActive ? S.matRowActive : {}) }}
+                  title={absorbsHint || undefined}
                 >
                   <span style={{ ...S.swatch, background: color }} />
-                  <span style={{ flex: 1, fontFamily: "monospace", fontSize: 10, color: isActive ? "#9fce9f" : "#ccc" }}>
-                    {cls.name.replace("BM_", "")}
-                  </span>
+                  <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
+                    <span style={{ fontFamily: "monospace", fontSize: 10, color: isActive ? "#9fce9f" : "#ccc" }}>
+                      {cls.name.replace("BM_", "")}
+                    </span>
+                    {absorbsHint && (
+                      <span style={{ fontSize: 8, color: "#666", marginTop: 1 }}>{absorbsHint}</span>
+                    )}
+                  </div>
                   {regionCount > 0 && (
                     <span style={{ fontSize: 10, color: "#888" }}>{regionCount}r</span>
                   )}
@@ -277,7 +286,7 @@ export default function CalibrationSidebar() {
               onClick={handleSampleAll}
               disabled={sampling || !hasRegions}
             >
-              {sampling ? "Sampling…" : `Sample (${calibratedCount}/${MEA_CLASSES.length})`}
+              {sampling ? "Sampling…" : `Sample (${calibratedCount}/${MEA_CLASS_ENTRIES.length})`}
             </button>
             <button
               style={S.btn}

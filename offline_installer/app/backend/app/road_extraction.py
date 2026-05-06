@@ -1332,13 +1332,13 @@ FEATURE_CONFIGS: Dict[str, List[Dict]] = {
         {
             "prompt": "grass, lawn, field, meadow, pasture",
             "suffix": "fields_grass",
-            "color": (124, 252, 0),       # BM_LAND_GRASS #7CFC00
+            "color": (34, 139, 34),       # BM_VEGETATION #228B22 (6-material schema)
             "color_detect": _color_detect_fields,
         },
         {
             "prompt": "crop, farmland, agriculture, cultivated field",
             "suffix": "fields_agriculture",
-            "color": (189, 183, 107),     # BM_LAND_DRY_GRASS #BDB76B
+            "color": (34, 139, 34),       # BM_VEGETATION #228B22 (6-material schema)
             "color_detect": _color_detect_fields,
         },
     ],
