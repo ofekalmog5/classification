@@ -297,3 +297,264 @@ def test_split_classes_by_source_unknown_name_defaults_to_kmeans():
     kmeans, masks = _split_classes_by_source(custom)
     assert kmeans == custom
     assert masks == []
+
+
+# ─── Phase 3 — soft-prior fusion + per-component veto ────────────────────────
+
+def _try_import_geo():
+    try:
+        import numpy
+        import rasterio
+        import scipy.ndimage  # noqa: F401
+        return numpy, rasterio
+    except Exception:
+        return None, None
+
+
+_NP_RIO = _try_import_geo()
+requires_geo = pytest.mark.skipif(
+    _NP_RIO[0] is None,
+    reason="numpy/rasterio/scipy not available in test env",
+)
+
+
+def _write_synthetic_geotiff(path, rgb_array, np_mod, rio_mod):
+    """Helper: write a 3-band uint8 GeoTIFF from an (H,W,3) numpy array."""
+    arr = np_mod.transpose(rgb_array, (2, 0, 1)).astype(np_mod.uint8)
+    profile = {
+        "driver": "GTiff", "height": arr.shape[1], "width": arr.shape[2],
+        "count": 3, "dtype": "uint8",
+        "transform": rio_mod.transform.from_origin(0, arr.shape[1], 1, 1),
+        "crs": "EPSG:32636",  # arbitrary metric CRS
+    }
+    with rio_mod.open(str(path), "w", **profile) as dst:
+        dst.write(arr)
+
+
+def _write_synthetic_mask(path, mask_array, np_mod, rio_mod, ref_geotiff):
+    """Helper: write a 1-band uint8 mask aligned with ref_geotiff."""
+    with rio_mod.open(str(ref_geotiff)) as src:
+        profile = src.profile.copy()
+    profile.update(count=1, dtype="uint8")
+    with rio_mod.open(str(path), "w", **profile) as dst:
+        dst.write(mask_array.astype(np_mod.uint8), 1)
+
+
+@requires_core
+@requires_geo
+def test_fusion_compatible_component_painted(tmp_path):
+    """A road-mask component overlapping mostly KMeans soil (compatible) gets
+    painted with BM_ASPHALT."""
+    np = _NP_RIO[0]; rio = _NP_RIO[1]
+    from app.pipeline import _fuse_with_priors_and_veto
+
+    H, W = 20, 20
+    soil_rgb = (101, 67, 33)         # BM_SOIL
+    asphalt_rgb = (45, 45, 48)       # BM_ASPHALT
+    rgb = np.zeros((H, W, 3), dtype=np.uint8)
+    rgb[..., 0] = soil_rgb[0]; rgb[..., 1] = soil_rgb[1]; rgb[..., 2] = soil_rgb[2]
+
+    mask = np.zeros((H, W), dtype=np.uint8)
+    mask[5:15, 5:15] = 1
+
+    cls_path = tmp_path / "classification.tif"
+    mask_path = tmp_path / "road_mask.tif"
+    _write_synthetic_geotiff(cls_path, rgb, np, rio)
+    _write_synthetic_mask(mask_path, mask, np, rio, cls_path)
+
+    kmeans_classes = [
+        {"id": "class-3", "name": "BM_VEGETATION", "color": "#228B22"},
+        {"id": "class-4", "name": "BM_WATER",      "color": "#1C6BA0"},
+        {"id": "class-5", "name": "BM_SAND",       "color": "#EDC9AF"},
+        {"id": "class-6", "name": "BM_SOIL",       "color": "#654321"},
+    ]
+    fusion_inputs = [(str(mask_path), asphalt_rgb, "BM_ASPHALT", "sam3")]
+
+    result = _fuse_with_priors_and_veto(
+        classification_path=str(cls_path),
+        fusion_inputs=fusion_inputs,
+        kmeans_classes=kmeans_classes,
+    )
+    assert result["status"] == "ok"
+    assert result["fusionStats"]["BM_ASPHALT"]["vetoed"] == 0
+    assert result["fusionStats"]["BM_ASPHALT"]["total"] == 1
+
+    with rio.open(result["outputPath"]) as out:
+        out_rgb = out.read()
+    # Pixels under the mask should be painted asphalt color.
+    assert int(out_rgb[0, 10, 10]) == asphalt_rgb[0]
+    # Pixels outside the mask should still be soil color.
+    assert int(out_rgb[0, 0, 0]) == soil_rgb[0]
+
+
+@requires_core
+@requires_geo
+def test_fusion_vegetation_component_vetoed(tmp_path):
+    """A road-mask component overlapping a forest (BM_VEGETATION pixels) is
+    vetoed because the KMeans evidence overwhelmingly disagrees with road."""
+    np = _NP_RIO[0]; rio = _NP_RIO[1]
+    from app.pipeline import _fuse_with_priors_and_veto
+
+    H, W = 20, 20
+    veg_rgb = (34, 139, 34)          # BM_VEGETATION
+    asphalt_rgb = (45, 45, 48)
+    rgb = np.zeros((H, W, 3), dtype=np.uint8)
+    rgb[..., 0] = veg_rgb[0]; rgb[..., 1] = veg_rgb[1]; rgb[..., 2] = veg_rgb[2]
+
+    mask = np.zeros((H, W), dtype=np.uint8)
+    mask[5:15, 5:15] = 1
+
+    cls_path = tmp_path / "classification.tif"
+    mask_path = tmp_path / "road_mask.tif"
+    _write_synthetic_geotiff(cls_path, rgb, np, rio)
+    _write_synthetic_mask(mask_path, mask, np, rio, cls_path)
+
+    kmeans_classes = [
+        {"id": "class-3", "name": "BM_VEGETATION", "color": "#228B22"},
+        {"id": "class-4", "name": "BM_WATER",      "color": "#1C6BA0"},
+        {"id": "class-5", "name": "BM_SAND",       "color": "#EDC9AF"},
+        {"id": "class-6", "name": "BM_SOIL",       "color": "#654321"},
+    ]
+    fusion_inputs = [(str(mask_path), asphalt_rgb, "BM_ASPHALT", "sam3")]
+
+    result = _fuse_with_priors_and_veto(
+        classification_path=str(cls_path),
+        fusion_inputs=fusion_inputs,
+        kmeans_classes=kmeans_classes,
+    )
+    assert result["status"] == "ok"
+    assert result["fusionStats"]["BM_ASPHALT"]["vetoed"] == 1
+    assert result["fusionStats"]["BM_ASPHALT"]["total"] == 1
+
+    with rio.open(result["outputPath"]) as out:
+        out_rgb = out.read()
+    # Vetoed: pixel under the mask should still be vegetation, not asphalt.
+    assert int(out_rgb[0, 10, 10]) == veg_rgb[0]
+    assert int(out_rgb[1, 10, 10]) == veg_rgb[1]
+
+
+@requires_core
+@requires_geo
+def test_fusion_drifted_vegetation_still_vetoes_within_tolerance(tmp_path):
+    """Vegetation pixels that drift slightly from the canonical anchor
+    (still well within the ±17/channel tolerance band) should still be
+    detected as incompatible with road."""
+    np = _NP_RIO[0]; rio = _NP_RIO[1]
+    from app.pipeline import _fuse_with_priors_and_veto
+
+    H, W = 20, 20
+    # Drift the green a bit: from (34,139,34) -> (40,130,40).
+    # d² = 36 + 81 + 36 = 153, well within the 900 tolerance.
+    drifted_veg = (40, 130, 40)
+    asphalt_rgb = (45, 45, 48)
+    rgb = np.zeros((H, W, 3), dtype=np.uint8)
+    rgb[..., 0] = drifted_veg[0]; rgb[..., 1] = drifted_veg[1]; rgb[..., 2] = drifted_veg[2]
+    mask = np.zeros((H, W), dtype=np.uint8); mask[5:15, 5:15] = 1
+
+    cls_path = tmp_path / "classification.tif"
+    mask_path = tmp_path / "road_mask.tif"
+    _write_synthetic_geotiff(cls_path, rgb, np, rio)
+    _write_synthetic_mask(mask_path, mask, np, rio, cls_path)
+
+    kmeans_classes = [
+        {"id": "class-3", "name": "BM_VEGETATION", "color": "#228B22"},
+        {"id": "class-4", "name": "BM_WATER",      "color": "#1C6BA0"},
+        {"id": "class-5", "name": "BM_SAND",       "color": "#EDC9AF"},
+        {"id": "class-6", "name": "BM_SOIL",       "color": "#654321"},
+    ]
+    result = _fuse_with_priors_and_veto(
+        classification_path=str(cls_path),
+        fusion_inputs=[(str(mask_path), asphalt_rgb, "BM_ASPHALT", "sam3")],
+        kmeans_classes=kmeans_classes,
+    )
+    assert result["fusionStats"]["BM_ASPHALT"]["vetoed"] == 1, \
+        "Slightly drifted vegetation should still trigger the veto"
+
+
+@requires_core
+@requires_geo
+def test_fusion_color_outside_tolerance_does_not_trigger_veto(tmp_path):
+    """A muted green that's outside the ±17/channel tolerance band should
+    NOT count as 'incompatible' — the mask paints over it normally."""
+    np = _NP_RIO[0]; rio = _NP_RIO[1]
+    from app.pipeline import _fuse_with_priors_and_veto
+
+    H, W = 20, 20
+    # Far from (34,139,34): d² = 676 + 361 + 676 = 1713 > 900.
+    out_of_band = (60, 120, 60)
+    asphalt_rgb = (45, 45, 48)
+    rgb = np.zeros((H, W, 3), dtype=np.uint8)
+    rgb[..., 0] = out_of_band[0]; rgb[..., 1] = out_of_band[1]; rgb[..., 2] = out_of_band[2]
+    mask = np.zeros((H, W), dtype=np.uint8); mask[5:15, 5:15] = 1
+
+    cls_path = tmp_path / "classification.tif"
+    mask_path = tmp_path / "road_mask.tif"
+    _write_synthetic_geotiff(cls_path, rgb, np, rio)
+    _write_synthetic_mask(mask_path, mask, np, rio, cls_path)
+
+    kmeans_classes = [
+        {"id": "class-3", "name": "BM_VEGETATION", "color": "#228B22"},
+        {"id": "class-4", "name": "BM_WATER",      "color": "#1C6BA0"},
+        {"id": "class-5", "name": "BM_SAND",       "color": "#EDC9AF"},
+        {"id": "class-6", "name": "BM_SOIL",       "color": "#654321"},
+    ]
+    result = _fuse_with_priors_and_veto(
+        classification_path=str(cls_path),
+        fusion_inputs=[(str(mask_path), asphalt_rgb, "BM_ASPHALT", "sam3")],
+        kmeans_classes=kmeans_classes,
+    )
+    assert result["fusionStats"]["BM_ASPHALT"]["vetoed"] == 0, \
+        "Out-of-band color should not trigger the veto"
+
+
+@requires_core
+@requires_geo
+def test_fusion_shapefile_threshold_higher_than_sam3(tmp_path):
+    """A mostly-vegetation component is vetoed when source=sam3 (threshold
+    0.55) but kept when source=shapefile (threshold 0.85)."""
+    np = _NP_RIO[0]; rio = _NP_RIO[1]
+    from app.pipeline import _fuse_with_priors_and_veto
+
+    H, W = 20, 20
+    veg_rgb = (34, 139, 34)
+    soil_rgb = (101, 67, 33)
+    asphalt_rgb = (45, 45, 48)
+
+    # 70% vegetation, 30% soil under the mask.  This is above the SAM3
+    # veto threshold (0.55) but below the shapefile one (0.85).
+    rgb = np.zeros((H, W, 3), dtype=np.uint8)
+    rgb[..., 0] = soil_rgb[0]; rgb[..., 1] = soil_rgb[1]; rgb[..., 2] = soil_rgb[2]
+    rgb[5:12, 5:15, 0] = veg_rgb[0]
+    rgb[5:12, 5:15, 1] = veg_rgb[1]
+    rgb[5:12, 5:15, 2] = veg_rgb[2]
+
+    mask = np.zeros((H, W), dtype=np.uint8)
+    mask[5:15, 5:15] = 1   # 100 pixels: 70 veg + 30 soil
+
+    cls_path = tmp_path / "classification.tif"
+    mask_path = tmp_path / "road_mask.tif"
+    _write_synthetic_geotiff(cls_path, rgb, np, rio)
+    _write_synthetic_mask(mask_path, mask, np, rio, cls_path)
+
+    kmeans_classes = [
+        {"id": "class-3", "name": "BM_VEGETATION", "color": "#228B22"},
+        {"id": "class-4", "name": "BM_WATER",      "color": "#1C6BA0"},
+        {"id": "class-5", "name": "BM_SAND",       "color": "#EDC9AF"},
+        {"id": "class-6", "name": "BM_SOIL",       "color": "#654321"},
+    ]
+
+    # SAM3 source -> vetoed (70% > 55% threshold)
+    result_sam3 = _fuse_with_priors_and_veto(
+        classification_path=str(cls_path),
+        fusion_inputs=[(str(mask_path), asphalt_rgb, "BM_ASPHALT", "sam3")],
+        kmeans_classes=kmeans_classes,
+    )
+    assert result_sam3["fusionStats"]["BM_ASPHALT"]["vetoed"] == 1
+
+    # Shapefile source -> kept (70% < 85% threshold)
+    result_shp = _fuse_with_priors_and_veto(
+        classification_path=str(cls_path),
+        fusion_inputs=[(str(mask_path), asphalt_rgb, "BM_ASPHALT", "shapefile")],
+        kmeans_classes=kmeans_classes,
+    )
+    assert result_shp["fusionStats"]["BM_ASPHALT"]["vetoed"] == 0
