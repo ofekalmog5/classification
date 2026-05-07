@@ -23,9 +23,9 @@ output raster with a unique suffix.
 |---------|---------------|-------------------|---------------------|
 | `roads` | `road, highway, asphalt path` | `roads` | `BM_ASPHALT` (`#2D2D30`) |
 | `buildings` | `building, house, roof, rooftop, structure` | `buildings` | `BM_CONCRETE` (`#B4B4B4`) |
-| `trees` | `tree, trees, forest, woodland, grove` | `trees` | `BM_VEGETATION` (`#228B22`) |
-| `fields` | `grass, lawn, field, meadow, pasture` | `fields_grass` | `BM_LAND_GRASS` (`#7CFC00`) |
-| | `crop, farmland, agriculture, cultivated field` | `fields_agriculture` | `BM_LAND_DRY_GRASS` (`#BDB76B`) |
+| `trees` | `tree, trees, forest, woodland, grove` | `trees` | `BM_VEGETATION` (`#006400`) |
+| `fields` | `grass, lawn, field, meadow, pasture` | `fields_grass` | `BM_VEGETATION` (`#006400`) |
+| | `crop, farmland, agriculture, cultivated field` | `fields_agriculture` | `BM_VEGETATION` (`#006400`) |
 | `water` | `water, lake, pond, reservoir, pool` | `water_bodies` | `BM_WATER` (`#1C6BA0`) |
 | | `river, stream, canal, waterway, channel` | `water_channels` | `BM_WATER` (`#1C6BA0`) |
 | | `sea, ocean, fish pond, swimming pool` | `water_other` | `BM_WATER` (`#1C6BA0`) |

@@ -550,11 +550,24 @@ MEA_CLASSES = [
         "id": "class-3", "name": "BM_VEGETATION", "color": "#228B22",
         "composite_name": "GENVEGETATION", "source": "kmeans", "material_type": "VEGETATION",
         "sub_absorbs": ["BM_FOLIAGE", "BM_LAND_GRASS", "BM_LAND_DRY_GRASS"],
-        "anchors": [[34, 139, 34], [0, 100, 0], [124, 252, 0], [189, 183, 107]],
+        # Anchors are deliberately constrained to clearly green-dominant RGBs
+        # (G > R AND G > B by a comfortable margin).  Earlier revisions included
+        # tan/khaki anchors like [189,183,107] and [150,160,90]; with strict 1:1
+        # cluster→material assignment those are no longer needed and they
+        # caused soil/sand pixels to be pulled into vegetation.
+        "anchors": [
+            [34, 139, 34],   # forest green
+            [0, 100, 0],     # dark forest
+            [124, 252, 0],   # lime / lush grass
+            [80, 100, 55],   # olive / dry grass — G dominant
+            [60, 90, 50],    # shadowed grass
+            [110, 130, 80],  # sage / dry meadow
+            [70, 110, 70],   # mid green
+        ],
     },
     {
         "id": "class-4", "name": "BM_WATER", "color": "#1C6BA0",
-        "composite_name": "WATER", "source": "kmeans", "material_type": "WATER",
+        "composite_name": "WATER", "source": "mask", "material_type": "WATER",
         "sub_absorbs": [],
         "anchors": [[28, 107, 160]],
     },
@@ -568,7 +581,16 @@ MEA_CLASSES = [
         "id": "class-6", "name": "BM_SOIL", "color": "#654321",
         "composite_name": "SOIL", "source": "kmeans", "material_type": "SOIL_EARTH",
         "sub_absorbs": [],
-        "anchors": [[101, 67, 33]],
+        # Pure-brown anchors only — deliberately avoid the greenish-brown
+        # band so dry grass and shadowed vegetation do not get pulled into
+        # soil.  (Greenish-brown is covered by BM_VEGETATION's olive anchors.)
+        "anchors": [
+            [101, 67, 33],   # earth brown
+            [139, 90, 43],   # saddle brown
+            [85, 55, 30],    # dark brown
+            [160, 110, 70],  # tan/brown
+            [120, 80, 50],   # rich brown
+        ],
     },
 ]
 
@@ -577,6 +599,32 @@ _MEA_MASK_MATERIALS   = {c["name"] for c in MEA_CLASSES if c["source"] == "mask"
 _MEA_KMEANS_MATERIALS = {c["name"] for c in MEA_CLASSES if c["source"] == "kmeans"}
 _MEA_ANCHOR_MAP: Dict[str, List[List[int]]] = {c["name"]: c["anchors"] for c in MEA_CLASSES}
 _MEA_COMPOSITE_NAMES: Dict[str, str] = {c["name"]: c["composite_name"] for c in MEA_CLASSES}
+
+
+def _resolve_active_anchor_map() -> Dict[str, List[List[int]]]:
+    """Return the anchor map merged with the user's active calibration profile.
+
+    Reads ``mea_profile.load_active_profile()`` (which already merges the user's
+    calibrated overrides onto factory defaults) and overlays its per-material
+    ``anchors`` arrays onto the hardcoded ``_MEA_ANCHOR_MAP``.  When the user
+    has not run the calibration tool, this returns the hardcoded defaults
+    unchanged.  Errors fall back to defaults so a malformed profile never
+    breaks classification.
+    """
+    base = {k: list(v) for k, v in _MEA_ANCHOR_MAP.items()}
+    try:
+        from . import mea_profile  # local import — avoids hard import cycle
+        profile = mea_profile.load_active_profile() or {}
+        overrides = profile.get("material_overrides", {}) or {}
+        for name, mat in overrides.items():
+            if not isinstance(mat, dict):
+                continue
+            anchors = mat.get("anchors")
+            if isinstance(anchors, list) and anchors:
+                base[name] = [list(a) for a in anchors]
+    except Exception as exc:
+        print(f"[core] anchor resolver: profile read failed ({exc}); using hardcoded defaults")
+    return base
 
 # Reverse map: legacy 13-material name -> new 6-material parent (for profile migration).
 _MEA_LEGACY_TO_PARENT: Dict[str, str] = {
@@ -3440,155 +3488,6 @@ def rasterize_vectors_onto_classification(
     }
 
 
-def recommend_cluster_count(
-    raster_path: str,
-    feature_flags: Dict[str, bool],
-    min_clusters: int = 2,
-    max_clusters: int = 10
-) -> int:
-    """
-    Analyze raster and recommend optimal number of clusters.
-    Uses robust random sampling and a weighted combination of:
-    - Silhouette score (higher is better)
-    - Calinski-Harabasz score (higher is better)
-    - Davies-Bouldin score (lower is better)
-    - Inertia elbow curvature (knee preference)
-    """
-    from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
-
-    def _normalize(values: Dict[int, float], invert: bool = False) -> Dict[int, float]:
-        if not values:
-            return {}
-        min_v = min(values.values())
-        max_v = max(values.values())
-        if abs(max_v - min_v) < 1e-12:
-            out = {k: 0.5 for k in values.keys()}
-        else:
-            out = {k: (v - min_v) / (max_v - min_v) for k, v in values.items()}
-        if invert:
-            out = {k: 1.0 - v for k, v in out.items()}
-        return out
-    
-    path = Path(raster_path)
-    if not path.exists():
-        raise ValueError("Raster path not found")
-
-    print("\n[Recommendation] Loading raster for analysis...")
-    with rasterio.open(path) as src:
-        raster_data = src.read()
-    
-    height, width = raster_data.shape[1], raster_data.shape[2]
-    n_pixels = height * width
-    
-    # Extract pixel-level features
-    print(f"[Recommendation] Extracting pixel features from {n_pixels} pixels...")
-    features = _extract_pixel_features(raster_data, feature_flags, window_size=3)
-
-    # Robust random sampling for better representativeness
-    max_samples = 60000
-    rng = np.random.default_rng(42)
-    if len(features) > max_samples:
-        sample_idx = rng.choice(len(features), size=max_samples, replace=False)
-        sampled_features = features[sample_idx]
-    else:
-        sampled_features = features
-
-    # Keep only valid finite rows
-    finite_mask = np.all(np.isfinite(sampled_features), axis=1)
-    sampled_features = sampled_features[finite_mask]
-
-    if len(sampled_features) < 50:
-        default_n = max(min_clusters, 3)
-        print(f"[Recommendation] Not enough valid samples, returning default ({default_n})")
-        return default_n
-
-    print(f"[Recommendation] Sampled {len(sampled_features)} pixels for analysis")
-    
-    # Normalize features
-    scaler = StandardScaler()
-    features_normalized = scaler.fit_transform(sampled_features)
-    
-    # Keep cluster range valid for the sampled dataset
-    upper = min(max_clusters, max(min_clusters, len(features_normalized) - 1))
-    lower = min_clusters
-    if upper < lower:
-        fallback = max(2, min(5, len(features_normalized) - 1))
-        print(f"[Recommendation] Too few samples for range, returning {fallback}")
-        return fallback
-
-    print(f"[Recommendation] Testing {lower}-{upper} clusters...")
-
-    silhouette_scores: Dict[int, float] = {}
-    ch_scores: Dict[int, float] = {}
-    db_scores: Dict[int, float] = {}
-    inertias: Dict[int, float] = {}
-
-    for n in range(lower, upper + 1):
-        try:
-            kmeans = _make_kmeans(n, mini_batch=False)
-            labels = kmeans.fit_predict(features_normalized)
-
-            sil_sample_size = min(8000, len(features_normalized))
-            sil = silhouette_score(features_normalized, labels, sample_size=sil_sample_size, random_state=42)
-            ch = calinski_harabasz_score(features_normalized, labels)
-            db = davies_bouldin_score(features_normalized, labels)
-
-            silhouette_scores[n] = float(sil)
-            ch_scores[n] = float(ch)
-            db_scores[n] = float(db)
-            inertias[n] = float(kmeans.inertia_)
-
-            print(f"  {n} clusters: sil={sil:.4f}, ch={ch:.2f}, db={db:.4f}, inertia={kmeans.inertia_:.2f}")
-        except Exception as e:
-            print(f"  {n} clusters: error - {e}")
-            continue
-
-    if not silhouette_scores:
-        print("[Recommendation] No valid results, returning default (5)")
-        return 5
-
-    sil_norm = _normalize(silhouette_scores)
-    ch_norm = _normalize(ch_scores)
-    db_inv_norm = _normalize(db_scores, invert=True)
-
-    # Elbow curvature on log-inertia: larger positive curvature indicates a better knee.
-    curvature: Dict[int, float] = {n: 0.0 for n in inertias.keys()}
-    sorted_ns = sorted(inertias.keys())
-    if len(sorted_ns) >= 3:
-        log_inertia = {n: math.log(max(inertias[n], 1e-9)) for n in sorted_ns}
-        for idx in range(1, len(sorted_ns) - 1):
-            prev_n = sorted_ns[idx - 1]
-            curr_n = sorted_ns[idx]
-            next_n = sorted_ns[idx + 1]
-            first_drop = log_inertia[prev_n] - log_inertia[curr_n]
-            second_drop = log_inertia[curr_n] - log_inertia[next_n]
-            curvature[curr_n] = max(0.0, first_drop - second_drop)
-    curvature_norm = _normalize(curvature)
-
-    # Weighted consensus score + mild complexity penalty (prefer simpler model when close).
-    combined: Dict[int, float] = {}
-    span = max(1, upper - lower)
-    for n in sorted_ns:
-        complexity_penalty = 0.05 * ((n - lower) / span)
-        combined[n] = (
-            0.45 * sil_norm.get(n, 0.0) +
-            0.25 * ch_norm.get(n, 0.0) +
-            0.20 * db_inv_norm.get(n, 0.0) +
-            0.10 * curvature_norm.get(n, 0.0) -
-            complexity_penalty
-        )
-
-    best_score = max(combined.values())
-    close = [n for n, score in combined.items() if (best_score - score) <= 0.03]
-    best_n = min(close) if close else max(combined.keys(), key=lambda n: combined[n])
-
-    print(
-        f"[Recommendation] [OK] Recommended: {best_n} clusters "
-        f"(combined={combined[best_n]:.4f}, sil={silhouette_scores[best_n]:.4f}, "
-        f"ch={ch_scores[best_n]:.2f}, db={db_scores[best_n]:.4f})"
-    )
-    return best_n
-
 def _build_class_map(classes: List[Dict[str, str]]) -> Dict[str, int]:
     return {item["id"]: idx + 1 for idx, item in enumerate(classes)}
 
@@ -4327,24 +4226,26 @@ def _build_mea_cluster_mapping(
     material_prior: Dict[str, float] | None = None,
     cluster_semantics: List[Dict[str, float]] | None = None,
 ) -> Tuple[List[Dict[str, object]], List[Tuple[int, int, int]]]:
-    """Assign each KMeans cluster to a MEA material via min-anchor RGB distance.
+    """Assign each KMeans cluster to a MEA material via Hungarian 1:1 mapping.
 
-    Each material in MEA_CLASSES carries a list of RGB anchors that absorb
-    clusters from across its semantic group (e.g. BM_VEGETATION absorbs the
-    old foliage / grass / dry-grass anchors). A cluster is assigned to the
-    material whose nearest anchor is closest in RGB space. Multiple clusters
-    may map to the same material — this is correct for multi-anchor absorption.
+    Each material in MEA_CLASSES carries a list of RGB anchors.  The cost from
+    cluster *i* to material *j* is the squared RGB distance from the cluster's
+    mean RGB to its **nearest** anchor in material *j*.  Assignment is then
+    solved as a linear sum assignment problem (Hungarian) so that **each
+    cluster maps to a distinct material** — preventing the previous failure
+    mode where 3 KMeans clusters all collapsed onto BM_VEGETATION because
+    vegetation's anchor set was wider than soil's or sand's.
+
+    When ``n_clusters > n_materials`` (more clusters than materials), Hungarian
+    assigns ``n_materials`` of them 1:1 and the leftover clusters fall back to
+    nearest-material (duplicates allowed), preserving the legacy contract.
 
     The optional ``material_prior`` adds a frequency-weighted nudge: rare
     materials get a small cost bump so common ones win ties.
 
     The legacy parameters ``cluster_counts`` and ``cluster_semantics`` are
-    accepted for caller compatibility but currently unused.  In the SAM3-first
-    pipeline (Phase 2+), road and building pixels are mask-driven, so the
-    per-cluster semantic disambiguation that the old 965-line implementation
-    performed is no longer needed for the 4 remaining KMeans materials
-    (vegetation / water / sand / soil).  These are kept in the signature so
-    existing call sites need no changes when semantic scoring is reintroduced.
+    accepted for caller compatibility but unused — the v6 SAM3-first pipeline
+    delegates road/building disambiguation to mask sources.
 
     Returns ``(mapping, color_table)`` matching the legacy contract.
     """
@@ -4355,11 +4256,16 @@ def _build_mea_cluster_mapping(
     n_clusters = len(cluster_rgbs)
     n_materials = len(material_classes)
 
+    # Resolve anchors against the active user profile once per call.  Profile
+    # overrides (from the MEA Calibration Tool) take precedence over the
+    # hardcoded MEA_CLASSES anchors.
+    active_anchors = _resolve_active_anchor_map()
+
     material_anchors: List[List[Tuple[int, int, int]]] = []
     for cls in material_classes:
         name = cls.get("name", "")
-        if name in _MEA_ANCHOR_MAP:
-            anchors = [tuple(int(c) for c in a) for a in _MEA_ANCHOR_MAP[name]]
+        if name in active_anchors:
+            anchors = [tuple(int(c) for c in a) for a in active_anchors[name]]
         else:
             anchors = [_hex_to_rgb(cls.get("color", "#ffffff"))]
         material_anchors.append(anchors)
@@ -4383,7 +4289,40 @@ def _build_mea_cluster_mapping(
             p = float(material_prior.get(cls.get("name", ""), 0.0))
             cost[:, j] += prevalence_bump * (1.0 - p)
 
-    cluster_to_material = np.argmin(cost, axis=1)
+    # Hue-aware shape penalty.  Pure-RGB distance can't tell shadow-vegetation
+    # (RGB ~50,60,35) from dark soil (RGB ~85,55,30) — they're closer in
+    # Euclidean distance than the truly-green anchors.  This causes Hungarian
+    # to invert the vegetation/soil assignment on dry farmland imagery: the
+    # tan/khaki bare-ground cluster goes to vegetation while the truly-green
+    # shadow cluster goes to soil.  Encode the canonical color shape of each
+    # material as a soft penalty so Hungarian respects "G > R = green-class,
+    # R > G = brown-class" semantics that RGB distance alone can't see.
+    SHAPE_PENALTY = 30000.0   # ~ a synthetic 100-unit-per-channel RGB gap
+    material_names = [cls.get("name", "") for cls in material_classes]
+    for i, (r, g, b) in enumerate(cluster_rgbs):
+        g_dominant = g > r              # vegetation requires G > R
+        bright     = (r + g + b) > 420  # sand requires avg ≳ 140 per channel
+        for j, name in enumerate(material_names):
+            if name == "BM_VEGETATION" and not g_dominant:
+                cost[i, j] += SHAPE_PENALTY
+            elif name == "BM_SOIL" and g_dominant:
+                cost[i, j] += SHAPE_PENALTY
+            elif name == "BM_SAND" and not bright:
+                cost[i, j] += SHAPE_PENALTY
+
+    # Hungarian (linear_sum_assignment) finds the globally optimal 1:1
+    # assignment between clusters and materials.  When n_clusters == n_materials
+    # this is a perfect bijection.  When they differ, scipy assigns
+    # min(n_clusters, n_materials) pairs and we resolve the remainder with
+    # plain nearest-material so the function still returns one entry per
+    # cluster.
+    from scipy.optimize import linear_sum_assignment
+    row_ind, col_ind = linear_sum_assignment(cost)
+    cluster_to_material = np.full(n_clusters, -1, dtype=int)
+    cluster_to_material[row_ind] = col_ind
+    if (cluster_to_material < 0).any():
+        leftover = np.where(cluster_to_material < 0)[0]
+        cluster_to_material[leftover] = np.argmin(cost[leftover], axis=1)
 
     mapping: List[Dict[str, object]] = []
     assigned: List[Tuple[int, int, int]] = []

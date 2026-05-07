@@ -37,6 +37,7 @@ from .road_extraction import merge_road_mask_onto_classification as run_merge_ro
 from .road_extraction import extract_feature_masks as run_extract_feature_masks
 from .road_extraction import merge_feature_masks_onto_classification as run_merge_feature_masks
 from .road_extraction import set_sam3_local_dir, get_road_extract_config
+from .config import load as _load_config, save as _save_config, config_path as _config_path
 
 # ─── SSE progress streaming infrastructure ───────────────────────────────
 
@@ -185,6 +186,7 @@ class ClassifyRequest(BaseModel):
     sam3Enabled: bool = True
     roadShapefile: str | None = None
     buildingShapefile: str | None = None
+    waterShapefile: str | None = None
 
 
 class ClassifyStep1Request(BaseModel):
@@ -206,6 +208,7 @@ class ClassifyStep1Request(BaseModel):
     sam3Enabled: bool = True
     roadShapefile: str | None = None
     buildingShapefile: str | None = None
+    waterShapefile: str | None = None
 
 
 class ClassifyStep2Request(BaseModel):
@@ -352,6 +355,7 @@ def classify(request: ClassifyRequest) -> dict:
     try:
         if use_v6:
             print("[API /classify] routing -> classify_v6 (SAM3-first 6-material pipeline)")
+            water_shp = request.waterShapefile or _load_config().get("water_mask_path")
             result = run_classify_v6(
                 raster_path=request.rasterPath,
                 classes=classes_dict,
@@ -361,6 +365,7 @@ def classify(request: ClassifyRequest) -> dict:
                 sam3_enabled=request.sam3Enabled,
                 road_shapefile=request.roadShapefile,
                 building_shapefile=request.buildingShapefile,
+                water_shapefile=water_shp,
                 tile_mode=request.tileMode,
                 tile_max_pixels=request.tileMaxPixels or 512 * 512,
                 tile_overlap=request.tileOverlap,
@@ -434,6 +439,7 @@ def classify_step1(request: ClassifyStep1Request) -> dict:
     try:
         if use_v6:
             print("[API /classify-step1] routing -> classify_v6 (SAM3-first 6-material pipeline)")
+            water_shp = request.waterShapefile or _load_config().get("water_mask_path")
             result = run_classify_v6(
                 raster_path=request.rasterPath,
                 classes=classes_dict,
@@ -443,6 +449,7 @@ def classify_step1(request: ClassifyStep1Request) -> dict:
                 sam3_enabled=request.sam3Enabled,
                 road_shapefile=request.roadShapefile,
                 building_shapefile=request.buildingShapefile,
+                water_shapefile=water_shp,
                 tile_mode=request.tileMode,
                 tile_max_pixels=request.tileMaxPixels or 512 * 512,
                 tile_overlap=request.tileOverlap,
@@ -500,6 +507,12 @@ class BatchClassifyRequest(BaseModel):
     detectShadows: bool = False
     maxThreads: int | None = None
     taskId: str | None = None
+    # SAM3-first 6-material pipeline flags (only consulted when the request's
+    # `classes` payload matches the canonical 6-material MEA schema).
+    sam3Enabled: bool = True
+    roadShapefile: str | None = None
+    buildingShapefile: str | None = None
+    waterShapefile: str | None = None
 
 
 @app.post("/classify-batch")
@@ -520,18 +533,36 @@ def classify_batch(request: BatchClassifyRequest) -> dict:
             print(f"  vector: id={_dv.get('id')}, classId={_dv.get('classId')}, filePath={_dv.get('filePath')}")
     import sys; sys.stdout.flush()
 
+    # When the payload matches the 6-material MEA schema and SAM3 is enabled,
+    # the shared KMeans model must be trained on the *kmeans-source* materials
+    # only (vegetation/water/sand/soil) — passing all 6 classes including the
+    # mask-source BM_ASPHALT/BM_CONCRETE causes the cluster→material mapping
+    # to collapse onto BM_ASPHALT for every cluster (their wide gray anchor
+    # bands dominate aerial-imagery centroids).  Roads and buildings are then
+    # painted per-raster via SAM3 masks after each classification.
+    use_v6 = _route_to_v6(classes_raw, request.sam3Enabled)
+    if use_v6:
+        from .pipeline import _split_classes_by_source, apply_v6_masks_to_classification
+        train_classes, _mask_classes = _split_classes_by_source(classes_raw)
+        print(f"[Batch] v6 mode: training shared model on "
+              f"{len(train_classes)}/{len(classes_raw)} kmeans-source classes "
+              f"({[c['name'] for c in train_classes]}); BM_ASPHALT/BM_CONCRETE "
+              f"painted from SAM3 masks per-raster.")
+    else:
+        train_classes = classes_raw
+
     try:
         # ── Phase 1: Train shared model ──
         if tracker:
             tracker("Training shared model", 0, 1)
         t0 = _time.perf_counter()
         scaler, kmeans = train_kmeans_model(
-            request.rasterPaths, classes_raw, ff,
+            request.rasterPaths, train_classes, ff,
             detect_shadows=request.detectShadows,
         )
         # Build ONE shared color table from all rasters
         mea_mapping, color_table = build_shared_color_table(
-            request.rasterPaths, scaler, kmeans, classes_raw, ff,
+            request.rasterPaths, scaler, kmeans, train_classes, ff,
         )
         if tracker:
             tracker("Training shared model", 1, 1)
@@ -555,7 +586,7 @@ def classify_batch(request: BatchClassifyRequest) -> dict:
             try:
                 result = run_classify_and_export(
                     raster_path=rpath,
-                    classes=classes_raw,
+                    classes=train_classes,
                     smoothing=request.smoothing,
                     feature_flags=ff,
                     output_path=request.outputPath,
@@ -573,6 +604,26 @@ def classify_batch(request: BatchClassifyRequest) -> dict:
                     export_format=request.exportFormat,
                     progress_callback=tracker,
                 )
+
+                # ── v6 SAM3 mask fusion per-raster ──
+                if use_v6 and result.get("status") == "ok":
+                    classified_path = result.get("outputPath")
+                    if classified_path:
+                        try:
+                            water_shp = request.waterShapefile or _load_config().get("water_mask_path")
+                            result = apply_v6_masks_to_classification(
+                                classification_path=classified_path,
+                                raster_path=rpath,
+                                classes=classes_raw,
+                                classify_result=result,
+                                sam3_enabled=request.sam3Enabled,
+                                road_shapefile=request.roadShapefile,
+                                building_shapefile=request.buildingShapefile,
+                                water_shapefile=water_shp,
+                                progress_callback=tracker,
+                            )
+                        except Exception as mask_err:
+                            print(f"[Batch][warn] mask fusion failed for {fname}: {mask_err}")
 
                 all_results.append(result)
                 if result.get("status") == "ok":
@@ -891,13 +942,12 @@ def merge_feature_masks(request: MergeFeatureMasksRequest) -> dict:
 
 # ─── App config (persistent settings) ────────────────────────────────────
 
-from .config import load as _load_config, save as _save_config, config_path as _config_path
-
 
 class AppConfigUpdate(BaseModel):
     sam3_local_dir: str | None = None
     hf_cache_dir: str | None = None
     offline_mode: bool | None = None
+    water_mask_path: str | None = None
 
 
 @app.get("/app-config")
@@ -958,7 +1008,6 @@ def suggest_tile_size_endpoint(request: SuggestTileSizeRequest) -> dict:
 
 # ─── File/folder browser (for web UI) ────────────────────────────────────
 
-import os
 import string
 
 

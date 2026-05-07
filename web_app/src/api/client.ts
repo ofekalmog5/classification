@@ -41,16 +41,6 @@ async function parseApiResponse<T>(r: Response): Promise<T> {
   return data as T;
 }
 
-/* ── Health ──────────────────────────────────────────────────────── */
-export async function healthCheck(): Promise<boolean> {
-  try {
-    const r = await fetch(`${BASE}/health`);
-    return r.ok;
-  } catch {
-    return false;
-  }
-}
-
 /* ── Classify Step 1 ─────────────────────────────────────────────── */
 export interface Step1Params {
   rasterPath: string;
@@ -68,6 +58,7 @@ export interface Step1Params {
   sam3Enabled?: boolean;
   roadShapefile?: string | null;
   buildingShapefile?: string | null;
+  waterShapefile?: string | null;
 }
 
 export async function runStep1(params: Step1Params): Promise<ClassifyResult> {
@@ -88,6 +79,7 @@ export async function runStep1(params: Step1Params): Promise<ClassifyResult> {
     sam3Enabled: params.sam3Enabled ?? true,
     roadShapefile: params.roadShapefile ?? null,
     buildingShapefile: params.buildingShapefile ?? null,
+    waterShapefile: params.waterShapefile ?? null,
   };
   const r = await fetch(`${BASE}/classify-step1`, {
     method: "POST",
@@ -148,6 +140,7 @@ export interface FullPipelineParams {
   sam3Enabled?: boolean;
   roadShapefile?: string | null;
   buildingShapefile?: string | null;
+  waterShapefile?: string | null;
 }
 
 export async function runFullPipeline(
@@ -171,6 +164,7 @@ export async function runFullPipeline(
     sam3Enabled: params.sam3Enabled ?? true,
     roadShapefile: params.roadShapefile ?? null,
     buildingShapefile: params.buildingShapefile ?? null,
+    waterShapefile: params.waterShapefile ?? null,
   };
   const r = await fetch(`${BASE}/classify`, {
     method: "POST",
@@ -221,6 +215,10 @@ export interface BatchParams {
   detectShadows?: boolean;
   maxThreads?: number | null;
   taskId?: string;
+  sam3Enabled?: boolean;
+  roadShapefile?: string | null;
+  buildingShapefile?: string | null;
+  waterShapefile?: string | null;
 }
 
 export interface BatchResult {
@@ -249,6 +247,10 @@ export async function runBatchClassify(params: BatchParams): Promise<BatchResult
     detectShadows: params.detectShadows ?? false,
     maxThreads: params.maxThreads ?? null,
     taskId: params.taskId ?? null,
+    sam3Enabled: params.sam3Enabled ?? true,
+    roadShapefile: params.roadShapefile ?? null,
+    buildingShapefile: params.buildingShapefile ?? null,
+    waterShapefile: params.waterShapefile ?? null,
   };
   const r = await fetch(`${BASE}/classify-batch`, {
     method: "POST",
@@ -453,46 +455,6 @@ export async function setSam3Path(path: string | null): Promise<RoadExtractConfi
   return r.json();
 }
 
-/* ── File browsing (used in electron / local mode) ───────────────── */
-export async function browseFile(
-  options?: { directory?: boolean; save?: boolean; filters?: string[] }
-): Promise<string | null> {
-  try {
-    const r = await fetch(`${BASE}/browse`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(options ?? {}),
-    });
-    const data = await r.json();
-    return data.path ?? null;
-  } catch {
-    return null;
-  }
-}
-
-/* ── Recommend cluster count ─────────────────────────────────────── */
-export interface RecommendParams {
-  rasterPath: string;
-  featureFlags: FeatureFlags;
-  quick?: boolean;
-}
-
-export async function recommendClusters(
-  params: RecommendParams
-): Promise<{ recommended: number; detail?: string } | null> {
-  try {
-    const r = await fetch(`${BASE}/recommend`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(params),
-    });
-    if (!r.ok) return null;
-    return r.json();
-  } catch {
-    return null;
-  }
-}
-
 /* ── Scan folder for raster images ────────────────────────────────── */
 export interface ScanFolderResult {
   folder: string;
@@ -509,23 +471,6 @@ export async function scanFolder(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ folderPath, extensions: extensions ?? null }),
-    });
-    if (!r.ok) return null;
-    return r.json();
-  } catch {
-    return null;
-  }
-}
-
-/* ── List raster tiles from a GeoTIFF (for map preview) ──────────── */
-export async function getRasterInfo(
-  filePath: string
-): Promise<{ bounds: [[number, number], [number, number]]; crs: string } | null> {
-  try {
-    const r = await fetch(`${BASE}/raster-info`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ filePath }),
     });
     if (!r.ok) return null;
     return r.json();

@@ -57,11 +57,11 @@ def test_mea_classes_required_fields():
 
 
 @requires_core
-def test_source_split_2_mask_4_kmeans():
-    assert len(_MEA_MASK_MATERIALS) == 2
-    assert len(_MEA_KMEANS_MATERIALS) == 4
-    assert _MEA_MASK_MATERIALS == {"BM_ASPHALT", "BM_CONCRETE"}
-    assert _MEA_KMEANS_MATERIALS == {"BM_VEGETATION", "BM_WATER", "BM_SAND", "BM_SOIL"}
+def test_source_split_3_mask_3_kmeans():
+    assert len(_MEA_MASK_MATERIALS) == 3
+    assert len(_MEA_KMEANS_MATERIALS) == 3
+    assert _MEA_MASK_MATERIALS == {"BM_ASPHALT", "BM_CONCRETE", "BM_WATER"}
+    assert _MEA_KMEANS_MATERIALS == {"BM_VEGETATION", "BM_SAND", "BM_SOIL"}
 
 
 @requires_core
@@ -272,8 +272,8 @@ def test_split_classes_by_source_uses_source_field():
     from app.pipeline import _split_classes_by_source
     classes = list(MEA_CLASSES)  # full 6 entries with source
     kmeans, masks = _split_classes_by_source(classes)
-    assert {c["name"] for c in masks} == {"BM_ASPHALT", "BM_CONCRETE"}
-    assert {c["name"] for c in kmeans} == {"BM_VEGETATION", "BM_WATER", "BM_SAND", "BM_SOIL"}
+    assert {c["name"] for c in masks} == {"BM_ASPHALT", "BM_CONCRETE", "BM_WATER"}
+    assert {c["name"] for c in kmeans} == {"BM_VEGETATION", "BM_SAND", "BM_SOIL"}
 
 
 @requires_core

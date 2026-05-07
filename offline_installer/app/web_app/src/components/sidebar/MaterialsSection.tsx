@@ -20,8 +20,6 @@ export default function MaterialsSection() {
   const setMEA = () => {
     dispatch({ type: "SET_CLASSES", classes: MEA_CLASSES });
     dispatch({ type: "SET_CLASS_COUNT", count: MEA_CLASSES.length });
-    // MEA default: export as .img
-    dispatch({ type: "SET_CLASSIFICATION", settings: { exportFormat: "img" } });
   };
 
   return (

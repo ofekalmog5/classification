@@ -2,18 +2,19 @@
 
 This module orchestrates the v6 flow:
 
-  1. Acquire road and building masks — from user-uploaded shapefile if
+  1. Acquire water, road and building masks — water is shapefile-only (never
+     SAM3 or KMeans), road and building come from user-uploaded shapefile if
      provided, else from SAM3 (when ``sam3_enabled``), else empty.
-  2. Run KMeans classification on the 4 ``source="kmeans"`` materials only
-     (BM_VEGETATION, BM_WATER, BM_SAND, BM_SOIL), reusing
-     ``core.classify_and_export`` with the filtered class list.
-  3. Soft-prior fusion of the road and building masks onto the classification
-     with per-component disagreement veto: a mask component whose underlying
-     KMeans pixels overwhelmingly disagree with the mask's class (e.g. a road
-     polygon that overlaps a forest) is vetoed and the KMeans labels are
-     kept.  Hard override is the fallback if soft-prior fusion errors out.
+  2. Run KMeans classification on the 3 ``source="kmeans"`` materials only
+     (BM_VEGETATION, BM_SAND, BM_SOIL), reusing ``core.classify_and_export``
+     with the filtered class list.  Strict 1:1 cluster→material assignment
+     (Hungarian) prevents any one material from absorbing multiple clusters.
+  3. Mask fusion paints water → roads → buildings on top of the KMeans output
+     (later masks win where they overlap).  The legacy soft-prior veto is
+     currently disabled (thresholds >1.0): user shapefiles and SAM3
+     detections are treated as authoritative and always paint.
   4. Rewrite the Composite_Material_Table XML so it includes all 6 materials
-     even though only 4 came from KMeans.
+     even though only 3 came from KMeans.
 
 The existing ``backend/app/core.classify_and_export`` and
 ``backend/app/road_extraction.{extract_feature_masks,merge_feature_masks_onto_classification}``
@@ -31,33 +32,36 @@ from . import core, road_extraction
 _MASK_FEATURE_FOR_CLASS: Dict[str, str] = {
     "BM_ASPHALT":  "roads",
     "BM_CONCRETE": "buildings",
+    "BM_WATER":    "water",
 }
 
-# Soft-prior fusion (Phase 3) — per-component veto thresholds.  When the
-# fraction of pixels in a mask component whose KMeans label is incompatible
-# with the mask's class exceeds the threshold, the entire component reverts
-# to the KMeans assignment instead of being painted.
-#
-#   - Shapefile masks are user-authoritative -> almost never vetoed.
-#   - SAM3 masks are model-detected and prone to false positives -> stricter.
+# Soft-prior fusion (Phase 3) — per-component veto thresholds.  Set to a value
+# >1.0 the veto is effectively disabled: any user shapefile or SAM3 detection
+# *always* paints over the KMeans output.  This matches the current product
+# rule that mask sources (shapefile > SAM3) are authoritative above all and
+# must never be silently dropped because the underlying RGB happened to look
+# like vegetation/water.
 _VETO_THRESHOLDS: Dict[str, float] = {
-    "shapefile":   0.85,
-    "sam3":        0.55,
-    "sam3_failed": 0.55,
-    "sam3_empty":  0.55,
-    "skipped":     0.55,
-    "disabled":    0.55,
+    "shapefile":   1.01,
+    "sam3":        1.01,
+    "sam3_failed": 1.01,
+    "sam3_empty":  1.01,
+    "skipped":     1.01,
+    "disabled":    1.01,
 }
 
-# A KMeans pixel "wins" against a mask if its RGB falls within this squared
-# Euclidean distance of an incompatible KMeans-class anchor.  900 corresponds
-# to roughly ±17 per RGB channel — wide enough to absorb typical KMeans
-# centroid drift, narrow enough to ignore mid-grey noise.
+# An ORIGINAL-raster pixel "wins" against a mask if its RGB falls within this
+# squared Euclidean distance of an incompatible KMeans-class anchor.  4500
+# (≈ ±39/channel) is a generous band so we only veto when the underlying input
+# pixel is unmistakably vegetation or water — not when KMeans happened to
+# label a road's pixels green.  The veto compares against the *original*
+# raster RGB, not the KMeans output, since the latter is by construction one
+# of 4 colors and would always trigger a false veto.
 _INCOMPATIBLE_CLASSES: Dict[str, Tuple[str, ...]] = {
     "BM_ASPHALT":  ("BM_VEGETATION", "BM_WATER"),
     "BM_CONCRETE": ("BM_VEGETATION", "BM_WATER"),
 }
-_INCOMPATIBLE_RGB_TOL_SQ = 900   # squared-distance threshold (≈ ±17/channel)
+_INCOMPATIBLE_RGB_TOL_SQ = 4500   # squared-distance threshold (≈ ±39/channel)
 
 
 def _split_classes_by_source(
@@ -200,6 +204,7 @@ def _fuse_with_priors_and_veto(
     kmeans_classes: List[Dict[str, Any]],
     progress_callback: Optional[Callable] = None,
     output_path: Optional[str] = None,
+    original_raster_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Soft-prior mask fusion with per-component disagreement veto.
 
@@ -247,6 +252,7 @@ def _fuse_with_priors_and_veto(
                 kmeans_classes=kmeans_classes,
                 progress_callback=None,
                 output_path=str(merged_dir / tf.name),
+                original_raster_path=original_raster_path,
             )
             if sub.get("status") == "ok":
                 merged_outputs.append(sub["outputPath"])
@@ -287,6 +293,45 @@ def _fuse_with_priors_and_veto(
     cls_profile.pop("predictor", None)
 
     out_rgb = rgb.copy()
+
+    # Read the *original* raster for the incompatibility check.  KMeans output
+    # is by construction one of 4 colors and would falsely trigger the veto on
+    # every road or building component that crosses anywhere KMeans painted
+    # vegetation/water.  The original raster's RGB is what the veto should
+    # actually compare against.
+    veto_rgb = rgb  # fallback: use KMeans output if original is unavailable
+    if original_raster_path:
+        try:
+            with rasterio.open(original_raster_path) as osrc:
+                same_grid = (
+                    osrc.width == W
+                    and osrc.height == H
+                    and osrc.transform == cls_transform
+                )
+                if same_grid:
+                    o = osrc.read(out_shape=(min(osrc.count, 3), H, W))
+                else:
+                    # Reproject original onto the classification grid.
+                    o = np.zeros((min(osrc.count, 3), H, W), dtype=np.uint8)
+                    for bi in range(min(osrc.count, 3)):
+                        _reproject(
+                            source=rasterio.band(osrc, bi + 1),
+                            destination=o[bi],
+                            src_transform=osrc.transform,
+                            src_crs=osrc.crs,
+                            dst_transform=cls_transform,
+                            dst_crs=cls_crs,
+                            resampling=_Resampling.bilinear,
+                        )
+                if o.shape[0] < 3:
+                    buf = np.zeros((3, H, W), dtype=np.uint8)
+                    buf[: o.shape[0]] = o
+                    o = buf
+                veto_rgb = o[:3].astype(np.uint8)
+                print(f"[fusion] using ORIGINAL raster RGB for veto comparison")
+        except Exception as exc:
+            print(f"[fusion] could not read original raster for veto ({exc}); "
+                  "falling back to KMeans output (may over-veto)")
     fusion_stats: Dict[str, Any] = {}
 
     for mask_idx, (mask_path, paint_rgb, mat_name, source) in enumerate(fusion_inputs):
@@ -327,17 +372,20 @@ def _fuse_with_priors_and_veto(
             continue
 
         incompatible_names = _INCOMPATIBLE_CLASSES.get(mat_name, ())
-        # Per-pixel "incompatible" map: pixels whose current RGB is close to a
-        # KMeans-anchor that's incompatible with this mask.
+        # Per-pixel "incompatible" map: pixels whose ORIGINAL raster RGB is
+        # close to a KMeans-anchor that's incompatible with this mask.  We
+        # compare against the original raster (veto_rgb), not KMeans output
+        # (out_rgb) — the latter is one of 4 colors by construction and would
+        # falsely trigger.
         incompatible_pixels = np.zeros((H, W), dtype=bool)
         for inc_name in incompatible_names:
             inc_rgb = kmeans_rgb_by_name.get(inc_name)
             if inc_rgb is None:
                 continue
             d2 = (
-                (out_rgb[0].astype(np.int32) - inc_rgb[0]) ** 2
-                + (out_rgb[1].astype(np.int32) - inc_rgb[1]) ** 2
-                + (out_rgb[2].astype(np.int32) - inc_rgb[2]) ** 2
+                (veto_rgb[0].astype(np.int32) - inc_rgb[0]) ** 2
+                + (veto_rgb[1].astype(np.int32) - inc_rgb[1]) ** 2
+                + (veto_rgb[2].astype(np.int32) - inc_rgb[2]) ** 2
             )
             incompatible_pixels |= (d2 <= _INCOMPATIBLE_RGB_TOL_SQ)
 
@@ -386,6 +434,153 @@ def _fuse_with_priors_and_veto(
     return {"status": "ok", "outputPath": out_path, "fusionStats": fusion_stats}
 
 
+def apply_v6_masks_to_classification(
+    classification_path: str,
+    raster_path: str,
+    classes: List[Dict[str, Any]],
+    classify_result: Optional[Dict[str, Any]] = None,
+    sam3_enabled: bool = True,
+    road_shapefile: Optional[str] = None,
+    building_shapefile: Optional[str] = None,
+    water_shapefile: Optional[str] = None,
+    progress_callback: Optional[Callable] = None,
+) -> Dict[str, Any]:
+    """Apply SAM3 / shapefile road & building masks to an existing classification.
+
+    Caller has already produced a classified GeoTIFF (or tile directory) via
+    KMeans on the *kmeans-source* materials only.  This helper performs the
+    SAM3-first orchestration's Phase 0 (mask acquisition), Phase 2 (soft-prior
+    fusion with per-component veto) and Phase 3 (XML rewrite for all 6
+    materials) — i.e. everything ``classify_v6`` does *except* the KMeans
+    step.  Used both by ``classify_v6`` (single-raster) and the batch endpoint
+    (one shared model for many rasters).
+
+    Returns the original ``classify_result`` dict augmented with
+    ``outputPath`` (post-fusion), ``maskSources`` and ``fusionStats``, and
+    ``meaSchemaVersion=6``.  Returned dict is a shallow copy so the caller's
+    input is left intact.
+    """
+    result: Dict[str, Any] = dict(classify_result or {})
+    if not classification_path:
+        return {"status": "error", "message": "apply_v6_masks: missing classification_path"}
+
+    def _phase_cb(label: str) -> Optional[Callable]:
+        if not progress_callback:
+            return None
+        def _inner(phase: str, done: int, total: int) -> None:
+            progress_callback(f"{label}: {phase}", done, total)
+        return _inner
+
+    # ── Phase 0: Mask acquisition ──────────────────────────────────────────
+    # Water is shapefile-only by design (sam3_enabled=False) — never detected
+    # by SAM3 or KMeans color matching.  No shapefile -> no water painted.
+    water_mask_path, water_source = _acquire_mask(
+        raster_path, "water", water_shapefile, sam3_enabled=False,
+        progress_callback=_phase_cb("Water (shapefile)"),
+    )
+    road_mask_path, road_source = _acquire_mask(
+        raster_path, "roads", road_shapefile, sam3_enabled,
+        progress_callback=_phase_cb("Roads (SAM3)"),
+    )
+    bldg_mask_path, bldg_source = _acquire_mask(
+        raster_path, "buildings", building_shapefile, sam3_enabled,
+        progress_callback=_phase_cb("Buildings (SAM3)"),
+    )
+    print(f"[pipeline] water mask source:    {water_source} -> {water_mask_path}")
+    print(f"[pipeline] road mask source:     {road_source} -> {road_mask_path}")
+    print(f"[pipeline] building mask source: {bldg_source} -> {bldg_mask_path}")
+
+    # ── Phase 2: Soft-prior fusion of water, road and building masks ──────
+    # Paint order (bottom-up): water → roads → buildings.  Each later mask
+    # paints on top of earlier ones so buildings win over roads, roads win
+    # over water, and any of them wins over the underlying KMeans output.
+    kmeans_classes, _mask_classes = _split_classes_by_source(classes)
+    by_name = {c["name"]: c for c in core.MEA_CLASSES}
+    fusion_inputs: List[Tuple[str, Tuple[int, int, int], str, str]] = []
+    if water_mask_path:
+        rgb = core._hex_to_rgb(by_name["BM_WATER"]["color"])
+        fusion_inputs.append((water_mask_path, rgb, "BM_WATER", water_source))
+    if road_mask_path:
+        rgb = core._hex_to_rgb(by_name["BM_ASPHALT"]["color"])
+        fusion_inputs.append((road_mask_path, rgb, "BM_ASPHALT", road_source))
+    if bldg_mask_path:
+        rgb = core._hex_to_rgb(by_name["BM_CONCRETE"]["color"])
+        # Building applied LAST -> wins over both water and road overlaps.
+        fusion_inputs.append((bldg_mask_path, rgb, "BM_CONCRETE", bldg_source))
+
+    fusion_stats: Dict[str, Any] = {}
+    final_path = classification_path
+    if fusion_inputs:
+        print(f"[pipeline] soft-prior fusion of {len(fusion_inputs)} mask(s)")
+        merge_result = _fuse_with_priors_and_veto(
+            classification_path=classification_path,
+            fusion_inputs=fusion_inputs,
+            kmeans_classes=kmeans_classes,
+            progress_callback=_phase_cb("Mask fusion"),
+            original_raster_path=raster_path,
+        )
+        if merge_result.get("status") != "ok":
+            print(f"[pipeline] soft-prior fusion failed: {merge_result.get('message')}; "
+                  "falling back to hard override")
+            mask_paths = [p for p, _, _, _ in fusion_inputs]
+            colors = [c for _, c, _, _ in fusion_inputs]
+            merge_result = road_extraction.merge_feature_masks_onto_classification(
+                classification_path=classification_path,
+                mask_paths=mask_paths,
+                colors=colors,
+                progress_callback=_phase_cb("Mask fusion (fallback)"),
+            )
+        if merge_result.get("status") == "ok":
+            final_path = merge_result.get("outputPath", classification_path)
+            fusion_stats = merge_result.get("fusionStats", {})
+
+    # ── Phase 3: Rewrite XML with full 6-material composite table ──────────
+    # The KMeans pass wrote a 4-entry XML (one per kmeans-source material).
+    # Now that masks have contributed BM_ASPHALT / BM_CONCRETE pixels, the
+    # companion XMLs need to list all 6 classes.  In tile mode, both the
+    # pre-merge tile dir AND the merged tile dir need their XMLs rewritten.
+    paths_needing_xml: List[Path] = []
+    pre_merge_p = Path(classification_path)
+    final_p = Path(final_path)
+
+    for p in (pre_merge_p, final_p):
+        if not p or str(p) == "":
+            continue
+        if p.is_dir():
+            paths_needing_xml.extend(
+                f for f in p.iterdir()
+                if f.is_file() and f.suffix.lower() in (".tif", ".tiff", ".img")
+            )
+        elif p.exists():
+            paths_needing_xml.append(p)
+
+    # Also include any tileOutputs the caller has tracked.
+    for tile_path in (result.get("tileOutputs") or []):
+        tp = Path(tile_path)
+        if tp.exists() and tp not in paths_needing_xml:
+            paths_needing_xml.append(tp)
+
+    seen: set = set()
+    for target in paths_needing_xml:
+        key = str(target.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        core._write_composite_material_xml(target, classes)
+
+    result["status"] = result.get("status", "ok")
+    result["outputPath"] = str(final_path)
+    result["maskSources"] = {
+        "water": water_source,
+        "roads": road_source,
+        "buildings": bldg_source,
+    }
+    if fusion_stats:
+        result["fusionStats"] = fusion_stats
+    result["meaSchemaVersion"] = 6
+    return result
+
+
 def classify_v6(
     raster_path: str,
     classes: List[Dict[str, Any]],
@@ -395,6 +590,7 @@ def classify_v6(
     sam3_enabled: bool = True,
     road_shapefile: Optional[str] = None,
     building_shapefile: Optional[str] = None,
+    water_shapefile: Optional[str] = None,
     progress_callback: Optional[Callable] = None,
     **classify_kwargs: Any,
 ) -> Dict[str, Any]:
@@ -406,35 +602,17 @@ def classify_v6(
 
     print("=" * 70)
     print("PIPELINE v6: SAM3-first 6-material classification")
-    print(f"  raster:           {raster.name}")
-    print(f"  sam3_enabled:     {sam3_enabled}")
-    print(f"  road_shapefile:   {road_shapefile!r}")
+    print(f"  raster:             {raster.name}")
+    print(f"  sam3_enabled:       {sam3_enabled}")
+    print(f"  road_shapefile:     {road_shapefile!r}")
     print(f"  building_shapefile: {building_shapefile!r}")
+    print(f"  water_shapefile:    {water_shapefile!r}")
     print("=" * 70)
 
     t_start = _time.perf_counter()
 
-    # ── Phase 0: Mask acquisition ──────────────────────────────────────────
-    def _phase_cb(label: str) -> Optional[Callable]:
-        if not progress_callback:
-            return None
-        def _inner(phase: str, done: int, total: int) -> None:
-            progress_callback(f"{label}: {phase}", done, total)
-        return _inner
-
-    road_mask_path, road_source = _acquire_mask(
-        raster_path, "roads", road_shapefile, sam3_enabled,
-        progress_callback=_phase_cb("Roads (SAM3)"),
-    )
-    bldg_mask_path, bldg_source = _acquire_mask(
-        raster_path, "buildings", building_shapefile, sam3_enabled,
-        progress_callback=_phase_cb("Buildings (SAM3)"),
-    )
-    print(f"[pipeline] road mask source:     {road_source} -> {road_mask_path}")
-    print(f"[pipeline] building mask source: {bldg_source} -> {bldg_mask_path}")
-
-    # ── Phase 1: KMeans classification on the 4 natural materials only ────
-    kmeans_classes, mask_classes = _split_classes_by_source(classes)
+    # ── Phase 1: KMeans classification on the kmeans-source materials only ────
+    kmeans_classes, _mask_classes = _split_classes_by_source(classes)
     if not kmeans_classes:
         return {"status": "error",
                 "message": "No KMeans-source classes in payload (need at least 1)"}
@@ -458,86 +636,19 @@ def classify_v6(
     if not classification_path:
         return {"status": "error", "message": "classify_and_export returned no outputPath"}
 
-    # ── Phase 2: Soft-prior fusion of road and building masks ─────────────
-    # Per-component disagreement veto: if the KMeans labels under a mask
-    # component overwhelmingly disagree with the mask's class (e.g. a road
-    # polygon overlaps a forest because the shapefile is outdated), the
-    # component is vetoed and the KMeans labels are kept.
-    by_name = {c["name"]: c for c in core.MEA_CLASSES}
-    fusion_inputs: List[Tuple[str, Tuple[int, int, int], str, str]] = []
-    if road_mask_path:
-        rgb = core._hex_to_rgb(by_name["BM_ASPHALT"]["color"])
-        fusion_inputs.append((road_mask_path, rgb, "BM_ASPHALT", road_source))
-    if bldg_mask_path:
-        rgb = core._hex_to_rgb(by_name["BM_CONCRETE"]["color"])
-        # Building applied AFTER road -> wins where they overlap.
-        fusion_inputs.append((bldg_mask_path, rgb, "BM_CONCRETE", bldg_source))
-
-    fusion_stats: Dict[str, Any] = {}
-    if fusion_inputs:
-        print(f"[pipeline] soft-prior fusion of {len(fusion_inputs)} mask(s)")
-        merge_result = _fuse_with_priors_and_veto(
-            classification_path=classification_path,
-            fusion_inputs=fusion_inputs,
-            kmeans_classes=kmeans_classes,
-            progress_callback=_phase_cb("Mask fusion"),
-        )
-        if merge_result.get("status") != "ok":
-            print(f"[pipeline] soft-prior fusion failed: {merge_result.get('message')}; "
-                  "falling back to hard override")
-            mask_paths = [p for p, _, _, _ in fusion_inputs]
-            colors = [c for _, c, _, _ in fusion_inputs]
-            merge_result = road_extraction.merge_feature_masks_onto_classification(
-                classification_path=classification_path,
-                mask_paths=mask_paths,
-                colors=colors,
-                progress_callback=_phase_cb("Mask fusion (fallback)"),
-            )
-        if merge_result.get("status") == "ok":
-            classification_path = merge_result.get("outputPath", classification_path)
-            fusion_stats = merge_result.get("fusionStats", {})
-
-    # ── Phase 3: Rewrite XML with full 6-material composite table ──────────
-    # core.classify_and_export wrote a 4-entry XML.  Now that masks have
-    # contributed BM_ASPHALT and BM_CONCRETE pixels, the companion XMLs need
-    # to list all 6 classes.  In tile mode, both the original tile dir AND
-    # the merged tile dir need their XMLs rewritten.
-    paths_needing_xml: List[Path] = []
-    pre_merge_path = Path(classify_result.get("outputPath") or "")
-    final_path = Path(classification_path)
-
-    for p in (pre_merge_path, final_path):
-        if not p or str(p) == "":
-            continue
-        if p.is_dir():
-            paths_needing_xml.extend(
-                f for f in p.iterdir()
-                if f.is_file() and f.suffix.lower() in (".tif", ".tiff", ".img")
-            )
-        elif p.exists():
-            paths_needing_xml.append(p)
-
-    # Also include any tileOutputs returned by the merge step (they may live
-    # in a sibling _merged/ folder that doesn't show up in `final_path` enum).
-    for tile_path in classify_result.get("tileOutputs") or []:
-        tp = Path(tile_path)
-        if tp.exists() and tp not in paths_needing_xml:
-            paths_needing_xml.append(tp)
-
-    seen: set = set()
-    for target in paths_needing_xml:
-        key = str(target.resolve())
-        if key in seen:
-            continue
-        seen.add(key)
-        core._write_composite_material_xml(target, classes)
+    # ── Phases 0 + 2 + 3: Mask acquisition, fusion, XML rewrite ───────────
+    result = apply_v6_masks_to_classification(
+        classification_path=classification_path,
+        raster_path=raster_path,
+        classes=classes,
+        classify_result=classify_result,
+        sam3_enabled=sam3_enabled,
+        road_shapefile=road_shapefile,
+        building_shapefile=building_shapefile,
+        water_shapefile=water_shapefile,
+        progress_callback=progress_callback,
+    )
 
     duration = _time.perf_counter() - t_start
     print(f"[pipeline] classify_v6 finished in {duration:.1f}s")
-
-    classify_result["outputPath"] = str(classification_path)
-    classify_result["maskSources"] = {"roads": road_source, "buildings": bldg_source}
-    if fusion_stats:
-        classify_result["fusionStats"] = fusion_stats
-    classify_result["meaSchemaVersion"] = 6
-    return classify_result
+    return result

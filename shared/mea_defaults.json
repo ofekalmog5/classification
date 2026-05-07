@@ -29,13 +29,13 @@
       "sample_std_rgb": [0.0, 0.0, 0.0]
     },
     "BM_VEGETATION": {
-      "reference_color": "#228B22",
-      "reference_rgb": [34, 139, 34],
+      "reference_color": "#006400",
+      "reference_rgb": [0, 100, 0],
       "composite_name": "GENVEGETATION",
       "source": "kmeans",
       "material_type": "VEGETATION",
       "sub_absorbs": ["BM_FOLIAGE", "BM_LAND_GRASS", "BM_LAND_DRY_GRASS"],
-      "anchors": [[34, 139, 34], [0, 100, 0], [124, 252, 0], [189, 183, 107]],
+      "anchors": [[0, 100, 0]],
       "tolerance_radius": 50,
       "sample_count": 0,
       "sample_std_rgb": [0.0, 0.0, 0.0]
@@ -44,7 +44,7 @@
       "reference_color": "#1C6BA0",
       "reference_rgb": [28, 107, 160],
       "composite_name": "WATER",
-      "source": "kmeans",
+      "source": "mask",
       "material_type": "WATER",
       "sub_absorbs": [],
       "anchors": [[28, 107, 160]],
@@ -53,25 +53,25 @@
       "sample_std_rgb": [0.0, 0.0, 0.0]
     },
     "BM_SAND": {
-      "reference_color": "#EDC9AF",
-      "reference_rgb": [237, 201, 175],
+      "reference_color": "#E6C882",
+      "reference_rgb": [230, 200, 130],
       "composite_name": "SAND",
       "source": "kmeans",
       "material_type": "SOIL_EARTH",
       "sub_absorbs": [],
-      "anchors": [[237, 201, 175]],
+      "anchors": [[230, 200, 130]],
       "tolerance_radius": 34,
       "sample_count": 0,
       "sample_std_rgb": [0.0, 0.0, 0.0]
     },
     "BM_SOIL": {
-      "reference_color": "#654321",
-      "reference_rgb": [101, 67, 33],
+      "reference_color": "#55371E",
+      "reference_rgb": [85, 55, 30],
       "composite_name": "SOIL",
       "source": "kmeans",
       "material_type": "SOIL_EARTH",
       "sub_absorbs": [],
-      "anchors": [[101, 67, 33]],
+      "anchors": [[85, 55, 30]],
       "tolerance_radius": 34,
       "sample_count": 0,
       "sample_std_rgb": [0.0, 0.0, 0.0]

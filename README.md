@@ -53,14 +53,15 @@ Material reference colors are read from
 falling back to [shared/mea_defaults.json](shared/mea_defaults.json). See
 [docs/MEA_CALIBRATION_TOOL.md](docs/MEA_CALIBRATION_TOOL.md).
 
-### MEA classes (13)
+### MEA classes (6)
 
-`BM_ASPHALT`, `BM_CONCRETE`, `BM_FOLIAGE`, `BM_LAND_DRY_GRASS`, `BM_LAND_GRASS`,
-`BM_METAL`, `BM_METAL_STEEL`, `BM_PAINT_ASPHALT`, `BM_ROCK`, `BM_SAND`, `BM_SOIL`,
-`BM_VEGETATION`, `BM_WATER`.
+`BM_ASPHALT`, `BM_CONCRETE`, `BM_VEGETATION`, `BM_WATER`, `BM_SAND`, `BM_SOIL`.
 
-`BM_EARTHEN` and `BM_SHINGLE` were removed — roads detected via clustering only (no morphological
-post-processing) are classified as `BM_ASPHALT` or `BM_PAINT_ASPHALT`.
+The pipeline is SAM3-first: water comes from a shapefile (if provided),
+roads/buildings come from SAM3 (or shapefiles), and KMeans only handles the
+three "earth" classes — vegetation, sand, soil. Each kmeans-source material
+has a single anchor color (vegetation `[0,100,0]`, sand `[230,200,130]`,
+soil `[85,55,30]`) for clean spectral separation.
 
 ---
 
@@ -73,8 +74,8 @@ The web app can refine the classification with text-prompted segmentation. See
 |---------|----------------------------|---------------------|
 | Roads | `road, highway, asphalt path` | `BM_ASPHALT` (`#2D2D30`) |
 | Buildings | `building, house, roof, rooftop, structure` | `BM_CONCRETE` (`#B4B4B4`) |
-| Trees | `tree, trees, forest, woodland, grove` | `BM_VEGETATION` (`#228B22`) |
-| Fields | `grass, lawn, field, meadow, pasture` + `crop, farmland, agriculture, cultivated field` | `BM_LAND_GRASS` / `BM_LAND_DRY_GRASS` |
+| Trees | `tree, trees, forest, woodland, grove` | `BM_VEGETATION` (`#006400`) |
+| Fields | `grass, lawn, field, meadow, pasture` + `crop, farmland, agriculture, cultivated field` | `BM_VEGETATION` (`#006400`) |
 | Water | `water, lake, pond, reservoir, pool` + `river, stream, canal, waterway, channel` + `sea, ocean, fish pond, swimming pool` | `BM_WATER` (`#1C6BA0`) |
 
 Each feature uses a two-strategy detector — OWLv2+SAM2/3 text segmentation **OR'd** with a
@@ -165,7 +166,7 @@ cd web_app && npm install && cd ..
 
 # Run (two terminals, or use start_webapp.bat)
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --app-dir backend     # backend  → 127.0.0.1:8000
-cd web_app && npm run dev                                                         # frontend → 127.0.0.1:5173
+cd web_app && npm run dev                                                         # frontend → 127.0.0.1:5174
 ```
 
 Or simply:

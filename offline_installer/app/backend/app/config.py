@@ -32,6 +32,7 @@ _DEFAULTS: Dict[str, Any] = {
     "sam3_local_dir": None,       # str | None  — path to sam3-main folder
     "hf_cache_dir": None,         # str | None  — custom HuggingFace cache dir
     "offline_mode": False,        # bool        — force offline (no network)
+    "water_mask_path": None,      # str | None  — global water shapefile/mask used as default for v6 classification
 }
 
 _cache: Dict[str, Any] | None = None
