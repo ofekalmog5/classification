@@ -606,11 +606,19 @@ def classify_batch(request: BatchClassifyRequest) -> dict:
                 )
 
                 # ── v6 SAM3 mask fusion per-raster ──
+                # Pass this raster's own tile list so fusion only iterates
+                # the relevant tiles (the batch output dir is shared across
+                # all rasters; without tile_paths, each per-raster fusion call
+                # would clobber prior rasters' painted tiles by re-writing
+                # them as unpainted from the original cls_path).
+                # mask_output_dir routes _roads/_buildings folders next to
+                # the user's output rather than next to the input raster.
                 if use_v6 and result.get("status") == "ok":
                     classified_path = result.get("outputPath")
                     if classified_path:
                         try:
                             water_shp = request.waterShapefile or _load_config().get("water_mask_path")
+                            this_tile_paths = result.get("tileOutputs") or None
                             result = apply_v6_masks_to_classification(
                                 classification_path=classified_path,
                                 raster_path=rpath,
@@ -621,6 +629,8 @@ def classify_batch(request: BatchClassifyRequest) -> dict:
                                 building_shapefile=request.buildingShapefile,
                                 water_shapefile=water_shp,
                                 progress_callback=tracker,
+                                mask_output_dir=request.outputPath,
+                                tile_paths=this_tile_paths,
                             )
                         except Exception as mask_err:
                             print(f"[Batch][warn] mask fusion failed for {fname}: {mask_err}")

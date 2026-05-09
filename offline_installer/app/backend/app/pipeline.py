@@ -91,6 +91,7 @@ def _acquire_mask(
     user_shapefile: Optional[str],
     sam3_enabled: bool,
     progress_callback: Optional[Callable] = None,
+    mask_output_dir: Optional[str] = None,
 ) -> Tuple[Optional[str], str]:
     """Return ``(mask_geotiff_path, source_label)`` for one feature.
 
@@ -121,6 +122,7 @@ def _acquire_mask(
     print(f"[pipeline] {feature_type}: pre-filter ok ({reason}); running SAM3")
     result = road_extraction.extract_feature_masks(
         input_path=raster_path,
+        output_path=mask_output_dir,
         feature_type=feature_type,
         progress_callback=progress_callback,
     )
@@ -205,6 +207,7 @@ def _fuse_with_priors_and_veto(
     progress_callback: Optional[Callable] = None,
     output_path: Optional[str] = None,
     original_raster_path: Optional[str] = None,
+    tile_paths: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Soft-prior mask fusion with per-component disagreement veto.
 
@@ -232,14 +235,25 @@ def _fuse_with_priors_and_veto(
     # Tile-mode classification: recurse per tile so each tile's components
     # are analysed independently.  Each fused tile is written into a single
     # ``_merged/`` directory so the caller has one path to read from.
-    if cls_path.is_dir():
-        tile_files = sorted(
-            p for p in cls_path.iterdir()
-            if p.is_file() and p.suffix.lower() in (".tif", ".tiff", ".img")
-        )
+    #
+    # ``tile_paths`` lets the caller restrict the iteration to a subset (used
+    # by the batch endpoint where many rasters share one output dir — without
+    # this filter, each per-raster fusion call would re-scan the whole dir
+    # and the unpainted overwrite from one iteration would clobber the
+    # painted result from a previous iteration).
+    if tile_paths is not None or cls_path.is_dir():
+        if tile_paths is not None:
+            tile_files = [Path(p) for p in tile_paths if Path(p).is_file()]
+            iter_root = tile_files[0].parent if tile_files else cls_path
+        else:
+            tile_files = sorted(
+                p for p in cls_path.iterdir()
+                if p.is_file() and p.suffix.lower() in (".tif", ".tiff", ".img")
+            )
+            iter_root = cls_path
         if not tile_files:
-            return {"status": "error", "message": f"No tiles in {cls_path}"}
-        merged_dir = Path(output_path) if output_path else cls_path.parent / f"{cls_path.name}_merged"
+            return {"status": "error", "message": f"No tiles in {iter_root}"}
+        merged_dir = Path(output_path) if output_path else iter_root.parent / f"{iter_root.name}_merged"
         merged_dir.mkdir(parents=True, exist_ok=True)
         merged_outputs: List[str] = []
         agg_stats: Dict[str, Any] = {}
@@ -444,6 +458,8 @@ def apply_v6_masks_to_classification(
     building_shapefile: Optional[str] = None,
     water_shapefile: Optional[str] = None,
     progress_callback: Optional[Callable] = None,
+    mask_output_dir: Optional[str] = None,
+    tile_paths: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Apply SAM3 / shapefile road & building masks to an existing classification.
 
@@ -477,14 +493,17 @@ def apply_v6_masks_to_classification(
     water_mask_path, water_source = _acquire_mask(
         raster_path, "water", water_shapefile, sam3_enabled=False,
         progress_callback=_phase_cb("Water (shapefile)"),
+        mask_output_dir=mask_output_dir,
     )
     road_mask_path, road_source = _acquire_mask(
         raster_path, "roads", road_shapefile, sam3_enabled,
         progress_callback=_phase_cb("Roads (SAM3)"),
+        mask_output_dir=mask_output_dir,
     )
     bldg_mask_path, bldg_source = _acquire_mask(
         raster_path, "buildings", building_shapefile, sam3_enabled,
         progress_callback=_phase_cb("Buildings (SAM3)"),
+        mask_output_dir=mask_output_dir,
     )
     print(f"[pipeline] water mask source:    {water_source} -> {water_mask_path}")
     print(f"[pipeline] road mask source:     {road_source} -> {road_mask_path}")
@@ -518,6 +537,7 @@ def apply_v6_masks_to_classification(
             kmeans_classes=kmeans_classes,
             progress_callback=_phase_cb("Mask fusion"),
             original_raster_path=raster_path,
+            tile_paths=tile_paths,
         )
         if merge_result.get("status") != "ok":
             print(f"[pipeline] soft-prior fusion failed: {merge_result.get('message')}; "
@@ -533,6 +553,37 @@ def apply_v6_masks_to_classification(
         if merge_result.get("status") == "ok":
             final_path = merge_result.get("outputPath", classification_path)
             fusion_stats = merge_result.get("fusionStats", {})
+
+    # ── Phase 2b: Consolidate fused tiles into the user's output dir ───────
+    # When fusion runs in tile mode it writes to ``<cls_dir>_merged/``, but
+    # the user's outputPath is ``<cls_dir>``.  Move the fused tiles back over
+    # the (intermediate) KMeans tiles so the user finds the final result
+    # exactly where they asked for it, and drop the now-empty merged dir.
+    if (
+        fusion_inputs
+        and final_path != classification_path
+    ):
+        try:
+            import shutil as _shutil
+            cls_p = Path(classification_path)
+            fin_p = Path(final_path)
+            if fin_p.is_dir() and cls_p.is_dir():
+                for tile in fin_p.iterdir():
+                    if tile.is_file():
+                        _shutil.move(str(tile), str(cls_p / tile.name))
+                try:
+                    fin_p.rmdir()
+                except OSError:
+                    pass  # not empty (e.g., other artifacts) — leave it alone
+                final_path = classification_path
+                # Update tile paths in result so callers reference the
+                # consolidated location, not the now-empty _merged dir.
+                if tile_paths:
+                    result["tileOutputs"] = [
+                        str(cls_p / Path(p).name) for p in tile_paths
+                    ]
+        except Exception as exc:
+            print(f"[pipeline] warn: fused-tile consolidation failed: {exc}")
 
     # ── Phase 3: Rewrite XML with full 6-material composite table ──────────
     # The KMeans pass wrote a 4-entry XML (one per kmeans-source material).
@@ -637,6 +688,9 @@ def classify_v6(
         return {"status": "error", "message": "classify_and_export returned no outputPath"}
 
     # ── Phases 0 + 2 + 3: Mask acquisition, fusion, XML rewrite ───────────
+    # Single-raster mode: route SAM3 _roads/_buildings folders next to the
+    # user's output, and pass the per-raster tile list (if tile mode) so the
+    # fusion step doesn't accidentally iterate sibling tiles in a shared dir.
     result = apply_v6_masks_to_classification(
         classification_path=classification_path,
         raster_path=raster_path,
@@ -647,6 +701,8 @@ def classify_v6(
         building_shapefile=building_shapefile,
         water_shapefile=water_shapefile,
         progress_callback=progress_callback,
+        mask_output_dir=output_path,
+        tile_paths=classify_result.get("tileOutputs"),
     )
 
     duration = _time.perf_counter() - t_start

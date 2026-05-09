@@ -209,21 +209,28 @@ def _load_sam3(device: str = "auto"):
             from sam3.model_builder import build_sam3_image_model
             from sam3.model.sam3_image_processor import Sam3Processor
 
-            # Look for checkpoint — local file or HuggingFace cache
-            ckpt_path = sam3_dir / "sam3.pt"
-            if not ckpt_path.exists():
+            # Prefer SAM 3.1 (sam3.1_multiplex.pt) over SAM 3.0 (sam3.pt) —
+            # 3.1 is substantially better on aerial imagery. Mirrors MATZA's
+            # loader pattern (Matza/app/pipeline/sam3_runner.py).
+            ckpt_path = next(
+                (p for p in (sam3_dir / "sam3.1_multiplex.pt", sam3_dir / "sam3.pt") if p.exists()),
+                None,
+            )
+            if ckpt_path is None:
                 # Check HuggingFace cache
                 try:
                     from huggingface_hub import try_to_load_from_cache
-                    cached = try_to_load_from_cache("facebook/sam3", "sam3.pt")
+                    cached = (
+                        try_to_load_from_cache("facebook/sam3.1", "sam3.1_multiplex.pt")
+                        or try_to_load_from_cache("facebook/sam3", "sam3.pt")
+                    )
                     if cached and Path(cached).exists():
                         ckpt_path = Path(cached)
                     else:
                         raise FileNotFoundError("No local SAM3 checkpoint found")
                 except Exception:
                     raise FileNotFoundError(
-                        f"SAM3 checkpoint not found. Place sam3.pt in {sam3_dir} "
-                        "or run: huggingface-cli login && huggingface-cli download facebook/sam3 sam3.pt"
+                        f"SAM3 checkpoint not found. Place sam3.1_multiplex.pt or sam3.pt in {sam3_dir}"
                     )
 
             print(f"[RoadExtract] Loading local SAM3 from {ckpt_path} …")
@@ -548,7 +555,8 @@ def _segment_tile(
     h, w = tile_rgb.shape[:2]
 
     if sam_type == "sam3_local":
-        return _segment_tile_sam3_local(sam, tile_rgb, text_prompt)
+        return _segment_tile_sam3_local(sam, tile_rgb, text_prompt,
+                                        confidence_threshold=threshold)
 
     if sam_type == "owlv2sam2":
         return _segment_tile_owlv2(sam, tile_rgb, text_prompt, threshold=threshold)
@@ -614,8 +622,19 @@ def _segment_tile(
                 pass
 
 
-def _segment_tile_sam3_local(sam_bundle: dict, tile_rgb: np.ndarray, text_prompt: str) -> np.ndarray:
+def _segment_tile_sam3_local(
+    sam_bundle: dict,
+    tile_rgb: np.ndarray,
+    text_prompt: str,
+    confidence_threshold: float = 0.5,
+    max_detection_fraction: float = 0.5,
+) -> np.ndarray:
     """Segment tile using local Meta SAM3 model with text prompts.
+
+    Mirrors MATZA's pattern (Matza/app/pipeline/sam3_runner.py + inference.py):
+    set the per-call confidence on the processor, then drop any returned mask
+    that covers more than ``max_detection_fraction`` of the tile area — those
+    are almost always false-positive whole-tile blobs.
 
     Returns binary mask (H, W).
     """
@@ -625,6 +644,8 @@ def _segment_tile_sam3_local(sam_bundle: dict, tile_rgb: np.ndarray, text_prompt
     pil_image = _PILImage.fromarray(tile_rgb)
     processor = sam_bundle["processor"]
 
+    processor.set_confidence_threshold(confidence_threshold)
+
     # SAM3 API: set_image → set_text_prompt → read masks
     state = processor.set_image(pil_image)
     state = processor.set_text_prompt(text_prompt, state)
@@ -633,8 +654,14 @@ def _segment_tile_sam3_local(sam_bundle: dict, tile_rgb: np.ndarray, text_prompt
     if masks is None or masks.numel() == 0:
         return np.zeros((h, w), dtype=np.uint8)
 
-    # Union all detected masks
-    combined = masks.squeeze(1).any(dim=0).cpu().numpy().astype(np.uint8)
+    masks = masks.squeeze(1)               # (N, H, W) bool
+    max_inst_px = int(h * w * max_detection_fraction)
+    areas = masks.flatten(1).sum(dim=1)    # (N,)
+    keep = areas <= max_inst_px
+    if not bool(keep.any()):
+        return np.zeros((h, w), dtype=np.uint8)
+
+    combined = masks[keep].any(dim=0).cpu().numpy().astype(np.uint8)
     return combined
 
 
@@ -1310,17 +1337,18 @@ FEATURE_CONFIGS: Dict[str, List[Dict]] = {
     # Results are unioned (OR) per tile.
     "roads": [
         {
-            "prompt": "road, highway, asphalt path",
+            "prompt": "road",
             "suffix": "roads",
             "color": (45, 45, 48),       # BM_ASPHALT #2D2D30
+            "threshold": 0.20,           # raised — fewer false positives on aerial fields/edges
         },
     ],
     "buildings": [
         {
-            "prompt": "building, house, roof, rooftop, structure",
+            "prompt": "building",
             "suffix": "buildings",
             "color": (180, 180, 180),     # BM_CONCRETE #B4B4B4
-            "threshold": 0.02,
+            "threshold": 0.15,           # SAM3 confidence_threshold for "building" (matches MATZA defaults)
             "color_detect": _color_detect_buildings,
         },
     ],
@@ -1351,21 +1379,21 @@ FEATURE_CONFIGS: Dict[str, List[Dict]] = {
             "prompt": "water, lake, pond, reservoir, pool",
             "suffix": "water_bodies",
             "color": (28, 107, 160),      # BM_WATER #1C6BA0
-            "threshold": 0.03,            # lower threshold — water is hard for OWLv2
+            "threshold": 0.20,            # raised — water is shapefile-only in v6 anyway
             "color_detect": _color_detect_water,
         },
         {
             "prompt": "river, stream, canal, waterway, channel",
             "suffix": "water_channels",
             "color": (28, 107, 160),      # BM_WATER #1C6BA0
-            "threshold": 0.03,
+            "threshold": 0.20,
             "color_detect": _color_detect_water,
         },
         {
             "prompt": "sea, ocean, fish pond, swimming pool",
             "suffix": "water_other",
             "color": (28, 107, 160),      # BM_WATER #1C6BA0
-            "threshold": 0.03,
+            "threshold": 0.20,
             "color_detect": _color_detect_water,
         },
     ],
